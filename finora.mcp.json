@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "finora": {
+      "command": "pnpm",
+      "args": ["--dir", "/absolute/path/to/finora", "mcp"]
+    }
+  }
+}

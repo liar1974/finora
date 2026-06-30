@@ -1,0 +1,258 @@
+openapi: 3.1.0
+info:
+  title: Finora Local API
+  version: 1.0.0
+  description: Local API for accounts, imports, provider connections, chat, alerts, and summaries.
+servers:
+  - url: http://127.0.0.1:3011
+paths:
+  /v1/health:
+    get:
+      summary: Health check
+      responses:
+        "200": { description: Healthy }
+  /v1/accounts:
+    get:
+      summary: List accounts
+      responses:
+        "200": { description: Account collection }
+    post:
+      summary: Create an account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [institution, name]
+              properties:
+                institution: { type: string, maxLength: 120 }
+                name: { type: string, maxLength: 120 }
+                type: { type: string, default: checking }
+                currency: { type: string, minLength: 3, maxLength: 3, default: USD }
+                domain: { type: string, enum: [bank, brokerage] }
+                source: { type: string, maxLength: 60 }
+                providerAccountId: { type: [string, "null"], maxLength: 255 }
+                metadata:
+                  type: object
+                  additionalProperties: true
+                  description: For Plaid accounts, include plaidItemId or itemId to upsert the existing Item connection.
+      responses:
+        "201": { description: Account created }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/accounts/{accountId}:
+    get:
+      summary: Get an account
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: Account }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete a local file-backed account
+      description: Provider-managed accounts must be removed through their provider connection.
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: Account deleted }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/imports:
+    post:
+      summary: Import a CSV or OFX statement
+      description: Content-addressed per account; retries with identical content return the existing import.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accountId, filename, contentBase64]
+              properties:
+                accountId: { type: string, format: uuid }
+                filename: { type: string }
+                format: { type: string, enum: [auto, csv, ofx], default: auto }
+                contentBase64: { type: string, contentEncoding: base64 }
+      responses:
+        "200": { description: Import record }
+        "404": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/transactions:
+    get:
+      summary: List transactions
+      parameters:
+        - { name: accountId, in: query, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        "200": { description: Cursor-paginated transaction collection }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/summary:
+    get:
+      summary: Summarize cash flow by currency
+      parameters:
+        - { name: accountId, in: query, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+      responses:
+        "200": { description: Income, expense, and net totals grouped by currency }
+  /v1/provider-connections:
+    get:
+      summary: List provider connections
+      responses:
+        "200": { description: Provider connection collection }
+  /v1/plaid/link-token:
+    post:
+      summary: Create a Plaid Link token
+      responses:
+        "200": { description: Link token }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/plaid/exchange:
+    post:
+      summary: Exchange a Plaid public token
+      responses:
+        "200": { description: Plaid Item and account sync result }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/plaid/remove:
+    post:
+      summary: Remove a Plaid Item connection
+      responses:
+        "200": { description: Removal result }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/snaptrade/connect:
+    post:
+      summary: Create a SnapTrade Connection Portal URL
+      responses:
+        "200": { description: Portal URL }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/snaptrade/remove:
+    post:
+      summary: Remove a SnapTrade brokerage authorization
+      responses:
+        "200": { description: Removal result }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/brokerage/summary:
+    get:
+      summary: Summarize brokerage holdings by currency
+      responses:
+        "200": { description: Brokerage summary collection }
+  /v1/brokerage/transactions:
+    get:
+      summary: List brokerage transactions
+      responses:
+        "200": { description: Cursor-paginated brokerage transaction collection }
+  /v1/brokerage/holdings:
+    get:
+      summary: List latest brokerage holdings
+      responses:
+        "200": { description: Holding collection }
+  /v1/account-balances:
+    get:
+      summary: List account balances
+      responses:
+        "200": { description: Balance collection }
+  /v1/credit-reports:
+    post:
+      summary: Validate and record a credit report PDF upload
+      responses:
+        "200": { description: Credit report import result }
+        "415": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/settings:
+    get:
+      summary: List app setting previews
+      responses:
+        "200": { description: Setting preview collection }
+    post:
+      summary: Save app settings
+      responses:
+        "200": { description: Save result }
+  /v1/chat:
+    post:
+      summary: Ask the local finance assistant
+      responses:
+        "200": { description: Assistant reply }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/llm:
+    get:
+      summary: Get effective LLM configuration
+      responses:
+        "200": { description: LLM status }
+  /v1/llm/test:
+    post:
+      summary: Test the configured chat model
+      responses:
+        "200": { description: Connectivity result }
+        "502": { $ref: "#/components/responses/Error" }
+  /v1/telegram/connect:
+    post:
+      summary: Bind the configured Telegram bot to a chat
+      responses:
+        "200": { description: Bound chat }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/alert-rules:
+    get:
+      summary: List alert rules
+      responses:
+        "200": { description: Alert rule collection }
+    post:
+      summary: Create an alert rule
+      responses:
+        "201": { description: Alert rule created }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/alert-rules/toggle:
+    post:
+      summary: Enable or disable an alert rule
+      responses:
+        "200": { description: Updated alert rule }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/alert-rules/remove:
+    post:
+      summary: Remove an alert rule
+      responses:
+        "200": { description: Removal result }
+  /v1/alert-mutes:
+    get:
+      summary: List alert mutes
+      responses:
+        "200": { description: Alert mute collection }
+    post:
+      summary: Create an alert mute
+      responses:
+        "201": { description: Alert mute created }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/alert-mutes/remove:
+    post:
+      summary: Remove an alert mute
+      responses:
+        "200": { description: Removal result }
+components:
+  responses:
+    Error:
+      description: Request failed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: { type: object }
+            requestId: { type: string, format: uuid }

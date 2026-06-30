@@ -1,0 +1,11 @@
+services:
+  finora:
+    build: .
+    ports:
+      - "127.0.0.1:3011:3011"
+    volumes:
+      - finora-data:/data
+    restart: unless-stopped
+
+volumes:
+  finora-data:
