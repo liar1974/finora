@@ -1502,7 +1502,7 @@ function renderBanks() {
   state.section = 'banks';
   renderSidebar();
   const view = $('#view');
-  view.replaceChildren(topbar('Banking', 'Bank accounts', { hideTitle: true }));
+  view.replaceChildren(topbar('Banking', 'Bank accounts', { hideTitle: true, hideDateRange: true }));
   const accounts = bankAccounts();
   if (!accounts.length) {
     view.appendChild(accountCta('No bank accounts yet', 'Connect a bank through Plaid Link. Bank statement import is not supported in this build.', 'Add bank account', () => openProviderConnection('plaid')));
@@ -1724,7 +1724,7 @@ function renderFeedZone(panel, title, zone, items) {
 
 function renderFeed() {
   const view = $('#view');
-  view.replaceChildren(topbar('Insights', 'Local review queue', { hideTitle: true }));
+  view.replaceChildren(topbar('Insights', 'Local review queue', { hideTitle: true, hideDateRange: true }));
   const panel = el('div', 'feedpanel');
   const items = buildFeedItems().filter((item) => item.zone !== 'activity' && !isInsightDismissed(item));
   const attention = items.filter((item) => item.zone === 'attention');
@@ -1793,7 +1793,7 @@ function renderBrokerage() {
   state.section = 'brokerage';
   renderSidebar();
   const view = $('#view');
-  view.replaceChildren(topbar('Brokerage', 'Investments', { hideTitle: true }));
+  view.replaceChildren(topbar('Brokerage', 'Investments', { hideTitle: true, hideDateRange: true }));
   const accounts = brokerageAccounts();
   if (!accounts.length) {
     view.appendChild(accountCta('No brokerage accounts yet', 'Connect a brokerage through the SnapTrade Connection Portal. Bank statement import is not used for brokerage data.', 'Add brokerage account', () => openProviderConnection('snaptrade')));
@@ -2292,17 +2292,22 @@ function uploadResultRow(filename, meta, detail, failed = false) {
   return row;
 }
 
+function visibleDashboard(dashboard) {
+  const label = `${dashboard.id || ''} ${dashboard.publicId || ''} ${dashboard.name || ''}`;
+  return !/\bsmoke\b/i.test(label);
+}
+
 function renderDashboards() {
   const view = $('#view');
   const createButton = el('button', 'primary');
   createButton.type = 'button';
   createButton.id = 'openChartCreator';
   createButton.textContent = 'Create chart';
-  view.replaceChildren(topbar('Dashboards', 'Saved views', { action: createButton }));
+  view.replaceChildren(topbar('Dashboards', 'Saved views', { hideDateRange: true, action: createButton }));
   $('#openChartCreator').addEventListener('click', openChartModal);
   const customArtifacts = customDashboardArtifacts();
   const hiddenArtifacts = hiddenDashboardArtifacts();
-  const savedDashboards = state.dashboards;
+  const savedDashboards = state.dashboards.filter(visibleDashboard);
   const dashboards = savedDashboards.length
     ? savedDashboards.map((dashboard, index) => index === 0 ? {
         ...dashboard,

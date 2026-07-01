@@ -66,6 +66,22 @@ directory under the `com.finora.desktop` identifier.
 The UI is built as a React/Vite web app. The desktop app packages the same
 static web output in a Tauri webview.
 
+## Releases
+
+GitHub Actions builds unsigned desktop installers for macOS arm64, macOS x64,
+Windows x64, and Linux x64, then publishes them to this repository's GitHub
+Releases.
+
+Create a release by pushing a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+You can also run the `Release` workflow manually from the Actions tab and
+provide the tag to publish under.
+
 ## Commands
 
 ```text
