@@ -572,6 +572,11 @@ export class SqliteFinanceRepository implements FinanceRepository {
     return row;
   }
 
+  removeCreditReport(id: string): boolean {
+    const result = this.database.prepare('DELETE FROM credit_reports WHERE id = ?').run(id);
+    return result.changes > 0;
+  }
+
   listAppSettings(keys?: string[]): AppSettingPreview[] {
     const allow = keys?.filter((key) => /^[A-Z0-9_]+$/.test(key));
     const rows = allow?.length

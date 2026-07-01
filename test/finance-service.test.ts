@@ -157,4 +157,53 @@ describe('FinanceService', () => {
     expect(service.listTransactions({ accountId: account.id, limit: 10 }).items).toHaveLength(0);
     service.close();
   });
+
+  it('parses text-searchable credit reports into tradelines and dispute templates', async () => {
+    const service = application();
+    const pdf = Buffer.from(`%PDF-1.7
+Equifax Credit Report
+Report Date: 06/15/2026
+FICO Score: 712
+Creditor: Chase Bank
+Account Number: XXXX1234
+Account Type: Credit Card
+Status: Pays As Agreed
+Date Opened: 01/10/2020
+Balance: $1,200
+Credit Limit: $5,000
+Past Due: $0
+Creditor: ABC Collections
+Account Number: XXXX9988
+Account Type: Collection
+Status: Collection
+Balance: $300
+Past Due: $300
+Inquiry: Example Auto Finance
+Date: 05/01/2026
+`);
+
+    const result = await service.importCreditReport({ filename: 'equifax-report.pdf', content: pdf });
+    expect(result).toMatchObject({
+      ok: true,
+      status: 'processed',
+      report: {
+        bureau: 'equifax',
+        score: 712,
+        accounts: 2,
+        delinquentAccounts: 1,
+        inquiries: 1,
+      },
+    });
+    const overview = service.getCreditOverview();
+    expect(overview.accounts.map((account) => account.creditor)).toEqual(['Chase Bank', 'ABC Collections']);
+    expect(overview.utilization?.overallUtilizationPercent).toBe(24);
+    expect(overview.suggestions.some((item) => item.creditor === 'ABC Collections')).toBe(true);
+    expect(service.generateCreditDisputeLetter({
+      creditor: 'ABC Collections',
+      accountMask: '*9988',
+      reason: 'This collection balance is inaccurate.',
+      bureau: 'equifax',
+    }).letter).toContain('This collection balance is inaccurate.');
+    service.close();
+  });
 });

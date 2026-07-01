@@ -98,12 +98,39 @@ export const openApiDocument = {
       get: { summary: 'List account balances', responses: { '200': { description: 'Balance collection' } } },
     },
     '/v1/credit-reports': {
+      get: {
+        summary: 'Get parsed credit report overview',
+        description: 'Returns the latest report, parsed credit lines, inquiries, utilization, and review flags.',
+        responses: { '200': { description: 'Credit report overview' } },
+      },
       post: {
-        summary: 'Validate and record a credit report PDF upload',
+        summary: 'Parse and record a credit report PDF upload',
+        description: 'Accepts text-searchable credit bureau PDFs. Scanned image PDFs need OCR first.',
         responses: {
           '200': { description: 'Credit report import result' },
           '415': { description: 'Unsupported format' },
           '422': { description: 'Validation failed' },
+        },
+      },
+    },
+    '/v1/credit-reports/dispute-letter': {
+      post: {
+        summary: 'Generate a dispute letter template',
+        description: 'Generates an editable FCRA dispute letter template. Finora does not file or send disputes.',
+        responses: {
+          '200': { description: 'Dispute letter draft' },
+          '422': { description: 'Validation failed' },
+        },
+      },
+    },
+    '/v1/credit-reports/{id}': {
+      delete: {
+        summary: 'Delete a parsed credit report',
+        description: 'Removes an uploaded credit report record and its parsed structured data.',
+        parameters: [{ in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }],
+        responses: {
+          '200': { description: 'Updated credit report overview' },
+          '404': { description: 'Credit report not found' },
         },
       },
     },
@@ -126,6 +153,9 @@ export const openApiDocument = {
     '/v1/alert-rules': {
       get: { summary: 'List alert rules', responses: { '200': { description: 'Alert rule collection' } } },
       post: { summary: 'Create an alert rule', responses: { '201': { description: 'Alert rule created' }, '422': { description: 'Validation failed' } } },
+    },
+    '/v1/alert-rules/preview': {
+      post: { summary: 'Preview inferred alert rule delivery settings', responses: { '200': { description: 'Rule preview' }, '422': { description: 'Validation failed' } } },
     },
     '/v1/alert-rules/toggle': {
       post: { summary: 'Enable or disable an alert rule', responses: { '200': { description: 'Updated alert rule' }, '404': { description: 'Alert rule not found' } } },

@@ -111,9 +111,45 @@ Detection levels:
 - `L+`: deterministic prefilter plus LLM admit/reject, with deterministic
   fallback.
 
-Reference built-in rules to copy into Finora evaluators include idle cash scan,
-new subscription or trial conversion, recurring charge price increase, duplicate
-or unusual charge, low or negative balance risk, expected income late or missing,
-weekly financial health check, discretionary spending review, brokerage cash
-drag, portfolio concentration, single name as percentage of net worth, high
-credit utilization, and connection health.
+Custom rules are stored as normalized rule metadata, not as separate query
+programs per detection level. The preview flow may use the configured chat model
+to infer delivery fields, then falls back to local inference. The saved rule
+keeps scope, cadence, channel, and scheduled hour; evaluators decide whether the
+rule runs as `D`, `L`, or `L+` from the rule kind.
+
+Built-in evaluators should cover connection health, idle cash, low or negative
+balance risk, large transactions, duplicate or unusual charges, subscription
+drift, trial conversions, discretionary spending, cash runway, expected income,
+fees and interest, credit utilization, credit report review, credit payment
+timing, brokerage cash drag, portfolio concentration, allocation drift, executed
+orders, dividends or interest, weekly financial health, net-worth movement, and
+stale imports.
+
+The alert creation UI should live with the page-level controls rather than
+inside the rules list. A new rule is saved only after the preview flow has
+resolved concrete delivery metadata.
+
+## Dashboards
+
+Dashboards render saved chart artifacts together with locally created charts.
+Local chart definitions live in browser storage so users can iterate on charts
+without changing server-side dashboard records. A local chart can be edited or
+deleted. Built-in or server-backed widgets can be hidden locally; hiding is not a
+server delete and does not change the underlying artifact.
+
+Dashboard chart creation is prompt-first: the user describes the desired chart,
+previews it against local data, then saves it. Editing an existing chart reuses
+the same chart identifier instead of creating a duplicate.
+
+## Credit reports
+
+Credit report import is intentionally modal. The credit page should provide one
+upload action plus instructions to download a free report from
+https://www.annualcreditreport.com/. The upload control itself belongs in the
+modal so accidental page-level drops do not start parsing private PDFs.
+
+Credit report PDFs commonly do not include a score, so the UI must not be
+score-first. The default view is the latest uploaded report, followed by AI
+insights, open accounts, and all parsed inquiries. Historical reports belong in
+the Reports tab. Deleting a report removes the parsed local record and returns
+the overview to the next latest report, if any.

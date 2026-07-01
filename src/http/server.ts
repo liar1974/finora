@@ -31,6 +31,13 @@ const creditReportImportSchema = z.object({
   contentBase64: z.string().min(1),
 }).strict();
 
+const disputeLetterSchema = z.object({
+  creditor: z.string().trim().min(1).max(180),
+  accountMask: z.string().trim().max(40).nullable().optional(),
+  reason: z.string().trim().min(1).max(2000),
+  bureau: z.string().trim().max(40).optional(),
+}).strict();
+
 const settingsSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]));
 
 const plaidExchangeSchema = z.object({
@@ -181,7 +188,20 @@ async function route(
     if (content.byteLength > 25 * 1024 * 1024) {
       throw new AppError('invalid_input', 'Credit report PDF exceeds the 25 MB limit');
     }
-    return sendJson(response, 200, service.importCreditReport({ filename: input.filename, content }));
+    return sendJson(response, 200, await service.importCreditReport({ filename: input.filename, content }));
+  }
+  if (url.pathname === '/v1/credit-reports' && method === 'GET') {
+    return sendJson(response, 200, service.getCreditOverview());
+  }
+  const creditReportDelete = url.pathname.match(/^\/v1\/credit-reports\/([0-9a-f-]{36})$/i);
+  if (creditReportDelete && method === 'DELETE') {
+    const id = creditReportDelete[1];
+    if (!id) throw new AppError('invalid_input', 'Credit report id is required');
+    return sendJson(response, 200, service.removeCreditReport(id));
+  }
+  if (url.pathname === '/v1/credit-reports/dispute-letter' && method === 'POST') {
+    const input = parseSchema(disputeLetterSchema, await readJson(request));
+    return sendJson(response, 200, service.generateCreditDisputeLetter(input));
   }
   if (url.pathname === '/v1/transactions' && method === 'GET') {
     const query = compact({
@@ -268,6 +288,10 @@ async function route(
   if (url.pathname === '/v1/alert-rules' && method === 'GET') {
     return sendJson(response, 200, { items: service.listAlertRules() });
   }
+  if (url.pathname === '/v1/alert-rules/preview' && method === 'POST') {
+    const input = parseSchema(alertRuleCreateSchema, await readJson(request));
+    return sendJson(response, 200, await service.previewAlertRule(input));
+  }
   if (url.pathname === '/v1/alert-rules' && method === 'POST') {
     const input = parseSchema(alertRuleCreateSchema, await readJson(request));
     return sendJson(response, 201, service.createAlertRule(input));
@@ -332,7 +356,13 @@ async function sendAsset(response: ServerResponse, pathname: string, headOnly = 
   const root = process.env.FINORA_WEB_ROOT || distRoot;
   const relative = normalize(pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, ''));
   if (relative.startsWith('..')) throw new HttpError(404, 'asset_not_found', 'Asset not found');
-  const candidates = [join(root, relative), join(bundledRoot, relative)];
+  const fallback = extname(relative) ? relative : 'index.html';
+  const candidates = [
+    join(root, relative),
+    join(bundledRoot, relative),
+    join(root, fallback),
+    join(bundledRoot, fallback),
+  ];
   let body: Buffer | undefined;
   for (const candidate of candidates) {
     try {
@@ -343,7 +373,7 @@ async function sendAsset(response: ServerResponse, pathname: string, headOnly = 
     }
   }
   if (!body) throw new HttpError(404, 'asset_not_found', 'Asset not found');
-  const contentType = contentTypeFor(relative);
+  const contentType = contentTypeFor(fallback);
   response.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-cache' });
   if (headOnly) return response.end();
   response.end(body);

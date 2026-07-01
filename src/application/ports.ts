@@ -129,6 +129,7 @@ export interface FinanceRepository {
   listDashboards(): DashboardRecord[];
   listCreditReports(): CreditReportRecord[];
   saveCreditReport(input: Omit<CreditReportRecord, 'id' | 'createdAt'>): CreditReportRecord;
+  removeCreditReport(id: string): boolean;
   listAppSettings(keys?: string[]): AppSettingPreview[];
   getAppSetting(key: string): string | null;
   saveAppSettings(entries: Record<string, string>): void;

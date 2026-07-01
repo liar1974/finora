@@ -61,6 +61,48 @@ interface ProviderSyncResult {
   skipped: number;
 }
 
+interface CreditTradeline {
+  creditor: string;
+  accountMask: string | null;
+  accountType: string | null;
+  status: string | null;
+  isOpen: boolean;
+  isNegative: boolean;
+  isRevolving: boolean;
+  dateOpened: string | null;
+  dateReported: string | null;
+  balanceMinor: number | null;
+  creditLimitMinor: number | null;
+  pastDueMinor: number | null;
+}
+
+interface CreditInquiry {
+  company: string;
+  inquiryDate: string | null;
+  type: 'hard' | 'soft';
+}
+
+interface CreditDisputeSuggestion {
+  severity: 'high' | 'medium' | 'low';
+  issue: string;
+  creditor: string;
+  accountMask: string | null;
+  why: string;
+  fcra: string;
+  reason: string;
+}
+
+interface CreditExtraction {
+  bureau: string | null;
+  reportDate: string | null;
+  score: number | null;
+  scoreModel: string | null;
+  accounts: CreditTradeline[];
+  inquiries: CreditInquiry[];
+  suggestions: CreditDisputeSuggestion[];
+  textSample: string;
+}
+
 export class FinanceService {
   private readonly telegramGateway: TelegramGateway;
   private readonly telegramHistory = new Map<string, ChatMessage[]>();
@@ -186,6 +228,36 @@ export class FinanceService {
 
   listDashboards() {
     return this.repository.listDashboards();
+  }
+
+  listCreditReports() {
+    return this.repository.listCreditReports();
+  }
+
+  removeCreditReport(id: string) {
+    if (!this.repository.removeCreditReport(id)) {
+      throw new AppError('not_found', 'Credit report not found');
+    }
+    return { ok: true, ...this.getCreditOverview() };
+  }
+
+  getCreditOverview() {
+    const reports = this.repository.listCreditReports();
+    const latest = reports[0] ?? null;
+    const raw = latest?.raw ?? {};
+    const accounts = asArray<CreditTradeline>(raw.accounts);
+    const inquiries = asArray<CreditInquiry>(raw.inquiries);
+    const suggestions = asArray<CreditDisputeSuggestion>(raw.suggestions);
+    const utilization = creditUtilization(accounts);
+    return {
+      hasData: Boolean(latest),
+      reports,
+      latest,
+      accounts,
+      inquiries,
+      suggestions,
+      utilization,
+    };
   }
 
   listAppSettings(keys?: string[]) {
@@ -760,6 +832,27 @@ export class FinanceService {
     return this.repository.listAlertRules();
   }
 
+  async previewAlertRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
+    const text = requireText(input.text, 'text');
+    const heuristic = inferRule(text, input.scope, input.cadence, input.channel);
+    const modelInferred = await this.inferRuleWithModel(text, heuristic);
+    const inferred = {
+      ...modelInferred,
+      scope: normalizeChoice(input.scope || modelInferred.scope, ['banking', 'brokerage', 'credit', 'all'], modelInferred.scope),
+      cadence: normalizeChoice(input.cadence || modelInferred.cadence, ['event', 'hourly', 'daily', 'weekly', 'monthly'], modelInferred.cadence),
+      channel: normalizeChoice(input.channel || modelInferred.channel, ['auto', 'digest', 'telegram', 'slack'], modelInferred.channel),
+    };
+    const scheduledHour = input.scheduledHour ?? suggestedRuleHour(inferred.cadence);
+    return {
+      text,
+      ...inferred,
+      scheduledHour,
+      mode: ruleExecutionMode(inferred.kind),
+      strategy: ruleExecutionStrategy(inferred.kind),
+      inference: inferred.inference,
+    };
+  }
+
   createAlertRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
     const inferred = inferRule(text, input.scope, input.cadence, input.channel);
@@ -890,7 +983,7 @@ export class FinanceService {
     };
   }
 
-  importCreditReport(input: { filename: string; content: Uint8Array }) {
+  async importCreditReport(input: { filename: string; content: Uint8Array }) {
     const filename = requireText(input.filename, 'filename');
     if (!/\.pdf$/i.test(filename)) {
       throw new AppError('unsupported_format', 'Credit reports must be uploaded as PDF files from a credit bureau');
@@ -903,14 +996,84 @@ export class FinanceService {
       throw new AppError('unsupported_format', 'Credit report upload must be a valid PDF');
     }
     const contentHash = createHash('sha256').update(input.content).digest('hex');
+    const existing = this.repository.listCreditReports().find((report) => report.contentHash === contentHash);
+    if (existing) return { ok: true, status: 'duplicate', report: existing, ...this.getCreditOverview() };
+
+    const extracted = await extractCreditReport(input.content, filename);
+    if (extracted.accounts.length === 0 && extracted.inquiries.length === 0 && !extracted.score) {
+      throw new AppError(
+        'invalid_input',
+        'No credit report fields were found. Upload a text-searchable credit bureau PDF, not a scanned image.',
+        { reason: 'needs_text_pdf' },
+      );
+    }
+    const totals = summarizeCreditExtraction(extracted);
+    const report = this.repository.saveCreditReport({
+      filename,
+      contentHash,
+      bureau: extracted.bureau,
+      reportDate: extracted.reportDate,
+      score: extracted.score,
+      scoreModel: extracted.scoreModel,
+      utilizationPercent: totals.utilizationPercent,
+      totalBalanceMinor: totals.totalBalanceMinor,
+      totalLimitMinor: totals.totalLimitMinor,
+      accounts: extracted.accounts.length,
+      openAccounts: extracted.accounts.filter((account) => account.isOpen).length,
+      delinquentAccounts: extracted.accounts.filter((account) => account.isNegative).length,
+      collections: extracted.accounts.filter((account) => /collection/i.test(account.status || '')).length,
+      inquiries: extracted.inquiries.filter((inquiry) => inquiry.type === 'hard').length,
+      publicRecords: 0,
+      raw: {
+        accounts: extracted.accounts,
+        inquiries: extracted.inquiries,
+        suggestions: extracted.suggestions,
+        textSample: extracted.textSample,
+      },
+      bytes: input.content.byteLength,
+    });
     return {
       ok: true,
       filename,
       contentHash,
       bytes: input.content.byteLength,
       status: 'processed',
-      note: 'PDF validated. Structured credit bureau extraction is not enabled in this build yet.',
+      report,
+      ...this.getCreditOverview(),
     };
+  }
+
+  generateCreditDisputeLetter(input: { creditor?: string | undefined; accountMask?: string | null | undefined; reason?: string | undefined; bureau?: string | undefined }) {
+    const overview = this.getCreditOverview();
+    const bureau = normalizeBureau(input.bureau || overview.latest?.bureau || 'credit bureau') || 'credit bureau';
+    const creditor = requireText(input.creditor || 'Creditor name', 'creditor');
+    const reason = requireText(input.reason || 'I believe this information is inaccurate or incomplete.', 'reason');
+    const accountMask = input.accountMask ? ` ${input.accountMask}` : '';
+    const today = new Date().toISOString().slice(0, 10);
+    const address = bureauDisputeAddress(bureau);
+    const letter = [
+      `${today}`,
+      '',
+      `${titleCase(bureau)} Dispute Department`,
+      address,
+      '',
+      'Re: FCRA Section 611 dispute request',
+      '',
+      'To whom it may concern:',
+      '',
+      `I am writing to dispute information in my credit file related to ${creditor}${accountMask}.`,
+      `Reason for dispute: ${reason}`,
+      '',
+      'Please conduct a reasonable reinvestigation under FCRA Section 611 and send me the results in writing. If the disputed information cannot be verified as accurate and complete, please delete or correct it.',
+      '',
+      'I have enclosed copies of documents supporting my position. This template is for my review and editing only, and I understand Finora does not send disputes for me.',
+      '',
+      'Sincerely,',
+      '',
+      '[Your name]',
+      '[Your mailing address]',
+    ].join('\n');
+    return { bureau, creditor, accountMask: input.accountMask || null, letter };
   }
 
   importStatement(input: ImportStatementInput): ImportRecord {
@@ -1011,6 +1174,35 @@ export class FinanceService {
 
   private llmConfig() {
     return resolveLlmConfig((key) => this.repository.getAppSetting(key));
+  }
+
+  private async inferRuleWithModel(text: string, fallback: ReturnType<typeof inferRule>) {
+    const llm = this.llmConfig();
+    try {
+      const reply = await generateChatReply({
+        config: llm,
+        system: [
+          'Infer alert rule delivery settings for Finora.',
+          'Return only compact JSON with keys: scope, cadence, channel.',
+          'Allowed scope values: banking, brokerage, credit, all.',
+          'Allowed cadence values: event, hourly, daily, weekly, monthly.',
+          'Allowed channel values: auto, digest, telegram, slack.',
+        ].join('\n'),
+        messages: [{ role: 'user', content: text }],
+        timeoutMs: 1_500,
+        maxTokens: 80,
+      });
+      const parsed = parseRuleInference(reply);
+      return {
+        kind: fallback.kind,
+        scope: normalizeChoice(parsed.scope || fallback.scope, ['banking', 'brokerage', 'credit', 'all'], fallback.scope),
+        cadence: normalizeChoice(parsed.cadence || fallback.cadence, ['event', 'hourly', 'daily', 'weekly', 'monthly'], fallback.cadence),
+        channel: normalizeChoice(parsed.channel || fallback.channel, ['auto', 'digest', 'telegram', 'slack'], fallback.channel),
+        inference: { source: 'llm', provider: llm.provider, model: llm.chatModel },
+      };
+    } catch {
+      return { ...fallback, inference: { source: 'heuristic' } };
+    }
   }
 
   private plaidConnectionsReady(): boolean {
@@ -1250,26 +1442,58 @@ export class FinanceService {
 function inferRule(text: string, scope?: string, cadence?: string, channel?: string) {
   const lower = text.toLowerCase();
   const inferredScope = scope || (
-    /brokerage|portfolio|holding|stock|etf|dividend|cash drag|投资|持仓/.test(lower) ? 'brokerage'
+    /brokerage|portfolio|holding|stock|etf|dividend|cash drag|order|trade|allocation|投资|持仓/.test(lower) ? 'brokerage'
       : /credit|card|utilization|score|信用|卡/.test(lower) ? 'credit'
-        : 'banking'
+        : /net[ -]?worth|balance sheet|asset|liability/.test(lower) ? 'all'
+          : 'banking'
   );
   const inferredCadence = cadence || (
     /monthly|month|每月/.test(lower) ? 'monthly'
       : /weekly|week|每周/.test(lower) ? 'weekly'
         : /daily|day|每天|每日/.test(lower) ? 'daily'
+          : /hourly|hour|每小时/.test(lower) ? 'hourly'
           : 'event'
   );
   let kind = 'rule_local_watch';
   if (/cash|现金|idle/.test(lower)) kind = inferredScope === 'brokerage' ? 'rule_idle_brokerage_cash' : 'rule_idle_cash';
-  else if (/spend|charge|transaction|消费|支出/.test(lower)) kind = 'rule_spending_watch';
+  else if (/duplicate|unusual|merchant|spend|charge|transaction|消费|支出/.test(lower)) kind = 'rule_spending_watch';
   else if (/portfolio|concentration|holding|持仓|集中/.test(lower)) kind = 'rule_portfolio_watch';
+  else if (/credit|card|utilization|score|信用|卡/.test(lower)) kind = 'rule_credit_utilization';
+  else if (/connection|sync|token|cursor|plaid|snaptrade/.test(lower)) kind = 'rule_connection_health';
   return {
     kind,
     scope: normalizeChoice(inferredScope, ['banking', 'brokerage', 'credit', 'all'], 'banking'),
     cadence: normalizeChoice(inferredCadence, ['event', 'hourly', 'daily', 'weekly', 'monthly'], 'event'),
     channel: normalizeChoice(channel || 'auto', ['auto', 'digest', 'telegram', 'slack'], 'auto'),
   };
+}
+
+function parseRuleInference(reply: string): Partial<{ scope: string; cadence: string; channel: string }> {
+  const match = reply.match(/\{[\s\S]*\}/);
+  if (!match) return {};
+  try {
+    const value = JSON.parse(match[0]);
+    return value && typeof value === 'object' ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function suggestedRuleHour(cadence: string) {
+  return cadence === 'event' || cadence === 'hourly' ? null : 9;
+}
+
+function ruleExecutionMode(kind: string) {
+  if (/credit_utilization|connection_health/.test(kind)) return 'D';
+  if (/spending_watch|local_watch/.test(kind)) return 'L+';
+  return 'L';
+}
+
+function ruleExecutionStrategy(kind: string) {
+  const mode = ruleExecutionMode(kind);
+  if (mode === 'D') return 'Deterministic query and local copy; no model is needed at run time.';
+  if (mode === 'L') return 'Deterministic trigger with model-generated explanation from local facts.';
+  return 'Deterministic prefilter, then model accept/reject with deterministic fallback.';
 }
 
 function plaidAccountDomain(account: { type?: string | null; subtype?: string | null }): string {
@@ -1373,4 +1597,371 @@ function formatTelegramAlerts(alerts: LocalAlert[]): string {
   const icon = { high: '🔴', medium: '🟠', low: '🟡' } as const;
   const lines = alerts.map((alert) => `${icon[alert.severity]} ${alert.title}\n${alert.detail}`);
   return `Finora — ${alerts.length} new alert${alerts.length === 1 ? '' : 's'}\n\n${lines.join('\n\n')}`;
+}
+
+async function extractCreditReport(content: Uint8Array, filename: string): Promise<CreditExtraction> {
+  const text = await normalizePdfText(content);
+  const bureau = normalizeBureau(filename) || normalizeBureau(text);
+  const reportDate = findDate(text, /(report\s+date|date\s+of\s+report|prepared\s+for|as\s+of)\s*:?\s*/i);
+  const scoreMatch = /\b(?:fico|vantagescore|credit\s+score|score)\b[^\d]{0,40}([3-8]\d{2})\b/i.exec(text);
+  const scoreModel = /\b(FICO\s*\d*|VantageScore\s*\d(?:\.\d)?|Credit\s+Score)\b/i.exec(text)?.[1]?.trim() ?? null;
+  const accounts = extractExperianTradelines(text);
+  const inquiries = extractExperianInquiries(text);
+  const fallbackAccounts = accounts.length ? accounts : extractCreditTradelines(text);
+  const fallbackInquiries = inquiries.length ? inquiries : extractCreditInquiries(text);
+  return {
+    bureau,
+    reportDate,
+    score: scoreMatch ? Number(scoreMatch[1]) : null,
+    scoreModel,
+    accounts: fallbackAccounts,
+    inquiries: fallbackInquiries,
+    suggestions: suggestCreditDisputes(fallbackAccounts, fallbackInquiries),
+    textSample: text.slice(0, 1200),
+  };
+}
+
+async function normalizePdfText(content: Uint8Array): Promise<string> {
+  const pdfText = await extractPdfText(content).catch(() => '');
+  if (pdfText.length > 500) return pdfText;
+  const raw = Buffer.from(content).toString('latin1');
+  const literalText = [...raw.matchAll(/\(([^()]|\\[()nrtbf\\]){2,}\)\s*Tj/g)]
+    .map((match) => match[0].replace(/\)\s*Tj$/, '').replace(/^\(/, ''))
+    .join('\n');
+  const source = literalText.length > 200 ? literalText : raw;
+  return source
+    .replace(/\\([()\\])/g, '$1')
+    .replace(/\\n|\\r/g, '\n')
+    .replace(/[^\x09\x0a\x0d\x20-\x7e]+/g, ' ')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+}
+
+async function extractPdfText(content: Uint8Array): Promise<string> {
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(content),
+    useSystemFonts: true,
+  }).promise;
+  const pages: string[] = [];
+  for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+    const page = await document.getPage(pageNumber);
+    const text = await page.getTextContent();
+    pages.push(text.items.map((item: unknown) => {
+      const maybe = item as { str?: unknown };
+      return typeof maybe.str === 'string' ? maybe.str : '';
+    }).join('\n'));
+  }
+  return pages.join('\n').replace(/\r/g, '\n').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function extractExperianTradelines(text: string): CreditTradeline[] {
+  if (!/Annual Credit Report - Experian|usa\.experian\.com/i.test(text)) return [];
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  const accounts: CreditTradeline[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/^Account Info$/i.test(lines[index]!)) continue;
+    const nextInfo = lines.findIndex((line, offset) => offset > index && /^Account Info$/i.test(line));
+    const nextBoundary = lines.findIndex((line, offset) =>
+      offset > index && /^(Hard Inquiries|Soft Inquiries|Public Records|Personal Information)$/i.test(line)
+    );
+    const endCandidates = [nextInfo, nextBoundary].filter((value) => value > index);
+    const end = endCandidates.length ? Math.min(...endCandidates) : Math.min(lines.length, index + 120);
+    const block = lines.slice(index, end);
+    const creditor = lineValue(block, 'Account Name');
+    if (!creditor) continue;
+    const accountType = lineValue(block, 'Account Type');
+    const status = lineValue(block, 'Status');
+    const balanceMinor = parseMoney(lineValue(block, 'Balance'));
+    const creditLimitMinor = parseMoney(lineValue(block, 'Credit Limit'));
+    const pastDueMinor = parseMoney(lineValue(block, 'Past Due'));
+    const closed = /closed|paid and closed/i.test(status || '') || Boolean(lineValue(block, 'On Record Until'));
+    const negative = /collection|charge.?off|delinquent|late|repossession|foreclosure|derogatory/i.test(status || '') ||
+      (pastDueMinor !== null && pastDueMinor > 0);
+    accounts.push({
+      creditor,
+      accountMask: maskFromAccountNumber(lineValue(block, 'Account Number')),
+      accountType,
+      status,
+      isOpen: !closed,
+      isNegative: negative,
+      isRevolving: /credit card|revolving|charge account/i.test(accountType || '') || creditLimitMinor !== null,
+      dateOpened: normalizeDate(lineValue(block, 'Date Opened') || ''),
+      dateReported: normalizeDate(lineValue(block, 'Balance Updated') || lineValue(block, 'Status Updated') || ''),
+      balanceMinor,
+      creditLimitMinor,
+      pastDueMinor,
+    });
+  }
+  return dedupeCreditAccounts(accounts);
+}
+
+function extractExperianInquiries(text: string): CreditInquiry[] {
+  const start = text.indexOf('Hard Inquiries');
+  if (start < 0) return [];
+  const end = text.indexOf('Soft Inquiries', start);
+  const section = text.slice(start, end > start ? end : start + 8000);
+  const lines = section.split('\n').map((line) => line.trim()).filter(Boolean);
+  const inquiries: CreditInquiry[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/^Inquired on$/i.test(lines[index]!)) continue;
+    const date = normalizeDate(lines[index + 1] || '');
+    const companyParts: string[] = [];
+    for (let offset = index - 1; offset >= 0 && companyParts.length < 4; offset -= 1) {
+      const value = lines[offset]!;
+      if (/^(Hard Inquiries|No public records reported\.|This inquiry|on behalf of|Credit Granting\.|Auto loan\.|Unspeciced\.|Real Estate)$/i.test(value)) break;
+      if (/^(PO BOX|\d|\(?\d{3}\)|[A-Z]{2},?\s*\d{5})/.test(value)) break;
+      companyParts.unshift(value);
+    }
+    const company = companyParts.join(' ').trim();
+    if (company && date) inquiries.push({ company, inquiryDate: date, type: 'hard' });
+  }
+  return inquiries;
+}
+
+function extractCreditTradelines(text: string): CreditTradeline[] {
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  const blocks: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const labeledCreditor = /^(?:account\s+name|creditor|furnisher|lender|company)\s*:?\s*(.+)$/i.exec(line);
+    const nextMentionsAccount = /account\s*(?:number|#)\b/i.test(lines[index + 1] || '');
+    if (!labeledCreditor && !nextMentionsAccount) continue;
+    const first = labeledCreditor?.[1]?.trim() || line;
+    if (!first || /^(account|creditor|furnisher|lender|company)$/i.test(first)) continue;
+    const blockLines = [first];
+    for (let offset = index + 1; offset < Math.min(lines.length, index + 18); offset += 1) {
+      const candidate = lines[offset]!;
+      if (offset > index + 2 && /^(?:account\s+name|creditor|furnisher|lender|company)\s*:?\s*\S+/i.test(candidate)) break;
+      if (/^(?:inquir|personal information|public record|summary)\b/i.test(candidate)) break;
+      blockLines.push(candidate);
+    }
+    const block = blockLines.join('\n');
+    if (/(balance|credit\s+limit|account\s+number|status|past\s+due|date\s+opened)/i.test(block)) blocks.push(block);
+  }
+
+  const seen = new Set<string>();
+  return blocks.flatMap((block) => {
+    const account = creditTradelineFromBlock(block);
+    if (!account) return [];
+    const key = [account.creditor.toLowerCase(), account.accountMask || '', account.balanceMinor || '', account.creditLimitMinor || ''].join('|');
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [account];
+  });
+}
+
+function creditTradelineFromBlock(block: string): CreditTradeline | null {
+  const first = block.split('\n')[0]?.replace(/^(?:account\s+name|creditor|furnisher|lender|company)\s*:?\s*/i, '').trim();
+  if (!first || first.length < 2) return null;
+  const status = field(block, ['status', 'account status', 'payment status']);
+  const accountType = field(block, ['account type', 'type']);
+  const balanceMinor = moneyField(block, ['balance', 'current balance']);
+  const creditLimitMinor = moneyField(block, ['credit limit', 'limit']);
+  const pastDueMinor = moneyField(block, ['past due', 'amount past due']);
+  const closed = /closed|paid and closed|date closed/i.test(block);
+  const negative = /collection|charge.?off|delinquent|late|repossession|foreclosure|derogatory/i.test(`${status || ''}\n${block}`) ||
+    (pastDueMinor !== null && pastDueMinor > 0);
+  const revolving = /credit card|revolving|charge account/i.test(`${accountType || ''}\n${block}`) || creditLimitMinor !== null;
+  return {
+    creditor: first,
+    accountMask: accountMask(block),
+    accountType,
+    status,
+    isOpen: !closed && !/closed/i.test(status || ''),
+    isNegative: negative,
+    isRevolving: revolving,
+    dateOpened: findDate(block, /(date\s+opened|opened)\s*:?\s*/i),
+    dateReported: findDate(block, /(date\s+reported|reported)\s*:?\s*/i),
+    balanceMinor,
+    creditLimitMinor,
+    pastDueMinor,
+  };
+}
+
+function extractCreditInquiries(text: string): CreditInquiry[] {
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  const out: CreditInquiry[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (!/inquir/i.test(line) && !/(permissible purpose|requested by)/i.test(lines[index + 1] || '')) continue;
+    const company = line.replace(/^(?:inquiry|inquiries|company|requested by)\s*:?\s*/i, '').trim();
+    if (!company || /^inquir/i.test(company)) continue;
+    const block = lines.slice(index, index + 5).join('\n');
+    out.push({
+      company,
+      inquiryDate: findDate(block, /(date|inquiry date)\s*:?\s*/i),
+      type: /soft|promotional|account review|consumer|self/i.test(block) ? 'soft' : 'hard',
+    });
+  }
+  return out.slice(0, 50);
+}
+
+function suggestCreditDisputes(accounts: CreditTradeline[], inquiries: CreditInquiry[]): CreditDisputeSuggestion[] {
+  const suggestions: CreditDisputeSuggestion[] = [];
+  for (const account of accounts) {
+    if (account.isNegative) {
+      suggestions.push({
+        severity: 'high',
+        issue: 'Negative status or past-due balance',
+        creditor: account.creditor,
+        accountMask: account.accountMask,
+        why: 'Negative, late, collection, charge-off, or past-due information should be reviewed against your records.',
+        fcra: 'FCRA Section 611 - right to dispute inaccurate or incomplete information',
+        reason: 'The reported negative status, late payment, collection, or past-due amount appears inaccurate or incomplete.',
+      });
+    }
+    if (!account.isOpen && (account.balanceMinor ?? 0) > 0) {
+      suggestions.push({
+        severity: 'medium',
+        issue: 'Closed account reports a balance',
+        creditor: account.creditor,
+        accountMask: account.accountMask,
+        why: 'Closed tradelines with balances can be valid, but often deserve review if the account was paid or transferred.',
+        fcra: 'FCRA Section 611 - right to dispute inaccurate or incomplete information',
+        reason: 'The account is shown closed but still reports a balance that I believe is inaccurate or incomplete.',
+      });
+    }
+  }
+  for (const inquiry of inquiries.filter((item) => item.type === 'hard')) {
+    suggestions.push({
+      severity: 'low',
+      issue: 'Hard inquiry to review',
+      creditor: inquiry.company,
+      accountMask: null,
+      why: 'Hard inquiries should match applications you authorized.',
+      fcra: 'FCRA Section 611 - right to dispute inaccurate information',
+      reason: 'I do not recognize or did not authorize this hard inquiry.',
+    });
+  }
+  return suggestions.slice(0, 20);
+}
+
+function summarizeCreditExtraction(extracted: CreditExtraction) {
+  const utilization = creditUtilization(extracted.accounts);
+  return {
+    utilizationPercent: utilization.overallLimitMinor > 0 ? utilization.overallUtilizationPercent : null,
+    totalBalanceMinor: utilization.overallBalanceMinor || null,
+    totalLimitMinor: utilization.overallLimitMinor || null,
+  };
+}
+
+function creditUtilization(accounts: CreditTradeline[]) {
+  const cards = accounts
+    .filter((account) => account.isOpen && account.isRevolving && (account.creditLimitMinor ?? 0) > 0)
+    .map((account) => ({
+      creditor: account.creditor,
+      accountMask: account.accountMask,
+      balanceMinor: Math.max(0, account.balanceMinor ?? 0),
+      creditLimitMinor: account.creditLimitMinor ?? 0,
+      utilizationPercent: Math.round((Math.max(0, account.balanceMinor ?? 0) / (account.creditLimitMinor ?? 1)) * 1000) / 10,
+    }));
+  const overallBalanceMinor = cards.reduce((sum, card) => sum + card.balanceMinor, 0);
+  const overallLimitMinor = cards.reduce((sum, card) => sum + card.creditLimitMinor, 0);
+  return {
+    cards,
+    overallBalanceMinor,
+    overallLimitMinor,
+    overallUtilizationPercent: overallLimitMinor > 0 ? Math.round((overallBalanceMinor / overallLimitMinor) * 1000) / 10 : null,
+  };
+}
+
+function field(text: string, labels: string[]): string | null {
+  for (const label of labels) {
+    const pattern = new RegExp(`${label.replace(/\s+/g, '\\s+')}\\s*:?\\s*([^\\n]+)`, 'i');
+    const value = pattern.exec(text)?.[1]?.trim();
+    if (value) return value.replace(/\s{2,}.*/, '').trim();
+  }
+  return null;
+}
+
+function lineValue(lines: string[], label: string): string | null {
+  const index = lines.findIndex((line) => line.toLowerCase() === label.toLowerCase());
+  if (index < 0) return null;
+  for (let offset = index + 1; offset < lines.length; offset += 1) {
+    const value = lines[offset]?.trim();
+    if (!value) continue;
+    if (/^(Account Name|Account Number|Account Type|Responsibility|Interest Type|Date Opened|Status|Status Updated|Balance|Balance Updated|Recent Payment|Monthly Payment|Credit Limit|Highest Balance|Terms|On Record Until)$/i.test(value)) {
+      return null;
+    }
+    return value;
+  }
+  return null;
+}
+
+function parseMoney(value: string | null): number | null {
+  if (!value || value === '-') return null;
+  const match = /\$?\s*([\d,]+(?:\.\d{1,2})?)/.exec(value);
+  return match?.[1] ? toMinor(match[1].replace(/,/g, '')) : null;
+}
+
+function maskFromAccountNumber(value: string | null): string | null {
+  if (!value) return null;
+  const digits = value.replace(/\D/g, '');
+  return digits ? `*${digits.slice(-4)}` : null;
+}
+
+function dedupeCreditAccounts(accounts: CreditTradeline[]): CreditTradeline[] {
+  const seen = new Set<string>();
+  return accounts.filter((account) => {
+    const key = [account.creditor.toLowerCase(), account.accountMask || '', account.dateOpened || '', account.creditLimitMinor ?? ''].join('|');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function moneyField(text: string, labels: string[]): number | null {
+  for (const label of labels) {
+    const pattern = new RegExp(`${label.replace(/\s+/g, '\\s+')}\\s*:?\\s*\\$?([\\d,]+(?:\\.\\d{1,2})?)`, 'i');
+    const value = pattern.exec(text)?.[1];
+    if (value) return toMinor(value.replace(/,/g, ''));
+  }
+  return null;
+}
+
+function accountMask(text: string): string | null {
+  const match = /(?:account\s*(?:number|#)|acct\s*#)\s*:?\s*([xX*\- ]*\d{4,})/i.exec(text);
+  if (!match?.[1]) return null;
+  const digits = match[1].replace(/\D/g, '');
+  return digits.length ? `*${digits.slice(-4)}` : null;
+}
+
+function findDate(text: string, prefix: RegExp): string | null {
+  const start = prefix.exec(text);
+  const haystack = start ? text.slice(start.index, start.index + 80) : text;
+  const match = /\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})\b/i.exec(haystack);
+  return match ? normalizeDate(match[1]!) : null;
+}
+
+function normalizeDate(value: string): string | null {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+function normalizeBureau(value: string): string | null {
+  const lower = value.toLowerCase();
+  if (lower.includes('equifax')) return 'equifax';
+  if (lower.includes('experian')) return 'experian';
+  if (lower.includes('transunion') || lower.includes('trans union')) return 'transunion';
+  return null;
+}
+
+function bureauDisputeAddress(bureau: string): string {
+  if (bureau === 'equifax') return 'P.O. Box 740256\nAtlanta, GA 30374-0256';
+  if (bureau === 'experian') return 'P.O. Box 4500\nAllen, TX 75013';
+  if (bureau === 'transunion') return 'P.O. Box 2000\nChester, PA 19016-2000';
+  return '[Look up the current dispute mailing address]';
+}
+
+function titleCase(value: string): string {
+  return value.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function asArray<T>(value: unknown): T[] {
+  return Array.isArray(value) ? value as T[] : [];
 }

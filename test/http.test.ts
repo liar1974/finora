@@ -60,18 +60,69 @@ describe('HTTP API', () => {
     expect((await fetch(`${base}/v1/accounts/${account.id}`)).status).toBe(404);
   });
 
-  it('validates credit report uploads and returns one error envelope', async () => {
+  it('serves the web app shell for direct section URLs', async () => {
+    const { base } = await httpFixture();
+    const response = await fetch(`${base}/credit`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    expect(await response.text()).toContain('<div id="root"></div>');
+  });
+
+  it('imports credit reports and exposes credit overview tools', async () => {
     const { base } = await httpFixture();
     const creditReport = await fetch(`${base}/v1/credit-reports`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         filename: 'equifax-report.pdf',
-        contentBase64: Buffer.from('%PDF-1.7\ncredit report').toString('base64'),
+        contentBase64: Buffer.from(`%PDF-1.7
+Equifax Credit Report
+Report Date: 06/15/2026
+VantageScore 3.0 701
+Creditor: Chase Bank
+Account Number: XXXX1234
+Account Type: Credit Card
+Status: Open
+Balance: $500
+Credit Limit: $2,000
+Inquiry: Example Bank
+Date: 05/01/2026
+`).toString('base64'),
       }),
     });
     expect(creditReport.status).toBe(200);
-    expect(await creditReport.json()).toMatchObject({ ok: true, status: 'processed' });
+    const imported = await creditReport.json();
+    expect(imported).toMatchObject({
+      ok: true,
+      status: 'processed',
+      report: { bureau: 'equifax', accounts: 1, inquiries: 1 },
+    });
+
+    const overview = await fetch(`${base}/v1/credit-reports`);
+    expect(overview.status).toBe(200);
+    expect(await overview.json()).toMatchObject({
+      hasData: true,
+      accounts: [{ creditor: 'Chase Bank', accountMask: '*1234' }],
+      utilization: { overallUtilizationPercent: 25 },
+    });
+
+    const letter = await fetch(`${base}/v1/credit-reports/dispute-letter`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creditor: 'Chase Bank',
+        accountMask: '*1234',
+        reason: 'The balance is incorrect.',
+        bureau: 'equifax',
+      }),
+    });
+    expect(letter.status).toBe(200);
+    const deleted = await fetch(`${base}/v1/credit-reports/${imported.report.id}`, { method: 'DELETE' });
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toMatchObject({ ok: true, hasData: false, reports: [] });
+    const missingDelete = await fetch(`${base}/v1/credit-reports/${imported.report.id}`, { method: 'DELETE' });
+    expect(missingDelete.status).toBe(404);
+    expect(await letter.json()).toMatchObject({ creditor: 'Chase Bank' });
 
     const wrongCreditFile = await fetch(`${base}/v1/credit-reports`, {
       method: 'POST',
@@ -120,6 +171,50 @@ describe('HTTP API', () => {
     expect(telegramConnect.status).toBe(422);
     expect(await telegramConnect.json()).toMatchObject({
       error: { code: 'invalid_input', message: 'Save a Telegram bot token first.' },
+    });
+  });
+
+  it('previews and saves generated alert rules', async () => {
+    const { base } = await httpFixture();
+    const preview = await fetch(`${base}/v1/alert-rules/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: 'Generate a weekly rule for large brokerage cash drag before a digest.',
+      }),
+    });
+    expect(preview.status).toBe(200);
+    const previewBody = await preview.json();
+    expect(previewBody).toMatchObject({
+      text: 'Generate a weekly rule for large brokerage cash drag before a digest.',
+      kind: 'rule_idle_brokerage_cash',
+      scope: 'brokerage',
+      cadence: 'weekly',
+      scheduledHour: 9,
+      mode: 'L',
+    });
+    expect(['auto', 'digest']).toContain(previewBody.channel);
+
+    const saved = await fetch(`${base}/v1/alert-rules`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: 'Generate a daily rule that flags high credit utilization.',
+        scope: 'credit',
+        cadence: 'daily',
+        channel: 'digest',
+        scheduledHour: 9,
+      }),
+    });
+    expect(saved.status).toBe(201);
+    expect(await saved.json()).toMatchObject({
+      kind: 'rule_credit_utilization',
+      sourceText: 'Generate a daily rule that flags high credit utilization.',
+      scope: 'credit',
+      cadence: 'daily',
+      channel: 'digest',
+      scheduledHour: 9,
+      enabled: true,
     });
   });
 

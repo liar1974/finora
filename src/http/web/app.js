@@ -167,6 +167,8 @@ const state = {
   llm: null,
   alertRules: [],
   alertMutes: [],
+  credit: { hasData: false, reports: [], accounts: [], inquiries: [], suggestions: [], utilization: null, latest: null },
+  creditTab: 'latest',
   settingsTab: 'models',
   notificationChannel: 'telegram',
   threads: [],
@@ -189,6 +191,7 @@ const pageSizeOptions = [10, 25, 50, 100];
 const bankTabs = [['summary', 'Summary'], ['transactions', 'Transactions'], ['cashflow', 'Cash flow'], ['recurring', 'Recurring']];
 const brokerageTabs = [['summary', 'Summary'], ['transactions', 'Transactions']];
 const settingsTabs = [['models', 'Models'], ['banks', 'Banks'], ['brokerage', 'Brokerage'], ['notifications', 'Notifications'], ['insights', 'Alerts & Insights']];
+const creditTabs = [['latest', 'Latest report overview'], ['reports', 'Reports']];
 const connectorCopy = {
   plaid: {
     title: 'Plaid banking',
@@ -221,25 +224,28 @@ const insightCategories = [
 const sampleInsightRules = [
   ['Connection health', 'event', 'all', 'D', null, 'Notify when Plaid or SnapTrade status is not active, a token is missing, or Plaid cursor is missing.'],
   ['Idle cash scan', 'weekly', 'banking', 'L', 9, 'Find cash balances above the local threshold and generate a short review note from the account evidence.'],
+  ['Low balance risk', 'daily', 'banking', 'D', 9, 'Flag checking or savings balances that fall below the local safety threshold.'],
+  ['Negative balance', 'event', 'banking', 'D', null, 'Notify immediately when an account balance is negative or an overdraft-like transaction posts.'],
   ['New large transaction', 'event', 'banking', 'L', null, 'Notify when any posted outflow exceeds $500 or 3x the account median outflow.'],
   ['Duplicate or unusual charge', 'event', 'banking', 'L+', null, 'Prefilter similar merchant charges, then ask the local model to accept or reject the duplicate signal.'],
   ['Subscription drift', 'weekly', 'banking', 'L', 9, 'Flag recurring merchants whose amount increased by more than 15% from the prior charge.'],
   ['Trial conversion watch', 'daily', 'banking', 'L+', 9, 'Detect trial-like merchants and ask the local model whether the charge looks like a conversion.'],
+  ['Discretionary spending review', 'weekly', 'banking', 'L', 9, 'Summarize dining, shopping, entertainment, and travel spend that moved materially from baseline.'],
   ['Cash runway', 'monthly', 'banking', 'L', 9, 'Estimate months of cash runway from latest cash balance and average monthly outflows.'],
   ['Expected income late', 'event', 'banking', 'L+', null, 'Prefilter missed income cadence and generate a review item when expected payroll or deposits are absent.'],
+  ['Fee and interest watch', 'event', 'banking', 'D', null, 'Flag bank fees, credit card interest, and cash advance charges as they post.'],
   ['Credit utilization', 'daily', 'credit', 'D', 9, 'Notify when credit card balance exceeds 30% or 70% of known limit.'],
+  ['Credit report review', 'monthly', 'credit', 'L+', 9, 'Review new bureau report changes, hard inquiries, derogatory lines, and dispute candidates.'],
+  ['Credit payment due', 'weekly', 'credit', 'L', 9, 'Surface card balances and payment timing when due-date evidence is available.'],
   ['Brokerage cash drag', 'weekly', 'brokerage', 'L', 9, 'Flag brokerage cash above 25% of portfolio value unless muted.'],
   ['Portfolio concentration', 'weekly', 'brokerage', 'L', 9, 'Flag any single holding above 20% of tracked holdings value.'],
   ['Single name net-worth exposure', 'weekly', 'all', 'L+', 9, 'Combine holdings and balances to review outsized exposure to one symbol or company.'],
+  ['Allocation drift', 'monthly', 'brokerage', 'L', 9, 'Compare current holdings mix with the saved target allocation when available.'],
+  ['Executed order review', 'event', 'brokerage', 'L', null, 'Summarize buy, sell, dividend reinvestment, and option-like brokerage activity.'],
   ['Dividend or interest received', 'event', 'brokerage', 'L', null, 'Notify on income-like brokerage transactions with symbol and account context.'],
   ['Weekly financial health check', 'weekly', 'all', 'L', 9, 'Generate a concise digest of balances, spending, investments, and connection health.'],
   ['Net worth movement', 'monthly', 'all', 'L', 9, 'Compare latest balances with the prior month and explain the largest movers.'],
-];
-const rulePromptTemplates = [
-  'Generate a weekly rule that reviews duplicate or unusual bank charges.',
-  'Generate an event rule for large brokerage cash drag before a weekly digest.',
-  'Generate a monthly rule that explains the biggest net-worth movers.',
-  'Generate a daily rule that flags high credit utilization.',
+  ['Stale local imports', 'weekly', 'all', 'D', 9, 'Flag accounts that have not received a file import or provider sync recently.'],
 ];
 const builtInRulesKey = 'finora.builtInRules.v1';
 const notificationChannels = {
@@ -275,9 +281,10 @@ async function api(path, options) {
   const request = { ...(options ?? {}) };
   request.headers = new Headers(request.headers);
   if (desktopToken) request.headers.set('X-Finora-Desktop-Token', desktopToken);
-  const response = await fetch(path, request);
+  const url = new URL(path, location.origin);
+  const response = await fetch(url, request);
   const body = await response.json();
-  if (!response.ok) throw new Error(body.error?.message ?? `Request failed (${response.status})`);
+  if (!response.ok) throw new Error(body.error?.message ? `${body.error.message} (${url.pathname})` : `Request failed (${response.status})`);
   return body;
 }
 
@@ -317,6 +324,18 @@ function monthKey(date) {
   return String(date || '').slice(0, 7) || 'Unknown';
 }
 
+function weekKey(date) {
+  const parsed = new Date(`${String(date || '').slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return 'Unknown';
+  const day = parsed.getUTCDay() || 7;
+  parsed.setUTCDate(parsed.getUTCDate() - day + 1);
+  return parsed.toISOString().slice(0, 10);
+}
+
+function periodKey(date, granularity = 'month') {
+  return granularity === 'week' ? weekKey(date) : monthKey(date);
+}
+
 function groupSum(rows, keyFn, valueFn, seedFn = (key) => ({ key })) {
   const map = new Map();
   for (const row of rows) {
@@ -342,12 +361,20 @@ function resolveArtifactRows(artifact) {
   const source = artifact.dataSource || {};
   const name = String(source.name || source.kind || '').toLowerCase();
   const params = source.params || {};
+  const scopedTransactions = (rows = state.transactions) => rows.filter((txn) => {
+    if (params.from && txn.date < params.from) return false;
+    if (params.to && txn.date > params.to) return false;
+    const acct = account(txn.accountId);
+    if (params.accountType === 'credit' && !isCreditAccount(acct || {})) return false;
+    if (params.accountType === 'banking' && isCreditAccount(acct || {})) return false;
+    return true;
+  });
 
   if (name.includes('cash_flow')) {
-    const txns = state.transactions.filter((txn) => (!params.from || txn.date >= params.from) && (!params.to || txn.date <= params.to));
+    const txns = scopedTransactions();
     const rows = groupSum(
       txns,
-      (txn) => `${monthKey(txn.date)}${params.groupBy === 'account' ? `|${accountLabel(txn.accountId)}` : ''}`,
+      (txn) => `${periodKey(txn.date, params.granularity)}${params.groupBy === 'account' ? `|${accountLabel(txn.accountId)}` : ''}`,
       (row, txn) => {
         if (txn.amountMinor >= 0) row.income_cents += txn.amountMinor;
         else row.expense_cents += Math.abs(txn.amountMinor);
@@ -361,9 +388,25 @@ function resolveArtifactRows(artifact) {
     return rows.sort((a, b) => `${a.period}${a.account || ''}`.localeCompare(`${b.period}${b.account || ''}`));
   }
 
+  if (name.includes('transaction_count')) {
+    return groupSum(
+      scopedTransactions(),
+      (txn) => `${periodKey(txn.date, params.granularity)}${params.groupBy === 'account' ? `|${accountLabel(txn.accountId)}` : ''}`,
+      (row, txn) => {
+        row.transactions += 1;
+        if (txn.amountMinor < 0) row.outflows += 1;
+        if (txn.amountMinor >= 0) row.inflows += 1;
+      },
+      (key) => {
+        const [period, accountName] = key.split('|');
+        return { period, account: accountName, transactions: 0, outflows: 0, inflows: 0 };
+      },
+    ).sort((a, b) => `${a.period}${a.account || ''}`.localeCompare(`${b.period}${b.account || ''}`));
+  }
+
   if (name.includes('spending') || name.includes('category')) {
     return groupSum(
-      state.transactions.filter((txn) => txn.amountMinor < 0),
+      scopedTransactions().filter((txn) => txn.amountMinor < 0),
       (txn) => txn.category || 'Uncategorized',
       (row, txn) => {
         row.amount_cents += Math.abs(txn.amountMinor);
@@ -375,7 +418,7 @@ function resolveArtifactRows(artifact) {
 
   if (name.includes('merchant')) {
     return groupSum(
-      state.transactions.filter((txn) => txn.amountMinor < 0),
+      scopedTransactions().filter((txn) => txn.amountMinor < 0),
       (txn) => txn.description || 'Unknown',
       (row, txn) => {
         row.amount_cents += Math.abs(txn.amountMinor);
@@ -543,7 +586,7 @@ function renderVegaChart(chart, artifact, rows, x, series, format) {
   // Vega's default expression compiler uses Function(), which is correctly
   // blocked by Finora's CSP. AST mode uses vega-interpreter instead, preserving
   // interactive charts without weakening script-src with unsafe-eval.
-  vegaEmbed(chart, spec, { actions: false, renderer: 'svg', theme: 'none', ast: true }).catch((error) => {
+  vegaEmbed(chart, spec, { actions: false, renderer: 'svg', theme: 'none', ast: true, tooltip: false }).catch((error) => {
     chart.classList.remove('vlchart');
     chart.replaceChildren(empty(`Could not render interactive chart: ${error.message || error}`));
   });
@@ -732,9 +775,46 @@ function saveCustomDashboardArtifact(artifact) {
   localStorage.setItem(customChartsKey, JSON.stringify(rows.slice(0, 24)));
 }
 
-function customChartFromPrompt(prompt) {
+function updateCustomDashboardArtifact(id, artifact) {
+  const rows = customDashboardArtifacts();
+  const index = rows.findIndex((row) => row.id === id || row.publicId === id);
+  if (index === -1) {
+    rows.unshift(artifact);
+  } else {
+    rows[index] = artifact;
+  }
+  localStorage.setItem(customChartsKey, JSON.stringify(rows.slice(0, 24)));
+}
+
+function removeCustomDashboardArtifact(id) {
+  localStorage.setItem(customChartsKey, JSON.stringify(customDashboardArtifacts().filter((row) => row.id !== id && row.publicId !== id)));
+}
+
+function hiddenDashboardArtifacts() {
+  try {
+    const rows = JSON.parse(localStorage.getItem(hiddenDashboardArtifactsKey) || '[]');
+    return new Set(Array.isArray(rows) ? rows : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function hideDashboardArtifact(id) {
+  const hidden = hiddenDashboardArtifacts();
+  hidden.add(id);
+  localStorage.setItem(hiddenDashboardArtifactsKey, JSON.stringify([...hidden].slice(0, 200)));
+}
+
+function isCustomArtifact(artifact) {
+  return String(artifact?.id || artifact?.publicId || '').startsWith('custom.');
+}
+
+function customChartFromPrompt(prompt, existing = null) {
   const text = normalizeText(prompt);
-  const id = `custom.${Date.now()}`;
+  const id = existing?.id || existing?.publicId || `custom.${Date.now()}`;
+  const granularity = /week|weekly|每周/.test(text) ? 'week' : 'month';
+  const accountType = /credit card|credit cards|card transaction|card transactions|信用卡/.test(text) ? 'credit' : undefined;
+  const wantsCount = /transaction number|transaction count|number of transaction|count of transaction|transactions by|交易数量|笔数/.test(text);
   const type = text.includes('donut') || text.includes('pie') ? 'donut'
     : text.includes('line') || text.includes('trend') ? 'line'
       : text.includes('area') ? 'area'
@@ -742,15 +822,19 @@ function customChartFromPrompt(prompt) {
           : text.includes('metric') || text.includes('kpi') ? 'metric'
             : 'bar';
   let title = 'Custom cash flow';
-  let dataSource = { kind: 'tool', name: 'cash_flow', params: { from: state.from, to: state.to } };
+  let dataSource = { kind: 'tool', name: 'cash_flow', params: { from: state.from, to: state.to, granularity, ...(accountType ? { accountType } : {}) } };
   let render = { type, x: 'period', y: ['income_cents', 'expense_cents', 'net_cents'], options: { yFormat: 'currency' } };
-  if (text.includes('spending') || text.includes('category')) {
-    title = 'Custom spending by category';
-    dataSource = { kind: 'tool', name: 'spending_by_category', params: { from: state.from, to: state.to } };
+  if (wantsCount) {
+    title = `${accountType === 'credit' ? 'Credit card' : 'Transaction'} count by ${granularity}`;
+    dataSource = { kind: 'tool', name: 'transaction_count', params: { from: state.from, to: state.to, granularity, ...(accountType ? { accountType } : {}) } };
+    render = { type: type === 'donut' ? 'bar' : type, x: 'period', y: 'transactions', options: { yFormat: 'number' } };
+  } else if (text.includes('spending') || text.includes('category')) {
+    title = `${accountType === 'credit' ? 'Credit card' : 'Custom'} spending by category`;
+    dataSource = { kind: 'tool', name: 'spending_by_category', params: { from: state.from, to: state.to, ...(accountType ? { accountType } : {}) } };
     render = { type: type === 'line' ? 'bar' : type, x: 'category', y: 'amount_cents', options: { yFormat: 'currency' } };
   } else if (text.includes('merchant') || text.includes('vendor')) {
-    title = 'Custom merchant spend';
-    dataSource = { kind: 'tool', name: 'merchant_spending', params: { from: state.from, to: state.to } };
+    title = `${accountType === 'credit' ? 'Credit card' : 'Custom'} merchant spend`;
+    dataSource = { kind: 'tool', name: 'merchant_spending', params: { from: state.from, to: state.to, ...(accountType ? { accountType } : {}) } };
     render = { type: type === 'line' ? 'bar' : type, x: 'merchant', y: 'amount_cents', options: { yFormat: 'currency' } };
   } else if (text.includes('holding') || text.includes('portfolio') || text.includes('investment')) {
     title = 'Custom portfolio holdings';
@@ -760,6 +844,8 @@ function customChartFromPrompt(prompt) {
     title = 'Custom account balances';
     dataSource = { kind: 'tool', name: 'account_balances', params: {} };
     render = { type, x: 'account', y: 'balance_cents', options: { yFormat: 'currency' } };
+  } else if (accountType === 'credit') {
+    title = `Credit card cash flow by ${granularity}`;
   }
   return {
     id,
@@ -995,6 +1081,7 @@ function toast(text) {
 
 const dismissedInsightsKey = 'finora.dismissedInsights.v1';
 const customChartsKey = 'finora.customCharts.v1';
+const hiddenDashboardArtifactsKey = 'finora.hiddenDashboardArtifacts.v1';
 
 function dismissedInsights() {
   try {
@@ -1071,6 +1158,7 @@ async function loadData() {
     llm,
     alertRules,
     alertMutes,
+    credit,
   ] = await Promise.all([
     api('/v1/accounts'),
     api('/v1/summary'),
@@ -1085,6 +1173,7 @@ async function loadData() {
     api('/v1/llm'),
     api('/v1/alert-rules'),
     api('/v1/alert-mutes'),
+    api('/v1/credit-reports'),
   ]);
   state.accounts = accounts.items;
   state.summary = summary.items;
@@ -1101,13 +1190,14 @@ async function loadData() {
   state.notificationChannel = settingValue('NOTIFICATION_CHANNEL', state.notificationChannel);
   state.alertRules = alertRules.items;
   state.alertMutes = alertMutes.items;
+  state.credit = credit;
 }
 
 function renderSidebar() {
   const side = $('#sidebar');
   side.replaceChildren();
   const brand = el('div', 'brand');
-  brand.innerHTML = '<span class="brandmark" aria-hidden="true"><svg viewBox="0 0 64 64" role="img"><rect width="64" height="64" rx="14" fill="#123f30"/><path d="M20 16h27v8H29v8h15v8H29v12h-9V16Z" fill="#f8f1e6"/></svg></span><span>Finora</span>';
+  brand.innerHTML = '<span>Finora</span>';
   side.appendChild(brand);
 
   const nav = el('div', 'navsec');
@@ -1150,7 +1240,10 @@ function topbar(title, eyebrow = 'Local finance workspace', options = {}) {
     text.innerHTML = `<p>${esc(eyebrow)}</p><h1>${esc(title)}</h1>`;
     bar.appendChild(text);
   }
-  if (!options.hideDateRange) bar.appendChild(dateRangeControl());
+  const controls = el('div', 'topbarcontrols');
+  if (!options.hideDateRange) controls.appendChild(dateRangeControl());
+  if (options.action) controls.appendChild(options.action);
+  if (controls.children.length) bar.appendChild(controls);
   return bar;
 }
 
@@ -1602,10 +1695,6 @@ function buildFeedItems() {
   if (monthlySpend > 0) {
     items.push({ zone: 'insights', group: 'Cash flow', icon: '-', title: 'Spending in selected range', detail: `${selectedTransactions().filter((txn) => txn.amountMinor < 0).length} outflow rows across bank accounts.`, value: shortMoney(monthlySpend) });
   }
-  for (const rule of state.alertRules.filter((item) => item.enabled).slice(0, 4)) {
-    items.push({ zone: 'insights', group: 'Local rules', icon: '*', title: rule.sourceText, detail: `${rule.scope} - ${rule.cadence} - ${ruleHourLabel(rule)} - ${rule.channel}`, value: 'On' });
-  }
-
   return items;
 }
 
@@ -1807,15 +1896,251 @@ function brokerageSummaryCards() {
 
 function renderCredit() {
   state.section = 'credit';
+  activeCreditUpload = null;
   renderSidebar();
   const view = $('#view');
-  view.replaceChildren(topbar('Credit', 'Credit bureau reports'));
-  const sec = el('div', 'sec creditupload');
-  sec.innerHTML = '<div class="sechdr"><h3>Credit report upload</h3><span class="pill">PDF only</span></div>';
+  const actions = el('div', 'row');
+  actions.innerHTML = '<button class="primary" type="button" id="openCreditUpload">Upload report</button><button class="ghost" type="button" id="manageCreditReports">Manage reports</button>';
+  view.replaceChildren(topbar('Credit Reports', 'Imported from AnnualCreditReport', { action: actions, hideDateRange: true }));
+  view.appendChild(renderSubnav(creditTabs, state.creditTab, (tab) => {
+    state.creditTab = tab;
+    renderCredit();
+  }));
+
+  if (state.creditTab === 'reports') renderCreditReportsTab(view);
+  else renderLatestCreditReportOverview(view);
+
+  $('#openCreditUpload').addEventListener('click', openCreditUploadModal);
+  $('#manageCreditReports').addEventListener('click', openCreditManageModal);
+}
+
+function formatReportDate(value) {
+  if (!value) return 'Date unavailable';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric' }).format(date);
+}
+
+function reportLabel(report = {}) {
+  return `${report.bureau || 'Unknown bureau'} report`;
+}
+
+function bytesLabel(bytes) {
+  const value = Number(bytes || 0);
+  if (!value) return '-';
+  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function oldestAccountAge(accounts) {
+  const dates = accounts
+    .map((account) => account.dateOpened)
+    .filter(Boolean)
+    .map((value) => new Date(value))
+    .filter((date) => !Number.isNaN(date.getTime()))
+    .sort((a, b) => a.getTime() - b.getTime());
+  if (!dates.length) return '-';
+  const now = new Date();
+  let months = (now.getFullYear() - dates[0].getFullYear()) * 12 + (now.getMonth() - dates[0].getMonth());
+  if (now.getDate() < dates[0].getDate()) months -= 1;
+  if (months < 0) return '-';
+  return `${Math.floor(months / 12)} yrs ${months % 12} mos`;
+}
+
+function latestCreditMetrics() {
+  const latest = state.credit.latest || {};
+  const accounts = state.credit.accounts || [];
+  const hardInquiries = (state.credit.inquiries || []).filter((item) => item.type === 'hard').length;
+  const latePayments = accounts.filter((account) => Number(account.pastDueMinor || 0) > 0 || /late|past due|delinquent/i.test(account.status || '')).length;
+  return [
+    ['Open accounts', latest.openAccounts ?? accounts.filter((account) => account.isOpen).length],
+    ['Hard inquiries', latest.inquiries ?? hardInquiries],
+    ['Collections', latest.collections ?? accounts.filter((account) => /collection/i.test(account.status || '')).length],
+    ['Late payments', latePayments],
+    ['Public records', latest.publicRecords ?? 0],
+    ['Oldest account age', oldestAccountAge(accounts)],
+  ];
+}
+
+function renderLatestCreditReportOverview(view) {
+  const latest = state.credit.latest;
+  if (!latest) {
+    const emptySec = el('div', 'sec creditlatest');
+    emptySec.innerHTML = '<div class="sechdr"><h3>Latest report overview</h3><span class="pill">Local only</span></div>';
+    emptySec.appendChild(empty('Upload a text-searchable Equifax, Experian, TransUnion, or AnnualCreditReport PDF to see deterministic report facts here.'));
+    view.appendChild(emptySec);
+    return;
+  }
+
+  const overview = el('div', 'sec creditlatest');
+  overview.innerHTML = `
+    <div class="creditreporthead">
+      <div>
+        <div class="kicker">Latest uploaded report</div>
+        <div class="creditreporttitle">${esc(reportLabel(latest))}</div>
+        <div class="creditreportmeta">${esc(latest.filename)} · Uploaded ${esc(formatReportDate(latest.createdAt))}${latest.reportDate ? ` · Report date ${esc(formatReportDate(latest.reportDate))}` : ''}</div>
+      </div>
+      <span class="status ${state.credit.suggestions.length ? 'warn' : 'good'}">${state.credit.suggestions.length ? `${state.credit.suggestions.length} review flag${state.credit.suggestions.length === 1 ? '' : 's'}` : 'No obvious flags'}</span>
+    </div>`;
+  const metrics = el('div', 'creditmetricgrid');
+  for (const [label, value] of latestCreditMetrics()) {
+    const cell = el('div', 'creditmetric');
+    cell.innerHTML = `<div class="lab">${esc(label)}</div><div class="value num">${esc(value)}</div>`;
+    metrics.appendChild(cell);
+  }
+  overview.appendChild(metrics);
+  view.appendChild(overview);
+
+  renderCreditAiInsights(view);
+  renderCreditOpenAccounts(view);
+  renderCreditInquiries(view);
+}
+
+function accountBalanceSummary(account) {
+  const parts = [];
+  if (account.balanceMinor !== null && account.balanceMinor !== undefined) parts.push(`Balance ${money(account.balanceMinor)}`);
+  if (account.creditLimitMinor !== null && account.creditLimitMinor !== undefined) parts.push(`Limit ${money(account.creditLimitMinor)}`);
+  if (Number(account.creditLimitMinor || 0) > 0 && account.balanceMinor !== null && account.balanceMinor !== undefined) {
+    const utilization = Math.round((Math.max(0, Number(account.balanceMinor || 0)) / Number(account.creditLimitMinor)) * 1000) / 10;
+    parts.push(`Utilization ${utilization}%`);
+  }
+  if (Number(account.pastDueMinor || 0) > 0) parts.push(`Past due ${money(account.pastDueMinor)}`);
+  return parts.join(' · ') || account.accountType || 'Account details unavailable';
+}
+
+function renderMiniReportList(rows, emptyText, limit = 5) {
+  const block = el('div', 'reportdetailblock');
+  if (!rows.length) {
+    const emptyRow = el('div', 'reportminirow emptymini');
+    emptyRow.textContent = emptyText;
+    block.appendChild(emptyRow);
+    return block;
+  }
+  for (const row of rows.slice(0, limit)) {
+    const item = el('div', `reportminirow ${row.level || ''}`);
+    item.innerHTML = `<div class="nm">${esc(row.title)}</div><div class="sub">${esc(row.detail)}</div>`;
+    block.appendChild(item);
+  }
+  if (rows.length > limit) {
+    const more = el('div', 'reportminirow moremini');
+    more.textContent = `+${rows.length - limit} more`;
+    block.appendChild(more);
+  }
+  return block;
+}
+
+function renderCreditOpenAccounts(view) {
+  const accounts = state.credit.accounts || [];
+  const openAccounts = accounts
+    .filter((account) => account.isOpen)
+    .map((account) => ({
+      title: `${account.creditor}${account.accountMask ? ` ${account.accountMask}` : ''}`,
+      detail: accountBalanceSummary(account),
+      level: Number(account.pastDueMinor || 0) > 0 || account.isNegative ? 'medium' : '',
+    }));
+  const section = el('div', 'sec creditdetails');
+  section.innerHTML = '<div class="sechdr"><h3>Open accounts</h3><span class="pill">Latest report</span></div>';
+  section.appendChild(renderMiniReportList(openAccounts, 'No open accounts parsed.', 8));
+  view.appendChild(section);
+}
+
+function renderCreditInquiries(view) {
+  const inquiries = state.credit.inquiries || [];
+  const rows = inquiries
+    .map((inquiry) => ({
+      title: inquiry.company || 'Unknown company',
+      detail: `${inquiry.type === 'hard' ? 'Hard' : 'Soft'} inquiry${inquiry.inquiryDate ? ` · ${formatReportDate(inquiry.inquiryDate)}` : ''}`,
+      level: inquiry.type === 'hard' ? 'medium' : '',
+    }));
+  const section = el('div', 'sec creditdetails');
+  section.innerHTML = '<div class="sechdr"><h3>Inquiries</h3><span class="pill">Hard + soft</span></div>';
+  section.appendChild(renderMiniReportList(rows, 'No inquiries parsed.', 8));
+  view.appendChild(section);
+}
+
+function renderCreditAiInsights(view) {
+  const latest = state.credit.latest;
+  const reports = state.credit.reports || [];
+  const suggestions = state.credit.suggestions || [];
+  const previous = reports.find((report) => report.id !== latest?.id);
+  const insights = [];
+  if (suggestions.length) {
+    const top = suggestions[0];
+    insights.push({
+      level: top.severity || 'medium',
+      title: `${top.issue} may need review`,
+      text: `${top.creditor}: ${top.why}`,
+    });
+  } else {
+    insights.push({ level: 'low', title: 'No dispute candidates detected', text: 'The parser did not find obvious collections, past-due balances, or hard inquiry issues in the latest report.' });
+  }
+  if (previous) {
+    const diff = Number(latest.openAccounts || 0) - Number(previous.openAccounts || 0);
+    insights.push({
+      level: diff === 0 ? 'low' : 'medium',
+      title: previous.bureau === latest.bureau ? 'Compared with the previous upload' : 'Compared with another bureau upload',
+      text: `${reportLabel(previous)} was uploaded ${formatReportDate(previous.createdAt)}. Open accounts changed by ${diff > 0 ? '+' : ''}${diff}; hard inquiries are ${latest.inquiries ?? 0} on the latest report versus ${previous.inquiries ?? 0}.`,
+    });
+  } else {
+    insights.push({ level: 'low', title: 'Only one report is uploaded', text: 'Add another bureau report when available to let AI look for bureau-to-bureau differences.' });
+  }
+  if ((latest.collections || 0) > 0 || (latest.publicRecords || 0) > 0) {
+    insights.push({ level: 'high', title: 'Derogatory information present', text: 'Collections or public records can be worth checking against your own records before taking action.' });
+  }
+
+  const sec = el('div', 'sec creditinsights');
+  sec.innerHTML = '<div class="sechdr"><h3>AI insights</h3><span class="pill">Assistant layer</span></div>';
+  for (const insight of insights) {
+    const row = el('div', `insightrow ${insight.level}`);
+    row.innerHTML = `<div><div class="nm">${esc(insight.title)}</div><div class="sub">${esc(insight.text)}</div></div>`;
+    sec.appendChild(row);
+  }
+  view.appendChild(sec);
+}
+
+function renderCreditReportsTab(view) {
+  const reports = state.credit.reports || [];
+  const sec = el('div', 'sec creditreports');
+  sec.innerHTML = '<div class="sechdr"><h3>Uploaded PDF reports</h3><span class="pill">History</span></div>';
+  if (!reports.length) {
+    sec.appendChild(empty('No uploaded credit report PDFs yet.'));
+    view.appendChild(sec);
+    return;
+  }
+  const list = el('div', 'reportlist');
+  for (const report of reports) {
+    const row = el('div', 'reportrow');
+    row.innerHTML = `
+      <div>
+        <div class="nm">${esc(reportLabel(report))}</div>
+        <div class="sub">${esc(report.filename)} · Uploaded ${esc(formatReportDate(report.createdAt))} · ${esc(bytesLabel(report.bytes))}</div>
+      </div>
+      <div class="reportfacts">
+        <span class="pill">${esc(report.openAccounts ?? 0)} open</span>
+        <span class="pill">${esc(report.inquiries ?? 0)} hard inquiries</span>
+      </div>`;
+    const actions = el('div', 'row');
+    const structured = el('button', 'ghost');
+    structured.type = 'button';
+    structured.textContent = 'View parsed data';
+    structured.addEventListener('click', () => openReportStructuredModal(report));
+    actions.appendChild(structured);
+    row.appendChild(actions);
+    list.appendChild(row);
+  }
+  sec.appendChild(list);
+  view.appendChild(sec);
+}
+
+function openCreditUploadModal() {
+  const panel = el('div');
+  panel.innerHTML = `<div class="sechdr"><h3>Upload credit report</h3><button class="ghost" type="button" id="closeModal">Close</button></div>
+    <div class="cardsub">Download your free report from <a href="https://www.annualcreditreport.com/" target="_blank" rel="noreferrer">annualcreditreport.com</a>, then upload the text-searchable PDF here.</div>`;
   const form = el('form', 'formgrid creditform');
   form.innerHTML = '<label class="file-drop compact">Drop PDF or choose file<small id="creditFileName">Experian, Equifax, TransUnion, or annual credit report PDF</small><input name="file" type="file" accept="application/pdf,.pdf"></label><span class="message" id="creditMessage"></span><div class="uploadhistory" id="creditUploadHistory"></div>';
-  sec.appendChild(form);
-  view.appendChild(sec);
+  panel.appendChild(form);
+  modal(panel);
+  $('#closeModal').addEventListener('click', closeModal);
 
   const fileInput = form.elements.file;
   const dropzone = form.querySelector('.file-drop');
@@ -1836,9 +2161,13 @@ function renderCredit() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filename: file.name, contentBase64: btoa(binary) }),
       });
-      const detail = result.note || result.status || 'Credit report PDF received.';
+      const detail = `${result.report?.accounts ?? 0} credit lines, ${result.report?.inquiries ?? 0} hard inquiries, ${result.suggestions?.length ?? 0} review flags.`;
       message.textContent = `Processed ${file.name}.`;
       history.prepend(uploadResultRow(file.name, `${Math.round(result.bytes / 1024)} KB`, detail));
+      await loadData();
+      activeCreditUpload = null;
+      closeModal();
+      render();
       toast('Credit report PDF processed.');
     } catch (error) {
       message.textContent = error.message;
@@ -1856,19 +2185,19 @@ function renderCredit() {
     if (file) uploadFile(file);
   });
   for (const eventName of ['dragenter', 'dragover']) {
-    sec.addEventListener(eventName, (event) => {
+    panel.addEventListener(eventName, (event) => {
       event.preventDefault();
       dropzone.classList.add('dragging');
     });
   }
   for (const eventName of ['dragleave', 'drop']) {
-    sec.addEventListener(eventName, (event) => {
+    panel.addEventListener(eventName, (event) => {
       event.preventDefault();
-      if (eventName === 'dragleave' && sec.contains(event.relatedTarget)) return;
+      if (eventName === 'dragleave' && panel.contains(event.relatedTarget)) return;
       dropzone.classList.remove('dragging');
     });
   }
-  sec.addEventListener('drop', (event) => {
+  panel.addEventListener('drop', (event) => {
     const file = event.dataTransfer?.files?.[0];
     if (!file) return;
     $('#creditFileName').textContent = file.name;
@@ -1879,6 +2208,84 @@ function renderCredit() {
   });
 }
 
+function openCreditManageModal() {
+  const reports = state.credit.reports || [];
+  const panel = el('div');
+  panel.innerHTML = `<div class="sechdr"><h3>Manage reports</h3><button class="ghost" type="button" id="closeModal">Close</button></div>
+    <p class="cardsub">Review uploaded credit report PDFs and remove reports you no longer want Finora to keep.</p>`;
+  const list = el('div', 'reportlist');
+  if (!reports.length) {
+    list.appendChild(empty('No uploaded reports yet.'));
+  } else {
+    for (const report of reports) {
+      const row = el('div', 'reportrow');
+      row.innerHTML = `<div><div class="nm">${esc(reportLabel(report))}</div><div class="sub">${esc(report.filename)} · Uploaded ${esc(formatReportDate(report.createdAt))}</div></div>`;
+      const actions = el('div', 'row');
+      const viewButton = el('button', 'ghost');
+      viewButton.type = 'button';
+      viewButton.textContent = 'View parsed data';
+      viewButton.addEventListener('click', () => openReportStructuredModal(report));
+      const deleteButton = el('button', 'ghost danger');
+      deleteButton.type = 'button';
+      deleteButton.textContent = 'Delete';
+      deleteButton.addEventListener('click', async () => {
+        deleteButton.disabled = true;
+        try {
+          state.credit = await api(`/v1/credit-reports/${encodeURIComponent(report.id)}`, { method: 'DELETE' });
+          toast('Credit report deleted.');
+          closeModal();
+          renderCredit();
+        } catch (error) {
+          deleteButton.disabled = false;
+          toast(error.message);
+        }
+      });
+      actions.append(viewButton, deleteButton);
+      row.appendChild(actions);
+      list.appendChild(row);
+    }
+  }
+  panel.appendChild(list);
+  modal(panel);
+  $('#closeModal').addEventListener('click', closeModal);
+}
+
+function openReportStructuredModal(report) {
+  const raw = report.raw || {};
+  const panel = el('div');
+  panel.innerHTML = `<div class="sechdr"><h3>${esc(reportLabel(report))}</h3><button class="ghost" type="button" id="closeModal">Close</button></div>
+    <div class="statusgrid">
+      <div class="statuscell"><div class="lab">Bureau</div><div class="value">${esc(report.bureau || 'Unknown')}</div></div>
+      <div class="statuscell"><div class="lab">Report date</div><div class="value">${esc(formatReportDate(report.reportDate))}</div></div>
+      <div class="statuscell"><div class="lab">Uploaded</div><div class="value">${esc(formatReportDate(report.createdAt))}</div></div>
+      <div class="statuscell"><div class="lab">File</div><div class="value">${esc(bytesLabel(report.bytes))}</div></div>
+    </div>`;
+  const accounts = asStructuredRows(raw.accounts);
+  const inquiries = asStructuredRows(raw.inquiries);
+  const suggestions = asStructuredRows(raw.suggestions);
+  panel.appendChild(structuredPreview('Accounts', accounts));
+  panel.appendChild(structuredPreview('Inquiries', inquiries));
+  panel.appendChild(structuredPreview('Dispute candidates', suggestions));
+  modal(panel);
+  $('#closeModal').addEventListener('click', closeModal);
+}
+
+function asStructuredRows(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function structuredPreview(title, rows) {
+  const sec = el('div', 'structuredblock');
+  sec.innerHTML = `<div class="sechdr"><h3>${esc(title)}</h3><span class="pill">${rows.length}</span></div>`;
+  if (!rows.length) {
+    sec.appendChild(empty(`No ${title.toLowerCase()} parsed for this report.`));
+    return sec;
+  }
+  const keys = Object.keys(rows[0]).slice(0, 5);
+  sec.appendChild(renderDataTable(keys.map(chartLabel), rows.map((row) => keys.map((key) => esc(row[key] ?? '-')))));
+  return sec;
+}
+
 function uploadResultRow(filename, meta, detail, failed = false) {
   const row = el('div', `uploadrow${failed ? ' failed' : ''}`);
   row.innerHTML = `<div><div class="nm">${esc(filename)}</div><div class="sub">${esc(detail)}</div></div><span class="pill">${esc(meta)}</span>`;
@@ -1887,24 +2294,17 @@ function uploadResultRow(filename, meta, detail, failed = false) {
 
 function renderDashboards() {
   const view = $('#view');
-  view.replaceChildren(topbar('Dashboards', 'Saved views'));
-  const creator = el('div', 'sec chartcreator');
-  creator.innerHTML = '<div class="sechdr"><h3>Create chart</h3><span class="pill">Plain text</span></div>';
-  const form = el('form', 'chartprompt');
-  form.innerHTML = '<input name="prompt" placeholder="Example: monthly cash flow line chart, spending by category donut, top merchants bar chart" required><button class="primary" type="submit">Create chart</button>';
-  creator.appendChild(form);
-  view.appendChild(creator);
-  form.addEventListener('submit', (event) => {
-    event.preventDefault();
-    const prompt = String(new FormData(form).get('prompt') || '').trim();
-    if (!prompt) return;
-    saveCustomDashboardArtifact(customChartFromPrompt(prompt));
-    toast('Chart created.');
-    renderDashboards();
-  });
+  const createButton = el('button', 'primary');
+  createButton.type = 'button';
+  createButton.id = 'openChartCreator';
+  createButton.textContent = 'Create chart';
+  view.replaceChildren(topbar('Dashboards', 'Saved views', { action: createButton }));
+  $('#openChartCreator').addEventListener('click', openChartModal);
   const customArtifacts = customDashboardArtifacts();
-  const dashboards = state.dashboards.length
-    ? state.dashboards.map((dashboard, index) => index === 0 ? {
+  const hiddenArtifacts = hiddenDashboardArtifacts();
+  const savedDashboards = state.dashboards;
+  const dashboards = savedDashboards.length
+    ? savedDashboards.map((dashboard, index) => index === 0 ? {
         ...dashboard,
         artifacts: [...customArtifacts, ...(dashboard.artifacts || [])],
         layout: [
@@ -1921,12 +2321,22 @@ function renderDashboards() {
       }];
   for (const dashboard of dashboards) {
     const sec = el('div', 'sec');
-    const artifactCount = dashboard.artifacts?.length || 0;
-    sec.innerHTML = `<div class="sechdr"><h3>${esc(dashboard.name)}</h3><span class="pill">${artifactCount} artifact${artifactCount === 1 ? '' : 's'}</span></div>`;
-    const layout = el('div', 'cardsub');
-    layout.textContent = `Updated ${dashboard.updatedAt}. Layout items: ${Array.isArray(dashboard.layout) ? dashboard.layout.length : 0}.`;
-    sec.appendChild(layout);
-    const artifacts = dashboard.artifacts || [];
+    const visibleArtifacts = (dashboard.artifacts || []).filter((artifact) => !hiddenArtifacts.has(artifact.publicId || artifact.id));
+    const artifactCount = visibleArtifacts.length;
+    sec.innerHTML = `<div class="sechdr"><h3>${esc(dashboard.name)}</h3><div class="row"><span class="pill">${artifactCount} artifact${artifactCount === 1 ? '' : 's'}</span>${artifactCount ? '<button class="ghost danger dashboarddelete" type="button">Delete dashboard</button>' : ''}</div></div>`;
+    const dashboardDelete = sec.querySelector('.dashboarddelete');
+    if (dashboardDelete) {
+      dashboardDelete.addEventListener('click', () => {
+        for (const artifact of visibleArtifacts) {
+          const id = artifact.publicId || artifact.id;
+          if (isCustomArtifact(artifact)) removeCustomDashboardArtifact(id);
+          else hideDashboardArtifact(id);
+        }
+        toast('Dashboard deleted.');
+        renderDashboards();
+      });
+    }
+    const artifacts = visibleArtifacts;
     const byId = new Map();
     for (const artifact of artifacts) {
       byId.set(artifact.id, artifact);
@@ -1943,6 +2353,28 @@ function renderDashboards() {
       slot.style.margin = '0';
       const span = Number(item.w || item.width || 6);
       slot.style.gridColumn = `span ${Math.min(12, Math.max(3, span))}`;
+      const actions = el('div', 'dashactions');
+      if (isCustomArtifact(saved)) {
+        const edit = el('button', 'iconbtn');
+        edit.type = 'button';
+        edit.textContent = 'Edit';
+        edit.title = 'Edit chart';
+        edit.addEventListener('click', () => openChartModal(saved));
+        actions.appendChild(edit);
+      }
+      const remove = el('button', 'iconbtn danger');
+      remove.type = 'button';
+      remove.textContent = 'Delete';
+      remove.title = isCustomArtifact(saved) ? 'Delete chart' : 'Hide widget';
+      remove.addEventListener('click', () => {
+        const id = saved.publicId || saved.id;
+        if (isCustomArtifact(saved)) removeCustomDashboardArtifact(id);
+        else hideDashboardArtifact(id);
+        toast(isCustomArtifact(saved) ? 'Chart deleted.' : 'Widget hidden.');
+        renderDashboards();
+      });
+      actions.appendChild(remove);
+      slot.appendChild(actions);
       const host = el('div');
       slot.appendChild(host);
       grid.appendChild(slot);
@@ -1954,9 +2386,99 @@ function renderDashboards() {
   }
 }
 
+function openChartModal(existingArtifact = null) {
+  const panel = el('div', 'chartcreator');
+  panel.dataset.modalClass = 'chartmodal-shell';
+  const editing = Boolean(existingArtifact);
+  const existingPrompt = existingArtifact?.artifact?.description || existingArtifact?.name || '';
+  panel.innerHTML = `<div class="sechdr"><div><h3>${editing ? 'Edit chart' : 'Create chart'}</h3><p class="cardsub">Describe the chart you want, preview it, then ${editing ? 'save the update' : 'save it to the dashboard'}.</p></div><button class="ghost" type="button" id="closeModal">Close</button></div>`;
+  const form = el('form', 'chartbuilder');
+  form.innerHTML = `<div class="chartcomposer">
+      <label class="chartprompt">Chart prompt<textarea name="prompt" rows="5" placeholder="Example: monthly cash flow line chart, spending by category donut, top merchants bar chart" required>${esc(existingPrompt)}</textarea></label>
+      <div class="promptchips" aria-label="Chart prompt examples"${editing ? ' hidden' : ''}>
+        <button type="button" class="promptchip">Monthly cash flow line chart</button>
+        <button type="button" class="promptchip">Spending by category donut</button>
+        <button type="button" class="promptchip">Top merchants bar chart</button>
+        <button type="button" class="promptchip">Credit card spending by week</button>
+      </div>
+      <div class="chartcomposer-actions">
+        <button class="primary" type="button" id="previewChart">Preview chart</button>
+        <button class="ghost" type="submit" id="saveChart"${editing ? '' : ' hidden disabled'}>${editing ? 'Save changes' : 'Save to dashboard'}</button>
+        <span class="message"></span>
+      </div>
+    </div>
+    <aside class="chartpreviewpane" aria-label="Chart preview">
+      <div class="chartpreviewhead"><div><div class="nm">Preview</div><div class="sub">Generated from the current prompt</div></div><span class="pill" id="chartPreviewState">Empty</span></div>
+      <div class="chartpreview empty" id="chartPreview"><div class="chartpreviewempty">Preview appears here after you generate a chart.</div></div>
+    </aside>`;
+  panel.appendChild(form);
+  modal(panel);
+  $('#closeModal').addEventListener('click', closeModal);
+  let previewArtifact = existingArtifact;
+  if (editing && existingArtifact) {
+    const host = el('div');
+    $('#chartPreview').classList.remove('empty');
+    $('#chartPreview').replaceChildren(host);
+    renderArtifactChart(host, existingArtifact);
+    $('#chartPreviewState').textContent = 'Ready';
+  }
+  for (const chip of panel.querySelectorAll('.promptchip')) {
+    chip.addEventListener('click', () => {
+      form.elements.prompt.value = chip.textContent;
+      form.elements.prompt.focus();
+      previewArtifact = null;
+      $('#saveChart').hidden = true;
+      $('#saveChart').disabled = true;
+      $('#chartPreviewState').textContent = 'Empty';
+      $('#chartPreview').classList.add('empty');
+      $('#chartPreview').replaceChildren(el('div', 'chartpreviewempty'));
+      $('#chartPreview').firstChild.textContent = 'Preview appears here after you generate a chart.';
+    });
+  }
+  form.elements.prompt.addEventListener('input', () => {
+    previewArtifact = null;
+    $('#saveChart').hidden = true;
+    $('#saveChart').disabled = true;
+    $('#chartPreviewState').textContent = 'Empty';
+    $('#chartPreview').classList.add('empty');
+    const placeholder = el('div', 'chartpreviewempty');
+    placeholder.textContent = 'Preview appears here after you generate a chart.';
+    $('#chartPreview').replaceChildren(placeholder);
+  });
+  $('#previewChart').addEventListener('click', () => {
+    const prompt = String(new FormData(form).get('prompt') || '').trim();
+    if (!prompt) return;
+    previewArtifact = customChartFromPrompt(prompt, editing ? existingArtifact : null);
+    const host = el('div');
+    $('#chartPreview').classList.remove('empty');
+    $('#chartPreview').replaceChildren(host);
+    renderArtifactChart(host, previewArtifact);
+    $('#chartPreviewState').textContent = 'Ready';
+    $('#saveChart').hidden = false;
+    $('#saveChart').disabled = false;
+    form.querySelector('.message').textContent = '';
+  });
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (!previewArtifact || $('#saveChart').disabled) return;
+    if (editing) updateCustomDashboardArtifact(existingArtifact.id || existingArtifact.publicId, previewArtifact);
+    else saveCustomDashboardArtifact(previewArtifact);
+    closeModal();
+    toast(editing ? 'Chart updated.' : 'Chart saved.');
+    renderDashboards();
+  });
+}
+
 function renderSettings() {
   const view = $('#view');
-  view.replaceChildren(topbar('Settings', 'Local runtime', { hideDateRange: true }));
+  const action = state.settingsTab === 'insights' ? el('button', 'primary') : null;
+  if (action) {
+    action.type = 'button';
+    action.id = 'newRuleTopbar';
+    action.textContent = 'Create alert';
+  }
+  view.replaceChildren(topbar('Settings', 'Local runtime', { hideDateRange: true, action }));
+  if (action) action.addEventListener('click', () => openRuleModal());
   const nav = el('div', 'subnav');
   for (const [id, label] of settingsTabs) {
     const tab = el('div', `subtab${state.settingsTab === id ? ' active' : ''}`);
@@ -2182,19 +2704,26 @@ function renderSettingsNotifications(view) {
 function renderSettingsInsights(view) {
   const feedItems = buildFeedItems();
   const sec = el('div', 'sec');
-  sec.innerHTML = '<div class="sechdr"><h3>Rules</h3><button class="primary" id="newRule">New rule</button></div><div class="cardsub">Rules can run on events or on a schedule. Use the switch to pause delivery without changing the rule.</div>';
+  sec.innerHTML = '<div class="sechdr"><h3>Rules</h3></div><div class="cardsub">Rules can run on events or on a schedule. Use the switch to pause delivery without changing the rule.</div>';
   const box = el('div', 'rulelist');
   const rules = [
     ...builtInRules().map((rule) => ({
       ...rule,
+      builtIn: true,
+      sourceText: rule.name,
       title: rule.name,
       description: rule.detail,
       status: builtInRuleCurrent(rule.originalName, feedItems),
-      editable: false,
-      removable: false,
+      editable: true,
+      removable: true,
       toggle: () => {
         saveBuiltInRuleOverride(rule.originalName, { ...rule, enabled: !rule.enabled });
         toast(rule.enabled ? 'Rule disabled.' : 'Rule enabled.');
+        renderSettings();
+      },
+      remove: () => {
+        saveBuiltInRuleOverride(rule.originalName, { ...rule, deleted: true, enabled: false });
+        toast('Rule deleted.');
         renderSettings();
       },
     })),
@@ -2241,8 +2770,6 @@ function renderSettingsInsights(view) {
     { pageKey: 'settings-muted' },
   ) : empty('Nothing muted.'));
   view.appendChild(muted);
-
-  $('#newRule').addEventListener('click', () => openRuleModal());
 }
 
 function ruleRow(rule) {
@@ -2273,6 +2800,7 @@ function ruleTags(rule) {
   return [
     ruleTag('scope', rule.scope),
     ruleTag('cadence', rule.cadence),
+    rule.channel ? ruleTag('channel', rule.channel) : '',
     ruleTag('hour', ruleHourLabel(rule)),
     rule.status ? ruleTag('status', rule.status) : '',
   ].filter(Boolean).join('');
@@ -2312,23 +2840,27 @@ function saveBuiltInRuleOverride(originalName, patch) {
     name: patch.name,
     cadence: patch.cadence,
     scope: patch.scope,
+    channel: patch.channel || 'auto',
     mode: patch.mode,
     scheduledHour: patch.scheduledHour ?? null,
     detail: patch.detail,
     enabled: patch.enabled,
+    deleted: patch.deleted === true,
   };
   localStorage.setItem(builtInRulesKey, JSON.stringify(overrides));
 }
 
 function builtInRules() {
   const overrides = builtInRuleOverrides();
-  return sampleInsightRules.map(([name, cadence, scope, mode, scheduledHour, detail]) => {
+  return sampleInsightRules.flatMap(([name, cadence, scope, mode, scheduledHour, detail]) => {
     const saved = overrides[name] || {};
+    if (saved.deleted === true) return [];
     return {
       originalName: name,
       name: saved.name || name,
       cadence: saved.cadence || cadence,
       scope: saved.scope || scope,
+      channel: saved.channel || 'auto',
       mode: saved.mode || mode,
       scheduledHour: saved.scheduledHour ?? scheduledHour,
       detail: saved.detail || detail,
@@ -2353,34 +2885,73 @@ function builtInRuleCurrent(name, feedItems) {
 
 function openRuleModal(existingRule = null) {
   const panel = el('div');
-  panel.innerHTML = `<div class="sechdr"><h3>${existingRule ? 'Edit rule' : 'New rule'}</h3><button class="ghost" type="button" id="closeModal">Close</button></div><div class="cardsub">Describe the financial signal. Finora will infer any unset delivery fields from the prompt.</div>`;
-  const templateGrid = el('div', 'ruletemplates');
-  for (const text of rulePromptTemplates) {
-    const button = el('button', 'ghost');
-    button.type = 'button';
-    button.textContent = text;
-    button.addEventListener('click', () => {
-      form.elements.text.value = text;
-      form.elements.text.focus();
-    });
-    templateGrid.appendChild(button);
-  }
+  panel.innerHTML = `<div class="sechdr"><h3>${existingRule ? 'Edit alert' : 'Create alert'}</h3><button class="ghost" type="button" id="closeModal">Close</button></div>`;
   const form = el('form', 'formgrid generaterule');
+  const hasPreview = Boolean(existingRule);
   form.innerHTML = `<label>Rule prompt<textarea name="text" required placeholder="Generate a weekly rule that flags brokerage cash above 25% and explains why it matters.">${esc(existingRule?.sourceText || '')}</textarea></label>
-    <details${existingRule ? ' open' : ''}><summary>Delivery settings</summary><div class="split"><label>Scope<select name="scope"><option value="">Generate</option><option${existingRule?.scope === 'banking' ? ' selected' : ''}>banking</option><option${existingRule?.scope === 'brokerage' ? ' selected' : ''}>brokerage</option><option${existingRule?.scope === 'credit' ? ' selected' : ''}>credit</option><option${existingRule?.scope === 'all' ? ' selected' : ''}>all</option></select></label><label>Cadence<select name="cadence"><option value="">Generate</option><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label></div><div class="split"><label>Channel<select name="channel"><option${existingRule?.channel === 'auto' ? ' selected' : ''}>auto</option><option${existingRule?.channel === 'digest' ? ' selected' : ''}>digest</option><option${existingRule?.channel === 'telegram' ? ' selected' : ''}>telegram</option><option${existingRule?.channel === 'slack' ? ' selected' : ''}>slack</option></select></label><label>Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div></details>
-    <div class="row"><button class="primary" type="submit">${existingRule ? 'Save rule' : 'Generate rule'}</button><span class="message"></span></div>`;
-  panel.appendChild(templateGrid);
+    <div class="row"><button class="ghost" type="button" id="previewRule">Preview</button><span class="message"></span></div>
+    <div class="rulepreview" id="rulePreview"${existingRule ? '' : ' hidden'}>${existingRule ? rulePreviewMarkup(existingRule) : ''}</div>
+    <div class="deliverysettings" id="deliverySettings"${hasPreview ? '' : ' hidden'}><div class="nm">Delivery settings</div><div class="split"><label>Scope<select name="scope"><option value="">Generate</option><option${existingRule?.scope === 'banking' ? ' selected' : ''}>banking</option><option${existingRule?.scope === 'brokerage' ? ' selected' : ''}>brokerage</option><option${existingRule?.scope === 'credit' ? ' selected' : ''}>credit</option><option${existingRule?.scope === 'all' ? ' selected' : ''}>all</option></select></label><label>Cadence<select name="cadence"><option value="">Generate</option><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label></div><div class="split"><label>Channel<select name="channel"><option${existingRule?.channel === 'auto' ? ' selected' : ''}>auto</option><option${existingRule?.channel === 'digest' ? ' selected' : ''}>digest</option><option${existingRule?.channel === 'telegram' ? ' selected' : ''}>telegram</option><option${existingRule?.channel === 'slack' ? ' selected' : ''}>slack</option></select></label><label>Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div></div>
+    <div class="row"><button class="primary" type="submit" id="saveRule"${hasPreview ? '' : ' hidden disabled'}>Save rule</button></div>`;
   panel.appendChild(form);
   modal(panel);
   $('#closeModal').addEventListener('click', closeModal);
+  form.elements.text.addEventListener('input', () => {
+    if (existingRule) return;
+    $('#deliverySettings').hidden = true;
+    $('#saveRule').hidden = true;
+    $('#saveRule').disabled = true;
+    $('#rulePreview').hidden = true;
+    $('#rulePreview').innerHTML = '';
+  });
+  $('#previewRule').addEventListener('click', async () => {
+    const data = ruleFormData(form);
+    const button = $('#previewRule');
+    button.disabled = true;
+    form.querySelector('.message').textContent = 'Inferring settings...';
+    form.querySelector('.message').classList.remove('error');
+    try {
+      const preview = await api('/v1/alert-rules/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      applyRulePreview(form, preview);
+      $('#rulePreview').hidden = false;
+      $('#rulePreview').innerHTML = rulePreviewMarkup(preview);
+      $('#deliverySettings').hidden = false;
+      $('#saveRule').hidden = false;
+      $('#saveRule').disabled = false;
+      form.querySelector('.message').textContent = '';
+    } catch (error) {
+      form.querySelector('.message').textContent = error.message;
+      form.querySelector('.message').classList.add('error');
+    } finally {
+      button.disabled = false;
+    }
+  });
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
-    const data = Object.fromEntries(new FormData(form));
-    for (const key of ['scope', 'cadence']) if (!data[key]) delete data[key];
-    data.scheduledHour = data.scheduledHour === '' ? null : Number(data.scheduledHour);
+    if ($('#saveRule').disabled) return;
+    const data = ruleFormData(form);
     const submit = event.submitter;
     submit.disabled = true;
     try {
+      if (existingRule?.builtIn) {
+        saveBuiltInRuleOverride(existingRule.originalName, {
+          ...existingRule,
+          name: data.text,
+          scope: data.scope || existingRule.scope,
+          cadence: data.cadence || existingRule.cadence,
+          channel: data.channel || existingRule.channel || 'auto',
+          scheduledHour: data.scheduledHour,
+          enabled: existingRule.enabled !== false,
+        });
+        closeModal();
+        toast('Rule saved.');
+        renderSettings();
+        return;
+      }
       const savedRule = await api('/v1/alert-rules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2411,6 +2982,32 @@ function openRuleModal(existingRule = null) {
       submit.disabled = false;
     }
   });
+}
+
+function ruleFormData(form) {
+  const data = Object.fromEntries(new FormData(form));
+  for (const key of ['scope', 'cadence']) if (!data[key]) delete data[key];
+  data.scheduledHour = data.scheduledHour === '' ? null : Number(data.scheduledHour);
+  return data;
+}
+
+function applyRulePreview(form, preview) {
+  form.elements.scope.value = preview.scope;
+  form.elements.cadence.value = preview.cadence;
+  form.elements.channel.value = preview.channel;
+  form.elements.scheduledHour.value = preview.scheduledHour === null || preview.scheduledHour === undefined ? '' : String(preview.scheduledHour);
+}
+
+function rulePreviewMarkup(rule) {
+  const source = rule.inference?.source === 'llm' ? `LLM: ${rule.inference.model}` : 'Heuristic fallback';
+  return `<div class="rulepreviewgrid">
+    <div><span>Scope</span><b>${esc(rule.scope)}</b></div>
+    <div><span>Cadence</span><b>${esc(rule.cadence)}</b></div>
+    <div><span>Channel</span><b>${esc(rule.channel)}</b></div>
+    <div><span>Run hour</span><b>${esc(ruleHourLabel(rule))}</b></div>
+  </div>
+  <div class="ruletags">${ruleTag('status', rule.mode || 'rule')} ${ruleTag('status', source)}</div>
+  ${rule.strategy ? `<div class="sub">${esc(rule.strategy)}</div>` : ''}`;
 }
 
 function ruleHourOptions(selected) {
@@ -2654,15 +3251,17 @@ function modal(content) {
   root.replaceChildren();
   const bg = el('div', 'modal-bg');
   const box = el('div', 'modal');
+  if (content.dataset.modalClass) box.classList.add(content.dataset.modalClass);
   box.appendChild(content);
   bg.appendChild(box);
   bg.addEventListener('click', (event) => {
-    if (event.target === bg) root.replaceChildren();
+    if (event.target === bg) closeModal();
   });
   root.appendChild(bg);
 }
 
 function closeModal() {
+  activeCreditUpload = null;
   $('#modalRoot').replaceChildren();
 }
 

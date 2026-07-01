@@ -66,9 +66,7 @@ main { overflow: auto; padding: 28px 32px; min-width: 0; }
 .app.nav-open .scrim, .app.chat-open .scrim { opacity: 1; pointer-events: auto; }
 
 .brand { display: flex; align-items: center; gap: 9px; padding: 2px 8px 4px; font-weight: 700; font-size: 15px; }
-.brandmark, .banklogo { display: inline-flex; align-items: center; justify-content: center; background: var(--brand); color: #fff; font-weight: 800; flex: none; }
-.brandmark { width: 24px; height: 24px; border-radius: 7px; background: transparent; color: inherit; overflow: hidden; }
-.brandmark svg { display: block; width: 24px; height: 24px; }
+.banklogo { display: inline-flex; align-items: center; justify-content: center; background: var(--brand); color: #fff; font-weight: 800; flex: none; }
 .navsec { display: flex; flex-direction: column; gap: 2px; margin: 18px 0 4px; }
 .navrow { width: 100%; display: flex; align-items: center; padding: 9px 11px; border-radius: 8px; background: transparent; color: var(--mut); font-size: 13.5px; text-align: left; }
 .navrow:hover { background: var(--card2); color: var(--fg); }
@@ -80,6 +78,7 @@ main { overflow: auto; padding: 28px 32px; min-width: 0; }
 .topbar, .sechdr { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
 .titleblock h1 { margin: 0; font-size: 30px; line-height: 1.12; letter-spacing: 0; }
 .titleblock p, .kicker { margin: 0 0 4px; color: var(--mut); font-size: 11.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.topbarcontrols { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
 .daterange { display: flex; align-items: center; gap: 6px; color: var(--mut); font-size: 12px; flex-wrap: wrap; justify-content: flex-end; }
 .daterange input { width: 138px; padding: 5px 8px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -190,6 +189,10 @@ td.r, th.r { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo
 .status { display: inline-flex; align-items: center; border-radius: 999px; padding: 3px 9px; font-size: 11px; font-weight: 800; white-space: nowrap; }
 .status.ok { color: var(--accd); background: rgba(4,120,87,.1); }
 .status.off { color: var(--amber); background: rgba(180,83,9,.1); }
+.status.good { color: var(--accd); background: rgba(4,120,87,.1); }
+.status.warn { color: var(--amber); background: rgba(180,83,9,.1); }
+.status.bad { color: var(--red); background: rgba(220,38,38,.1); }
+.status.neutral { color: var(--mut); background: var(--card2); }
 
 .primary, .ghost { border-radius: 9px; padding: 8px 14px; min-height: 36px; font-size: 12.5px; }
 .primary { background: var(--brand); color: #fff; }
@@ -229,10 +232,33 @@ td.r, th.r { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo
 .feedactions .dismissbtn:hover { background: rgba(38,34,29,.055); color: var(--red); }
 
 .dashgrid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; align-items: stretch; margin-top: 12px; }
-.chartcreator { padding: 14px 16px; }
-.chartprompt { display: grid; grid-template-columns: minmax(260px, 1fr) auto; gap: 10px; align-items: center; }
-.chartprompt input { min-height: 40px; }
-.dashslot { min-width: 0; min-height: 250px; display: flex; flex-direction: column; }
+.modal.chartmodal-shell { width: min(1040px, 94vw); }
+.chartcreator .sechdr { align-items: flex-start; margin-bottom: 14px; }
+.chartcreator .cardsub { margin: 3px 0 0; max-width: 560px; text-wrap: pretty; }
+.chartbuilder { display: grid; grid-template-columns: minmax(280px, .86fr) minmax(420px, 1.14fr); gap: 14px; align-items: stretch; }
+.chartcomposer, .chartpreviewpane { min-width: 0; border-radius: 12px; background: var(--card); box-shadow: 0 0 0 1px rgba(38,34,29,.08), 0 8px 24px rgba(61,46,30,.08); }
+.chartcomposer { display: flex; flex-direction: column; gap: 12px; padding: 14px; }
+.chartprompt { display: flex; flex-direction: column; gap: 7px; color: var(--mut); font-size: 12px; font-weight: 750; }
+.chartprompt textarea { min-height: 132px; resize: vertical; line-height: 1.5; }
+.promptchips { display: flex; flex-wrap: wrap; gap: 7px; }
+.promptchip { min-height: 34px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--fg); padding: 6px 9px; font-size: 12px; font-weight: 750; text-align: left; transition-property: background, border-color, transform; transition-duration: .14s; }
+.promptchip:hover { background: var(--card2); border-color: var(--mut); }
+.promptchip:active { transform: scale(.96); }
+.chartcomposer-actions { margin-top: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chartcomposer-actions .primary, .chartcomposer-actions .ghost { min-height: 40px; }
+.chartpreviewpane { display: flex; flex-direction: column; padding: 12px; }
+.chartpreviewhead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 2px 2px 10px; }
+.chartpreview { flex: 1; min-height: 320px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); padding: 10px; }
+.chartpreview.empty { display: flex; align-items: center; justify-content: center; color: var(--mut); text-align: center; }
+.chartpreviewempty { max-width: 260px; font-size: 12.5px; line-height: 1.45; text-wrap: pretty; }
+.chartpreview:empty { display: none; }
+.dashslot { min-width: 0; min-height: 250px; display: flex; flex-direction: column; position: relative; }
+.dashactions { position: absolute; top: 10px; right: 10px; z-index: 6; display: inline-flex; gap: 6px; padding: 4px; border-radius: 10px; background: color-mix(in srgb, var(--card) 88%, transparent); box-shadow: 0 0 0 1px rgba(38,34,29,.08), 0 8px 20px rgba(61,46,30,.1); backdrop-filter: blur(8px); opacity: .28; transition-property: opacity, transform, box-shadow; transition-duration: .16s; }
+.dashslot:hover .dashactions, .dashactions:focus-within { opacity: 1; transform: translateY(-1px); }
+.dashactions .iconbtn { min-height: 32px; padding: 5px 8px; background: var(--card); }
+.dashslot > .dashactions { flex: none; display: inline-flex; min-width: 0; }
+.iconbtn.danger { color: var(--red); border-color: rgba(220,38,38,.22); }
+.iconbtn.danger:hover { background: rgba(220,38,38,.08); border-color: rgba(220,38,38,.34); }
 .dashslot > div { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .artifact { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
 .artifact.dark { background: #0b0f19; color: #eef2ff; border-color: #1f2937; border-radius: 10px; padding: 12px; }
@@ -337,11 +363,13 @@ td.r, th.r { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo
 .switchbtn b { font-size: 11px; line-height: 1; }
 .switchbtn.on { border-color: color-mix(in srgb, var(--brand) 58%, var(--line)); background: rgba(176,90,56,.07); color: var(--fg); }
 .switchbtn.on span { background: var(--brand); transform: translateX(3px); }
-.ruletemplates { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
-.ruletemplates button { min-height: 42px; text-align: left; justify-content: flex-start; white-space: normal; line-height: 1.25; }
-.generaterule details { border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 10px 12px; }
-.generaterule summary { cursor: pointer; color: var(--mut); font-size: 12px; font-weight: 800; }
-.generaterule details .split { margin-top: 10px; }
+.deliverysettings { display: grid; gap: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 10px 12px; }
+.deliverysettings[hidden] { display: none; }
+.rulepreview { display: grid; gap: 9px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 10px 12px; }
+.rulepreviewgrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.rulepreviewgrid div { min-width: 0; display: grid; gap: 2px; }
+.rulepreviewgrid span { color: var(--mut); font-size: 11px; font-weight: 800; }
+.rulepreviewgrid b { min-width: 0; font-size: 13px; font-weight: 800; text-transform: capitalize; overflow-wrap: anywhere; }
 .checkrow { display: inline-flex; flex-direction: row; align-items: center; gap: 8px; color: var(--fg); font-size: 13px; font-weight: 700; }
 .checkrow input { width: auto; }
 .formgrid textarea { min-height: 110px; resize: vertical; }
@@ -400,9 +428,32 @@ td.r, th.r { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo
 .formgrid { display: grid; gap: 12px; }
 .formgrid label { display: flex; flex-direction: column; gap: 6px; color: var(--mut); font-size: 12px; font-weight: 650; }
 .split { display: grid; grid-template-columns: minmax(0, 1fr) 100px; gap: 10px; }
-.creditupload { padding: 14px 16px; }
 .creditform { grid-template-columns: minmax(240px, 360px) minmax(180px, 1fr); align-items: center; }
 .creditform .uploadhistory { grid-column: 1 / -1; }
+.creditlatest { padding: 20px; }
+.creditreporthead { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start; margin-bottom: 18px; }
+.creditreporttitle { margin-top: 2px; font-size: 24px; line-height: 1.16; font-weight: 800; letter-spacing: 0; }
+.creditreportmeta { margin-top: 5px; color: var(--mut); font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }
+.creditmetricgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.creditmetric { min-width: 0; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); padding: 12px; }
+.creditmetric .lab { color: var(--mut); font-size: 10.5px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.creditmetric .value { margin-top: 5px; color: var(--fg); font-size: 19px; line-height: 1.2; font-weight: 850; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.reportdetailblock { min-width: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--card); overflow: hidden; }
+.reportminirow { min-width: 0; padding: 10px 12px; border-top: 1px solid var(--line); }
+.reportminirow:first-of-type { border-top: 0; }
+.reportminirow.medium { background: rgba(180,83,9,.055); }
+.reportminirow.high { background: rgba(220,38,38,.055); }
+.reportminirow.emptymini, .reportminirow.moremini { color: var(--mut); font-size: 12.5px; }
+.reportminirow.moremini { font-weight: 750; }
+.creditinsights { display: grid; gap: 10px; }
+.insightrow { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; border: 1px solid var(--line); border-left-width: 3px; border-radius: 10px; background: var(--panel); padding: 12px; }
+.insightrow.high { border-left-color: var(--red); }
+.insightrow.medium { border-left-color: var(--amber); }
+.insightrow.low { border-left-color: var(--blue); }
+.reportlist { display: grid; gap: 9px; }
+.reportrow { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 12px; }
+.reportfacts { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+.structuredblock { margin-top: 14px; }
 .file-drop { min-height: 112px; align-items: center; justify-content: center; border: 1px dashed rgba(176,90,56,.45); border-radius: 12px; background: rgba(176,90,56,.055); text-align: center; }
 .file-drop.compact { min-height: 62px; padding: 10px 14px; cursor: pointer; }
 .file-drop.dragging, .file-drop.busy { border-color: var(--brand); background: rgba(176,90,56,.1); }
@@ -433,13 +484,17 @@ td.r, th.r { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo
   .cards { grid-template-columns: 1fr; }
   .acctgrid { grid-template-columns: 1fr; }
   .topbar, .sechdr, .feedhead, .weekbrief { align-items: stretch; flex-direction: column; }
+  .topbarcontrols { margin-left: 0; align-items: flex-start; }
   .daterange { justify-content: flex-start; }
   .tx-account, table .tx-account { display: none; }
   .split { grid-template-columns: 1fr; }
   .creditform { grid-template-columns: 1fr; }
-  .chartprompt { grid-template-columns: 1fr; }
   .settingsform { grid-template-columns: 1fr; }
-  .channelgrid, .channelpicker, .channelsetup, .notificationlayout, .requirementgrid, .principlegrid { grid-template-columns: 1fr; }
+  .chartbuilder { grid-template-columns: 1fr; }
+  .chartpreview { min-height: 240px; }
+  .channelgrid, .channelpicker, .channelsetup, .notificationlayout, .requirementgrid, .principlegrid, .rulepreviewgrid { grid-template-columns: 1fr; }
+  .creditreporthead, .creditmetricgrid, .insightrow, .reportrow { grid-template-columns: 1fr; }
+  .reportfacts { justify-content: flex-start; }
   .callout { flex-direction: column; }
   .dashslot { grid-column: 1 / -1 !important; }
   .adonuts { align-items: flex-start; }

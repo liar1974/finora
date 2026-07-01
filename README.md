@@ -19,6 +19,20 @@ a desktop app, and a read-only MCP server.
 
 Finora does not move money, store bank credentials, or provide financial advice.
 
+## Web workspace
+
+The web UI includes:
+
+- Insights, banking, brokerage, dashboards, credit reports, and settings.
+- Dashboard widgets from saved artifacts plus locally created charts. Locally
+  created charts can be edited or deleted in the browser; built-in and saved
+  widgets can be hidden from the dashboard without deleting server data.
+- Credit report import for text-searchable PDFs downloaded from
+  AnnualCreditReport.com. The overview is report-first and does not assume a
+  score is present; uploaded reports can be deleted from the local store.
+- Alert rules managed from Settings. Creating an alert opens a preview flow
+  before saving delivery scope, cadence, channel, and schedule.
+
 ## Quick start
 
 Requirements: Node.js 22.13 or newer and pnpm.
