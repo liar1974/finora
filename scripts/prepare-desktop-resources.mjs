@@ -13,10 +13,24 @@ function run(command, args) {
   execFileSync(command, args, { cwd: root, stdio: 'inherit' });
 }
 
+function runPnpm(args) {
+  if (process.env.npm_execpath) {
+    run(process.execPath, [process.env.npm_execpath, ...args]);
+    return;
+  }
+
+  if (process.platform === 'win32') {
+    run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'pnpm', ...args]);
+    return;
+  }
+
+  run('pnpm', args);
+}
+
 await rm(desktop, { recursive: true, force: true });
 await rm(buildOutput, { recursive: true, force: true });
-run('pnpm', ['build']);
-run('pnpm', ['build:desktop-backend']);
+runPnpm(['build']);
+runPnpm(['build:desktop-backend']);
 
 await mkdir(join(buildOutput, 'backend'), { recursive: true });
 await cp(join(root, 'dist', 'http', 'web'), join(buildOutput, 'backend', 'web'), {
