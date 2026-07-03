@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+src-tauri/target/
+.env
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+src-tauri/resources/desktop/*
+!src-tauri/resources/desktop/.gitkeep

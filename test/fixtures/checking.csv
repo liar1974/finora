@@ -1,0 +1,4 @@
+Date,Description,Debit,Credit,Category,Transaction ID
+2026-06-01,Neighborhood Market,42.17,,Groceries,txn-1
+2026-06-03,Salary,,2500.00,Income,txn-2
+2026-06-05,Electric Utility,84.30,,Utilities,txn-3

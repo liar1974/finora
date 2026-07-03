@@ -1,0 +1,119 @@
+# Contributing to Finora
+
+This guide is for developers who want to run Finora from source, work on the
+code, or cut a release. If you just want to *use* the app, see the
+[README](README.md) and the [onboarding guide](docs/onboarding.md) instead.
+
+## Architecture and API
+
+- [Architecture](docs/architecture.md) — local-first boundaries, provider rules,
+  extension points, and API policy.
+- [OpenAPI contract](docs/openapi.yaml) — the local HTTP API surface, also served
+  by the running local server.
+
+Principles that shape the code:
+
+- **Local by default** — data is stored in one SQLite database on your machine.
+- **Deterministic imports** — CSV and OFX/QFX files do not require an LLM.
+- **Exact money** — amounts are integer minor units, never floating point.
+- **Clear direction** — positive amounts are inflows; negative are outflows.
+- **One core** — CLI, HTTP, MCP, and desktop call the same application service.
+- **Explicit provider ownership** — Plaid accounts are managed through Link
+  update mode account selection; SnapTrade accounts through brokerage
+  authorization flows. Provider accounts are not removed by deleting local rows.
+- **Extension through ports** — import formats, provider syncs, storage, and
+  client protocols stay behind application interfaces.
+
+## Run From Source
+
+You need Node.js 22.13 or newer and pnpm.
+
+```bash
+pnpm install
+pnpm cli accounts add --institution "Demo Bank" --name "Checking"
+pnpm cli ingest ./statement.csv --account <account-id>
+pnpm dev
+```
+
+Open <http://127.0.0.1:3011>. The database defaults to `~/.finora/finora.db`.
+Configure the host, port, and data path with `.env` variables shown in
+[`.env.example`](.env.example).
+
+Common CLI commands:
+
+```text
+finora accounts list
+finora accounts add --institution <name> --name <name> [--type checking]
+finora ingest <file> --account <account-id> [--format auto|csv|ofx]
+finora transactions [--account <account-id>] [--limit 50]
+finora summary [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+finora serve
+finora mcp
+```
+
+An import is idempotent at both the file and transaction level. Importing
+identical content into the same account returns the existing import and inserts
+no duplicate rows.
+
+CSV imports recognize common date, description, amount, debit, credit, category,
+type, and transaction ID headers. A single signed amount column uses Finora's
+native convention: positive is inflow and negative is outflow. A type column can
+make unsigned amounts explicit (`debit`, `credit`, `deposit`, or `purchase`).
+OFX and QFX signs already use the native convention and are preserved.
+
+## Desktop application
+
+The Tauri application starts and stops its own authenticated local backend, so
+it does not need a separately running server.
+
+```bash
+pnpm tauri:dev
+pnpm tauri:build
+```
+
+Development mode runs the TypeScript backend from the repository. A packaged
+application bundles the compiled backend, the static web assets (the same
+React/Vite build the web UI uses), and a matching Node.js runtime. Desktop data
+is stored in the OS application data directory under `com.finora.desktop`.
+
+## Provider connections
+
+Plaid banking and SnapTrade brokerage integrations are configured from the web
+UI or HTTP API and are optional — Finora works with file imports alone.
+Provider-managed accounts are created and refreshed by provider sync and cannot
+be hard-deleted through the account delete endpoint. In particular, Finora never
+removes a Plaid Item as part of account management: dropping one bank account
+uses Plaid Link update mode with account selection, after which Finora deletes
+only local rows for accounts Plaid no longer returns. Credentials are stored in
+the local SQLite database and are never proxied anywhere except the configured
+provider SDK call. See the [architecture guide](docs/architecture.md) for the
+full connector rules.
+
+## Development checks
+
+```bash
+pnpm typecheck
+pnpm test
+pnpm build:web
+pnpm build
+cargo check --manifest-path src-tauri/Cargo.toml
+```
+
+## Cutting a release
+
+Create a release by pushing a version tag (or run the `Release` workflow
+manually from the Actions tab):
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The [`Release` workflow](.github/workflows/release.yml) builds installers for
+macOS (arm64/x64), Windows x64, and Linux x64, then publishes them to a GitHub
+release. Alongside the versioned Tauri outputs it also uploads version-less
+copies (`Finora-macOS-AppleSilicon.dmg`, `Finora-macOS-Intel.dmg`,
+`Finora-Windows-Setup.exe`, `Finora-Linux-x86_64.AppImage`) so the README's
+"latest build" download links keep working across releases. If you change the
+product name or bundle targets, update the copy step's globs to match the new
+Tauri output filenames.
