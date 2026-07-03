@@ -28,6 +28,11 @@ money.
   so you're not hunting for problems yourself.
 - **Alerts you can trust.** Before an alert is ever turned on, Finora shows you
   exactly what it will watch for and when it will notify you.
+- **Get insights where you already are.** Have Finora send rule-triggered
+  insights to your own **Telegram** chat or a **Slack** channel — great for a
+  personal heads-up or a shared household or advisor channel. Your data still
+  lives on your computer; only the alerts you choose to push are sent, and you
+  connect the channels with your own bot credentials.
 - **Read your credit report at home.** Load a credit report you downloaded from
   AnnualCreditReport.com and review it on your own computer, without giving it to
   a third party.
@@ -58,6 +63,12 @@ Once Finora is installed, you're a few minutes away from your first overview:
    PDF you download from AnnualCreditReport.com.
 3. **Explore.** Browse your spending in **Banking**, see charts in
    **Dashboards**, and check **Insights** for anything that needs attention.
+4. **(Optional) Get notified.** In **Settings → Delivery**, connect **Telegram**
+   or **Slack** so rule-triggered insights come to you — see the
+   [onboarding guide](docs/onboarding.md#5-get-insights-in-telegram-or-slack)
+   for the step-by-step.
+
+![Settings → Delivery, connecting Telegram or Slack](docs/media/screenshots/delivery.png)
 
 👉 **New here? Follow the [step-by-step onboarding guide](docs/onboarding.md)** —
 it walks you through installing, connecting your first account, and touring

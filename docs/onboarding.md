@@ -177,6 +177,54 @@ under **Rules & Insights**.
 
 ![Settings](media/screenshots/settings.png)
 
+Want alerts to reach you outside the app? See
+**[Get insights in Telegram or Slack](#5-get-insights-in-telegram-or-slack)**
+below.
+
+## 5. Get insights in Telegram or Slack
+
+Everything in Finora stays on your computer, and the **Insights** feed always
+lives there. If you'd like, you can also have Finora *push* rule-triggered
+insights to a chat you already check — your own **Telegram** chat or a **Slack**
+channel. Only the alerts you choose to send leave your machine, and you connect
+each channel with your own bot credentials.
+
+Open **Settings → Delivery** and pick a channel. Each one shows a short,
+numbered setup right on the screen.
+
+### Telegram — best for a personal heads-up
+
+![Settings → Delivery with Telegram connected](media/screenshots/delivery.png)
+
+1. In Telegram, open **@BotFather**, send `/newbot`, and follow the prompts.
+   Copy the **bot token** it gives you.
+2. In Finora, go to **Settings → Delivery**, choose **Telegram**, paste the bot
+   token into **Bot token**, and click **Save credentials**.
+3. Open Telegram and **send any message to your new bot** (for example, "hi").
+4. Back in Finora, click **Connect chat**. Finora reads that latest message to
+   bind the delivery chat — you never have to paste a chat ID. When it shows
+   **Ready** and a **Bound chat**, you're set.
+
+> **Bonus:** Telegram is two-way. Once connected, you can message the bot to ask
+> questions about your own accounts, transactions, and holdings — the answers
+> come from the local model on your computer. Send `/help` to see what it can do.
+
+### Slack — best for a shared household, advisor, or ops channel
+
+![Settings → Delivery with Slack selected](media/screenshots/delivery-slack.png)
+
+1. Create a **Slack app** with the `chat:write` and `channels:read` scopes, then
+   install it to your workspace and copy the **Bot token** (starts with `xoxb-`).
+2. **Invite the bot** to the channel where you want insights to land.
+3. In Finora, go to **Settings → Delivery**, choose **Slack**, paste the **Bot
+   token** and the target **Channel ID**, and click **Save credentials**. When
+   it shows **Ready**, delivery is on.
+
+Once a channel shows **Ready**, insights from your enabled rules (set up under
+**Settings → Rules & Insights**) are delivered there. You can switch the active
+channel or pause delivery any time — turning delivery off never changes or
+deletes the local Insights feed.
+
 ---
 
 *Building Finora from source or contributing code? See
