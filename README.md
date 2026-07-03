@@ -120,6 +120,8 @@ Found a bug or have a question? Please
 
 ---
 
-*Want to build Finora from source, self-host it, or contribute code? See
-[CONTRIBUTING.md](CONTRIBUTING.md). Finora is released under the
-[MIT License](LICENSE).*
+*Want to build Finora from source or run it yourself? See
+[CONTRIBUTING.md](CONTRIBUTING.md). Finora is **source-available**, not open
+source: the code is public to read and to run for your own personal,
+non-commercial use, but modifying, redistributing, or using it commercially is
+not permitted. See the [LICENSE](LICENSE) for the exact terms.*

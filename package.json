@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "A local-first personal finance data service.",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=22.13"
   },
