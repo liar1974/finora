@@ -44,6 +44,15 @@ account-scoped file hashes, transaction fingerprints, provider connection
 records, and insert-time deduplication are enabled. The repository port isolates
 SQLite so another store can be supplied.
 
+Schema changes run through a versioned migration runner. A `schema_migrations`
+ledger records which numbered migrations have applied; each new migration runs
+once, in order, inside its own transaction, on the first launch of a build that
+ships it — which is what keeps desktop auto-update safe across schema changes.
+Before applying a pending migration to a database that already holds data, the
+runner writes a consistent snapshot to `<db>.backup-v<fromVersion>` via
+`VACUUM INTO` and refuses to migrate if that backup cannot be written, so an
+upgrade can never mutate data it has not first backed up.
+
 ## Extension points
 
 ### Statement format
@@ -154,6 +163,10 @@ Regression checks:
 
 ### SnapTrade connector rules
 
+> SnapTrade is an experimental brokerage adapter reachable through the HTTP API
+> only; the shipping desktop UI connects brokerage accounts through Plaid Link.
+> The rules below apply if and when SnapTrade is exposed in a client.
+
 SnapTrade brokerage accounts are managed through SnapTrade authorizations. A
 SnapTrade remove flow may remove the brokerage authorization when the user
 chooses to disconnect that brokerage connection. That behavior must not be
@@ -175,6 +188,15 @@ The desktop application launches the same API on a random loopback port and
 requires a per-process session token for every data route. The token is passed
 only to the Tauri webview. Health checks remain unauthenticated. Packaged builds
 carry a platform-native Node runtime so users do not need Node.js installed.
+
+The desktop app updates itself through the Tauri updater: it polls
+`releases/latest/download/latest.json` and installs an update only after
+verifying its minisign signature against the public key embedded in the app.
+Because that signature is independent of OS code signing, updates are verified
+even though the published installers are unsigned. The updater is driven from the
+sidebar "Update available" banner; because the UI is served from the loopback
+origin, a capability grants that origin IPC access to the updater/process
+plugins.
 
 ## Insight delivery
 

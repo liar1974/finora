@@ -137,6 +137,9 @@ export const openApiDocument = {
         },
       },
     },
+    '/v1/dashboards': {
+      get: { summary: 'List saved dashboards', responses: { '200': { description: 'Dashboard collection' } } },
+    },
     '/v1/settings': {
       get: { summary: 'List app setting previews', responses: { '200': { description: 'Setting preview collection' } } },
       post: { summary: 'Save app settings', responses: { '200': { description: 'Save result' } } },

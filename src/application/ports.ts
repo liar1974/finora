@@ -146,7 +146,6 @@ export interface FinanceRepository {
   removeAlertMute(id: string): boolean;
   findImport(accountId: string, contentHash: string): ImportRecord | null;
   saveImport(input: SaveImportInput): ImportRecord;
-  saveProviderTransactions(transactions: ProviderTransactionInput[]): { inserted: number; skipped: number };
   reconcileProviderTransactions(transactions: ProviderTransactionInput[]): { inserted: number; updated: number; skipped: number };
   deleteTransactionsByFingerprints(accountId: string, fingerprints: string[]): number;
   saveProviderBrokerageTransactions(transactions: ProviderBrokerageTransactionInput[]): { inserted: number; skipped: number };

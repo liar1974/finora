@@ -36,11 +36,11 @@ money.
 - **Read your credit report at home.** Load a credit report you downloaded from
   AnnualCreditReport.com and review it on your own computer, without giving it to
   a third party.
-- **Ask questions with no setup.** Finora includes a built-in local AI model, so
-  you can chat about your finances without an API key or any extra install. The
-  model downloads once from a public open-source model host and then runs
-  entirely on your computer. Prefer a hosted model? Bring your own Anthropic,
-  OpenAI, Google, or Ollama setup in **Settings → Models**.
+- **Ask questions locally.** Finora includes a built-in local AI model option:
+  after a one-time ~2 GB download in **Settings → Models**, you can chat about
+  your finances with no API key, running entirely on your computer. Prefer a
+  hosted model? Bring your own Anthropic, OpenAI, Google, or Ollama setup in the
+  same place.
 
 ## Download
 
@@ -57,6 +57,11 @@ immediately — just open the file and follow the prompts to install.
 *(Download links point at the newest release. If a link doesn't work yet, the
 first version may not be published — check the
 [Releases page](https://github.com/liar1974/finora/releases).)*
+
+**Updates are automatic.** When a newer version is published, Finora shows an
+**Update available** button at the bottom of the sidebar — one click downloads
+the update, verifies it, installs it, and relaunches. You won't need to come
+back here to upgrade.
 
 ## Getting started
 
@@ -116,7 +121,10 @@ data only**. Each clip loops automatically — click it to open the full video.
   the decisions to you.
 - **Connections are optional.** If you connect a bank or brokerage, those
   credentials are saved only on your computer and used only to talk to that
-  provider. You can skip connections entirely and just import files.
+  provider.
+- **Upgrades keep a safety copy.** Before ever changing how your data is stored,
+  Finora writes a one-time backup file (`finora.db.backup-v…`) next to your data
+  so an update can't lose anything.
 
 ## Questions or problems
 

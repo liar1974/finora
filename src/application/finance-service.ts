@@ -345,7 +345,6 @@ export class FinanceService {
       const title = chat.title || chat.username || [chat.first_name, chat.last_name].filter(Boolean).join(' ') || String(chat.id);
       this.repository.saveAppSettings({
         TELEGRAM_CHAT_ID: String(chat.id),
-        TELEGRAM_CHAT_TYPE: chat.type || 'chat',
         TELEGRAM_CHAT_TITLE: title,
         TELEGRAM_LAST_UPDATE_ID: String(update?.update_id ?? ''),
       });
@@ -438,16 +437,10 @@ export class FinanceService {
           removedAt: null,
         },
       });
-      this.repository.saveAppSettings({ active_bank_source: 'plaid' });
       return { ok: true, itemId, institution: institutionName, accounts: accountIds.length, connection };
     } catch (error) {
       throw connectorError('Plaid token exchange failed', error);
     }
-  }
-
-  async removePlaidConnection(itemId: string) {
-    const id = requireText(itemId, 'item_id');
-    throw new AppError('invalid_input', 'Plaid Item removal is disabled. Use Plaid account selection/update flow for account-level changes.', { itemId: id });
   }
 
   async createPlaidUpdateLinkToken(itemId: string, options: { accountSelection?: boolean | undefined } = {}) {
@@ -533,7 +526,6 @@ export class FinanceService {
           connectionType: 'read',
         },
       });
-      this.repository.saveAppSettings({ active_brokerage_source: 'snaptrade' });
       return { url, userId };
     } catch (error) {
       throw connectorError('SnapTrade Connection Portal failed', error);
@@ -1033,7 +1025,7 @@ export class FinanceService {
     return this.listAlertRules();
   }
 
-  async previewAlertRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
+  async previewRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
     const heuristic = inferRule(text, input.scope, input.cadence);
     const modelInferred = await this.inferRuleWithModel(text, heuristic);
@@ -1054,11 +1046,7 @@ export class FinanceService {
     };
   }
 
-  async previewRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
-    return this.previewAlertRule(input);
-  }
-
-  createAlertRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
+  createRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
     const inferred = inferRule(text, input.scope, input.cadence);
     return this.repository.saveAlertRule({
@@ -1072,37 +1060,21 @@ export class FinanceService {
     });
   }
 
-  createRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
-    return this.createAlertRule(input);
-  }
-
-  toggleAlertRule(id: string, enabled: boolean) {
+  toggleRule(id: string, enabled: boolean) {
     const rule = this.repository.toggleAlertRule(id, enabled);
     if (!rule) throw new AppError('not_found', 'Rule not found', { id });
     return rule;
   }
 
-  toggleRule(id: string, enabled: boolean) {
-    return this.toggleAlertRule(id, enabled);
-  }
-
-  removeAlertRule(id: string) {
+  removeRule(id: string) {
     return { removed: this.repository.removeAlertRule(id) };
   }
 
-  removeRule(id: string) {
-    return this.removeAlertRule(id);
-  }
-
-  listAlertMutes() {
+  listInsightMutes() {
     return this.repository.listAlertMutes();
   }
 
-  listInsightMutes() {
-    return this.listAlertMutes();
-  }
-
-  createAlertMute(input: { kind?: string | null | undefined; accountId?: string | null | undefined; label?: string | null | undefined; days?: number | null | undefined }) {
+  createInsightMute(input: { kind?: string | null | undefined; accountId?: string | null | undefined; label?: string | null | undefined; days?: number | null | undefined }) {
     const days = Number(input.days || 0);
     const expiresAt = Number.isFinite(days) && days > 0
       ? new Date(Date.now() + Math.round(days) * 86_400_000).toISOString()
@@ -1115,16 +1087,8 @@ export class FinanceService {
     });
   }
 
-  createInsightMute(input: { kind?: string | null | undefined; accountId?: string | null | undefined; label?: string | null | undefined; days?: number | null | undefined }) {
-    return this.createAlertMute(input);
-  }
-
-  removeAlertMute(id: string) {
-    return { removed: this.repository.removeAlertMute(id) };
-  }
-
   removeInsightMute(id: string) {
-    return this.removeAlertMute(id);
+    return { removed: this.repository.removeAlertMute(id) };
   }
 
   async chat(messages: ChatMessage[], section?: string, contextAttachments: ChatContextAttachment[] = []) {
@@ -1543,7 +1507,7 @@ export class FinanceService {
     const normalizedInstitution = normalizeProviderInstitution(connection.institution || '');
     return this.repository.listAccounts().filter((account) => {
       if (account.source !== 'plaid') return false;
-      const metadataItemId = String(account.metadata?.plaidItemId || account.metadata?.itemId || account.metadata?.item_id || '');
+      const metadataItemId = String(account.metadata?.plaidItemId || '');
       if (metadataItemId) return metadataItemId === itemId;
       if (account.providerAccountId && accountIds.has(account.providerAccountId)) return true;
       return normalizedInstitution !== '' && normalizeProviderInstitution(account.institution) === normalizedInstitution;

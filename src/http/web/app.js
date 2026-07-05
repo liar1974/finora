@@ -168,7 +168,7 @@ const state = {
   rules: [],
   insights: [],
   insightMutes: [],
-  credit: { hasData: false, reports: [], accounts: [], inquiries: [], suggestions: [], utilization: null, latest: null },
+  credit: { reports: [], accounts: [], inquiries: [], suggestions: [], latest: null },
   creditTab: 'latest',
   settingsTab: 'models',
   notificationChannel: 'telegram',
@@ -194,13 +194,6 @@ const bankTabs = [['summary', 'Summary'], ['transactions', 'Transactions'], ['ca
 const brokerageTabs = [['summary', 'Summary'], ['transactions', 'Transactions']];
 const settingsTabs = [['models', 'Models'], ['accounts', 'Bank/Brokerage'], ['delivery', 'Delivery'], ['insights', 'Rules & Insights']];
 const creditTabs = [['latest', 'Latest report overview'], ['reports', 'Reports']];
-const insightCategories = [
-  ['Cash flow', 'income timing, bill runway, idle cash, recurring spend'],
-  ['Spending', 'large charges, duplicates, subscriptions, fees, categorization cleanup'],
-  ['Credit', 'utilization, card interest, late or fee signals'],
-  ['Investments', 'cash drag, concentration, portfolio movement, executed orders'],
-  ['Connections', 'provider status, missing tokens, stale cursors, sync health'],
-];
 const sampleInsightRules = [
   ['Connection health', 'event', 'all', 'D', null, 'Create an insight when a Plaid connection is not active, a token is missing, or the Plaid cursor is missing.'],
   ['Idle cash scan', 'weekly', 'banking', 'L', 9, 'Find cash balances above the local threshold and generate a short review note from the account evidence.'],
@@ -381,11 +374,6 @@ async function api(path, options) {
 
 function money(amount, currency = 'USD') {
   return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(Number(amount || 0) / 100);
-}
-
-function shortMoney(amount, currency = 'USD') {
-  const value = Number(amount || 0) / 100;
-  return new Intl.NumberFormat(undefined, { style: 'currency', currency, notation: 'compact', maximumFractionDigits: 1 }).format(value);
 }
 
 const chartPalette = ['#2563eb', '#047857', '#b45309', '#7c3aed', '#0891b2', '#dc2626', '#64748b', '#10b981'];
@@ -974,17 +962,9 @@ function brokerageAccounts() {
   return state.accounts.filter((item) => item.domain === 'brokerage');
 }
 
-function providerManagedAccounts(provider, accounts = state.accounts) {
-  return accounts.filter((item) => item.source === provider);
-}
-
 function accountLabel(id) {
   const item = account(id);
   return item ? `${item.institution} / ${item.name}` : 'Unknown account';
-}
-
-function accountInitial(item) {
-  return (item?.institution || item?.name || 'F').trim().slice(0, 1).toUpperCase();
 }
 
 function accountProfile(item = {}) {
@@ -1535,12 +1515,6 @@ function manageAccountsButton(tab) {
   return button;
 }
 
-function sectionActionBar(tab) {
-  const bar = el('div', 'sectionactions');
-  bar.appendChild(manageAccountsButton(tab));
-  return bar;
-}
-
 function accountCards(accounts = selectedAccounts(), label = 'accounts') {
   const grid = el('div', 'acctgrid');
   const accountAmount = (item) => {
@@ -1611,25 +1585,6 @@ function summaryCards() {
     <div class="card"><div class="lab">Transactions</div><div class="big num">${txns.length}</div></div>
   `;
   return cards;
-}
-
-function transactionTable(rows) {
-  const wrap = el('div', 'table-wrap');
-  const table = document.createElement('table');
-  table.innerHTML = '<thead><tr><th class="tx-date">Date</th><th>Description</th><th class="tx-account">Account</th><th class="tx-amount r">Amount</th></tr></thead>';
-  const body = document.createElement('tbody');
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="4" class="empty">No transactions match.</td></tr>';
-  } else {
-    for (const txn of rows) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td class="tx-date">${esc(txn.date)}</td><td>${esc(txn.description)}</td><td class="tx-account">${esc(accountLabel(txn.accountId))}</td><td class="tx-amount r ${txn.amountMinor < 0 ? 'neg' : 'pos'}">${money(txn.amountMinor, txn.currency)}</td>`;
-      body.appendChild(tr);
-    }
-  }
-  table.appendChild(body);
-  wrap.appendChild(table);
-  return wrap;
 }
 
 function tablePageSize(key) {
@@ -1729,14 +1684,6 @@ function pageRows(key, rows) {
   const page = Math.min(state.tablePages[key] || 0, Math.max(0, Math.ceil(rows.length / size) - 1));
   state.tablePages[key] = page;
   return rows.slice(page * size, page * size + size);
-}
-
-function tableWithPagination(table, key, total, renderFn) {
-  const wrap = el('div');
-  wrap.appendChild(table);
-  const pager = pagination(key, total, renderFn);
-  if (pager) wrap.appendChild(pager);
-  return wrap;
 }
 
 function renderDataTable(headers, rows, options = {}) {
@@ -2020,19 +1967,6 @@ function renderFeed() {
     renderFeedZone(panel, '', 'insights', regular);
   }
   view.appendChild(panel);
-}
-
-function renderImports(host = $('#view'), embedded = false) {
-  if (!embedded) host.replaceChildren(topbar('Imports', 'Statement files'));
-  const sec = el('div', 'sec');
-  sec.innerHTML = '<div class="sechdr"><h3>Statement import</h3><button class="primary" id="openImport">Import statement</button></div><div class="cardsub">CSV, OFX, and QFX files are parsed locally and deduplicated by account plus file content.</div>';
-  host.appendChild(sec);
-  sec.querySelector('#openImport').addEventListener('click', () => openImportModal());
-  const accounts = el('div', 'sec');
-  accounts.innerHTML = '<div class="sechdr"><h3>Accounts</h3><button class="ghost" id="openAccount">Create account</button></div>';
-  accounts.appendChild(accountCards(bankAccounts(), 'Banks'));
-  host.appendChild(accounts);
-  accounts.querySelector('#openAccount').addEventListener('click', () => openAccountModal());
 }
 
 function selectedBrokerageTransactions() {
@@ -3357,20 +3291,6 @@ function ruleHourOptions(selected) {
   return options.join('');
 }
 
-function notificationChannelCard(id, title, rows, detail) {
-  const connected = rows.every(([key]) => settingIsSet(key));
-  const card = el('div', 'channelcard');
-  card.innerHTML = `<div class="channelhead"><div><div class="nm">${esc(title)}</div><div class="sub">${esc(detail)}</div></div><span class="status ${connected ? 'ok' : 'off'}">${connected ? 'Connected' : 'Not connected'}</span></div>`;
-  const steps = el('div', 'steplist');
-  rows.forEach(([key, label, instruction], index) => {
-    const row = el('div', 'steprow');
-    row.innerHTML = `<span class="stepnum">${index + 1}</span><div><div class="nm">${esc(label)} <span class="mut">(${settingIsSet(key) ? 'saved' : 'missing'})</span></div><div class="sub">${esc(instruction)}</div></div>`;
-    steps.appendChild(row);
-  });
-  card.appendChild(steps);
-  return card;
-}
-
 async function openPlaidLink() {
   if (!window.Plaid) throw new Error('Plaid Link failed to load. Check network access to cdn.plaid.com.');
   const { link_token: linkToken } = await api('/v1/plaid/link-token', { method: 'POST' });
@@ -3401,8 +3321,6 @@ async function openPlaidAccountSelection(account) {
   if (!window.Plaid) throw new Error('Plaid Link failed to load. Check network access to cdn.plaid.com.');
   const connection = account?.externalId ? account : plaidConnectionForAccount(account);
   const itemId = account.metadata?.plaidItemId
-    || account.metadata?.itemId
-    || account.metadata?.item_id
     || connection?.externalId
     || null;
   if (!itemId) throw new Error('No Plaid Item id is available for this account.');
@@ -3541,98 +3459,6 @@ function modal(content) {
 function closeModal() {
   activeCreditUpload = null;
   $('#modalRoot').replaceChildren();
-}
-
-function openImportModal() {
-  const panel = el('div');
-  panel.innerHTML = '<div class="sechdr"><h3>Import statement</h3><button class="ghost" type="button" id="closeModal">Close</button></div>';
-  const form = el('form', 'formgrid');
-  form.innerHTML = `<label>Account<select name="accountId" required><option value="">Choose an account</option>${bankAccounts().map((item) => `<option value="${esc(item.id)}">${esc(item.institution)} - ${esc(item.name)}</option>`).join('')}</select></label>
-    <label class="file-drop">Choose statement<small id="fileName">CSV, OFX, or QFX</small><input name="file" type="file" accept=".csv,.ofx,.qfx,text/csv" required></label>
-    <div class="row"><button class="primary" type="submit">Import</button><button class="ghost" type="button" id="newAccountFromImport">New account</button></div>
-    <div class="message" id="modalMessage"></div>`;
-  panel.appendChild(form);
-  modal(panel);
-  $('#closeModal').addEventListener('click', closeModal);
-  $('#newAccountFromImport').addEventListener('click', openAccountModal);
-  const fileInput = form.elements.file;
-  fileInput.addEventListener('change', () => {
-    $('#fileName').textContent = fileInput.files[0]?.name || 'CSV, OFX, or QFX';
-  });
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const message = $('#modalMessage');
-    const submit = event.submitter;
-    submit.disabled = true;
-    try {
-      const file = fileInput.files[0];
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      let binary = '';
-      for (let offset = 0; offset < bytes.length; offset += 32768) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
-      }
-      const result = await api('/v1/imports', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          accountId: form.elements.accountId.value,
-          filename: file.name,
-          format: 'auto',
-          contentBase64: btoa(binary),
-        }),
-      });
-      await loadData();
-      closeModal();
-      toast(`Imported ${result.insertedCount}; skipped ${result.skippedCount}.`);
-      render();
-    } catch (error) {
-      message.textContent = error.message;
-      message.classList.add('error');
-    } finally {
-      submit.disabled = false;
-    }
-  });
-}
-
-function openAccountModal(defaultType = 'Checking') {
-  const panel = el('div');
-  panel.innerHTML = '<div class="sechdr"><h3>Create account</h3><button class="ghost" type="button" id="closeModal">Close</button></div>';
-  const form = el('form', 'formgrid');
-  form.innerHTML = `<label>Institution<input name="institution" autocomplete="organization" required></label>
-    <label>Account name<input name="name" required></label>
-    <div class="split"><label>Type<select name="type"><option>Checking</option><option>Savings</option><option>Credit Card</option><option>Brokerage</option><option>Other</option></select></label><label>Currency<input name="currency" value="USD" maxlength="3" required></label></div>
-    <button class="primary" type="submit">Create account</button>
-    <div class="message" id="modalMessage"></div>`;
-  panel.appendChild(form);
-  modal(panel);
-  form.elements.type.value = defaultType;
-  $('#closeModal').addEventListener('click', closeModal);
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const submit = event.submitter;
-    submit.disabled = true;
-    try {
-      const data = Object.fromEntries(new FormData(form));
-      data.type = String(data.type).toLowerCase().replaceAll(' ', '_');
-      data.currency = String(data.currency).toUpperCase();
-      data.domain = data.type === 'brokerage' ? 'brokerage' : 'bank';
-      data.source = 'manual';
-      await api('/v1/accounts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      await loadData();
-      closeModal();
-      toast('Account created.');
-      render();
-    } catch (error) {
-      $('#modalMessage').textContent = error.message;
-      $('#modalMessage').classList.add('error');
-    } finally {
-      submit.disabled = false;
-    }
-  });
 }
 
 function render() {

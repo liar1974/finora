@@ -47,10 +47,6 @@ export class TelegramGateway {
     this.controller = null;
   }
 
-  isRunning(): boolean {
-    return this.controller !== null;
-  }
-
   private async run(controller: AbortController): Promise<void> {
     let offset = Math.max(0, this.options.getLastUpdateId() + 1);
     const timeout = this.options.pollTimeoutSeconds ?? 30;

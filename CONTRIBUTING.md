@@ -8,8 +8,9 @@ code, or cut a release. If you just want to *use* the app, see the
 
 - [Architecture](docs/architecture.md) — local-first boundaries, provider rules,
   extension points, and API policy.
-- [OpenAPI contract](docs/openapi.yaml) — the local HTTP API surface, also served
-  by the running local server.
+- **OpenAPI contract** — the running local server serves it at
+  `GET /openapi.json`, generated from `src/http/openapi.ts` (the single source of
+  truth for the HTTP surface).
 
 Principles that shape the code:
 
@@ -18,9 +19,10 @@ Principles that shape the code:
 - **Exact money** — amounts are integer minor units, never floating point.
 - **Clear direction** — positive amounts are inflows; negative are outflows.
 - **One core** — CLI, HTTP, MCP, and desktop call the same application service.
-- **Explicit provider ownership** — Plaid accounts are managed through Link
-  update mode account selection; SnapTrade accounts through brokerage
-  authorization flows. Provider accounts are not removed by deleting local rows.
+- **Explicit provider ownership** — Plaid accounts (bank and brokerage) are
+  managed through Link update-mode account selection, not by deleting local rows.
+  (A SnapTrade brokerage adapter exists in the backend/HTTP API but is not wired
+  into the desktop UI, which connects brokerage through Plaid Link.)
 - **Extension through ports** — import formats, provider syncs, storage, and
   client protocols stay behind application interfaces.
 
@@ -78,9 +80,11 @@ is stored in the OS application data directory under `com.finora.desktop`.
 
 ## Provider connections
 
-Plaid banking and SnapTrade brokerage integrations are configured from the web
-UI or HTTP API and are optional — Finora works with file imports alone.
-Provider-managed accounts are created and refreshed by provider sync and cannot
+Plaid banking and brokerage connections are configured from the desktop UI or
+HTTP API and are optional — Finora also works with CLI/HTTP file imports. (A
+SnapTrade brokerage adapter exists in the HTTP API only and is not exposed in the
+desktop UI.) Provider-managed accounts are created and refreshed by provider sync
+and cannot
 be hard-deleted through the account delete endpoint. In particular, Finora never
 removes a Plaid Item as part of account management: dropping one bank account
 uses Plaid Link update mode with account selection, after which Finora deletes
@@ -117,3 +121,21 @@ copies (`Finora-macOS-AppleSilicon.dmg`, `Finora-macOS-Intel.dmg`,
 "latest build" download links keep working across releases. If you change the
 product name or bundle targets, update the copy step's globs to match the new
 Tauri output filenames.
+
+### Auto-update signing
+
+The desktop app updates itself via the Tauri updater. Its public key is embedded
+in `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`); the updater endpoint
+is `releases/latest/download/latest.json`. For the workflow to produce signed
+update artifacts and the `latest.json` manifest (via
+`scripts/generate-latest-json.mjs`), add two repository secrets:
+
+- `TAURI_SIGNING_PRIVATE_KEY` — the minisign private key generated with
+  `pnpm exec tauri signer generate`.
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — its password (empty if the key has
+  none).
+
+This signature is independent of OS code signing, so it works even though the
+installers are unsigned. Without these secrets the release still publishes, but
+no `.sig`/`latest.json` is produced and auto-update stays dormant. Losing the
+private key means existing installs can no longer verify updates — keep it safe.

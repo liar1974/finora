@@ -747,29 +747,6 @@ export class SqliteFinanceRepository implements FinanceRepository {
     }
   }
 
-  saveProviderTransactions(transactions: ProviderTransactionInput[]): { inserted: number; skipped: number } {
-    const insert = this.database.prepare(`
-      INSERT OR IGNORE INTO transactions (
-        id, account_id, source_id, date, description, amount_minor, currency,
-        category, pending, metadata, fingerprint, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    return this.insertBatch(transactions, (transaction, now) => insert.run(
-      randomUUID(),
-      transaction.accountId,
-      transaction.sourceId ?? null,
-      transaction.date,
-      transaction.description,
-      transaction.amountMinor,
-      transaction.currency,
-      transaction.category ?? null,
-      transaction.pending ? 1 : 0,
-      JSON.stringify(transaction.metadata ?? {}),
-      transaction.fingerprint,
-      now,
-    ).changes === 1);
-  }
-
   reconcileProviderTransactions(transactions: ProviderTransactionInput[]): { inserted: number; updated: number; skipped: number } {
     const insert = this.database.prepare(`
       INSERT OR IGNORE INTO transactions (

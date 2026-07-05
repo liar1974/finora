@@ -136,8 +136,7 @@ export const LLM_PROVIDERS: readonly LlmProvider[] = [
 const providersById = new Map(LLM_PROVIDERS.map((provider) => [provider.id, provider]));
 
 export function resolveLlmConfig(getSetting: (key: string) => string | null): EffectiveLlmConfig {
-  const configuredProvider = (getSetting('LLM_PROVIDER') || process.env.LLM_PROVIDER || 'builtin').toLowerCase();
-  const providerId = configuredProvider === 'local' ? 'ollama' : configuredProvider;
+  const providerId = (getSetting('LLM_PROVIDER') || process.env.LLM_PROVIDER || 'builtin').toLowerCase();
   const provider = providersById.get(providerId) || providersById.get('custom')!;
   const configuredBaseUrl = getSetting('LLM_BASE_URL') || process.env.LLM_BASE_URL || provider.baseUrl || '';
   const baseUrl = providerId === 'ollama' ? ollamaCompatibleUrl(configuredBaseUrl) : configuredBaseUrl;
@@ -170,7 +169,7 @@ export async function generateChatReply(input: {
   const signal = AbortSignal.timeout(input.timeoutMs ?? 120_000);
   try {
     const result = await generateText({
-      model: buildModel(input.config, true),
+      model: buildModel(input.config),
       system: input.system,
       messages: input.messages as ModelMessage[],
       maxOutputTokens: input.maxTokens ?? 768,
@@ -233,9 +232,9 @@ function assertConfigured(config: EffectiveLlmConfig): void {
   }
 }
 
-function buildModel(config: EffectiveLlmConfig, chat: boolean): LanguageModel {
+function buildModel(config: EffectiveLlmConfig): LanguageModel {
   const provider = providersById.get(config.provider) || providersById.get('custom')!;
-  const model = chat ? config.chatModel : config.model;
+  const model = config.chatModel;
   switch (provider.kind) {
     case 'anthropic':
       return createAnthropic({

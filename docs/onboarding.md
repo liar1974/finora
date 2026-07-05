@@ -41,6 +41,13 @@ blocks them on the first launch. This is expected — here's how to allow it:
 - **Windows:** if a blue **SmartScreen** box appears, click **More info → Run
   anyway**.
 
+### Staying up to date
+
+You only need to download from this page once. After that, when a newer version
+is released, Finora shows an **Update available** button at the bottom of the
+left menu — one click downloads the update, verifies it, installs it, and
+restarts the app.
+
 ## 2. First launch
 
 When Finora opens, you're ready to go — there's no account to create. The menu

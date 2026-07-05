@@ -124,7 +124,7 @@ export function parseMoney(raw: string): number | null {
   return Number.isSafeInteger(value) ? sign * value : null;
 }
 
-export function parseDate(raw: string): string | null {
+function parseDate(raw: string): string | null {
   const value = raw.trim();
   let match = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/.exec(value);
   if (match) return validDate(match[1]!, match[2]!, match[3]!);
