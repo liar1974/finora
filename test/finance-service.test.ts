@@ -1,16 +1,26 @@
 import { readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FinanceService } from '../src/application/finance-service.js';
+import { LocalModelEngine } from '../src/infrastructure/local-model.js';
 import { CsvStatementParser } from '../src/infrastructure/parsers/csv-parser.js';
 import { OfxStatementParser } from '../src/infrastructure/parsers/ofx-parser.js';
 import { SqliteFinanceRepository } from '../src/infrastructure/sqlite-repository.js';
 
 afterEach(() => vi.unstubAllGlobals());
 
+// A models dir that will never contain weights, so the built-in engine reports
+// the model as absent without touching the native runtime.
+function localModel() {
+  return new LocalModelEngine(join(tmpdir(), 'finora-test-models-missing'));
+}
+
 function application() {
   return new FinanceService(
     new SqliteFinanceRepository(':memory:'),
     [new OfxStatementParser(), new CsvStatementParser()],
+    localModel(),
   );
 }
 
@@ -28,7 +38,7 @@ describe('FinanceService', () => {
       institution: 'Example Bank',
       status: 'error',
     });
-    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()]);
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
     const sent: Record<string, unknown>[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       sent.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -49,7 +59,7 @@ describe('FinanceService', () => {
       TELEGRAM_CHAT_ID: '123',
       NOTIFICATION_CHANNEL: 'telegram',
     });
-    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()]);
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
     service.createRule({
       text: 'any new credit card transactions',
       scope: 'banking',
@@ -88,9 +98,115 @@ describe('FinanceService', () => {
     service.close();
   });
 
+  it('does not re-notify when a pending charge posts (Plaid pending→posted)', async () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    repository.saveAppSettings({
+      TELEGRAM_BOT_TOKEN: 'test-token',
+      TELEGRAM_CHAT_ID: '123',
+      NOTIFICATION_CHANNEL: 'telegram',
+    });
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
+    service.createRule({ text: 'any new credit card transactions', scope: 'banking', cadence: 'event' });
+    const account = service.createAccount({
+      institution: 'Robinhood',
+      name: 'Robinhood Credit Card',
+      type: 'credit',
+      currency: 'USD',
+    });
+    const sent: Record<string, unknown>[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      sent.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return Response.json({ ok: true, result: {} });
+    }));
+
+    // Pending charge arrives and is notified once.
+    repository.reconcileProviderTransactions([{
+      accountId: account.id,
+      sourceId: 'plaid-pending',
+      date: '2026-07-03',
+      description: '99 Ranch Market',
+      amountMinor: -1874,
+      currency: 'USD',
+      pending: true,
+      fingerprint: 'plaid:pending',
+    }]);
+    await expect(service.deliverInsightsToIm()).resolves.toMatchObject({ count: 1, sent: true });
+
+    // It posts under a new transaction_id with a shifted date; supersede in place.
+    const reconciled = repository.reconcileProviderTransactions([{
+      accountId: account.id,
+      sourceId: 'plaid-posted',
+      date: '2026-07-02',
+      description: '99 Ranch Market',
+      amountMinor: -1874,
+      currency: 'USD',
+      pending: false,
+      fingerprint: 'plaid:posted',
+      supersedesFingerprint: 'plaid:pending',
+    }]);
+
+    expect(reconciled).toMatchObject({ inserted: 0, updated: 1 });
+    await expect(service.deliverInsightsToIm()).resolves.toMatchObject({ count: 0, sent: false, reason: 'no-new-insights' });
+    expect(sent).toHaveLength(1);
+
+    // The ledger keeps a single, posted entry — no duplicate row.
+    const rows = service.listTransactions({ accountId: account.id }).items;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ date: '2026-07-02', pending: false, sourceId: 'plaid-posted' });
+    service.close();
+  });
+
+  it('reconcileProviderTransactions preserves the row id and deleteTransactionsByFingerprints removes rows', () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    const account = repository.createAccount({
+      institution: 'Robinhood',
+      name: 'Robinhood Credit Card',
+      type: 'credit',
+      currency: 'USD',
+      domain: 'bank',
+      source: 'plaid',
+      providerAccountId: 'acct-1',
+      metadata: {},
+    });
+    repository.reconcileProviderTransactions([{
+      accountId: account.id,
+      sourceId: 'x',
+      date: '2026-07-01',
+      description: 'Clipper Mobile',
+      amountMinor: -5500,
+      currency: 'USD',
+      pending: true,
+      fingerprint: 'plaid:x',
+    }]);
+    const before = repository.listTransactions({ accountId: account.id, limit: 50 }).items;
+    expect(before).toHaveLength(1);
+    const originalId = before[0]!.id;
+
+    repository.reconcileProviderTransactions([{
+      accountId: account.id,
+      sourceId: 'y',
+      date: '2026-07-01',
+      description: 'Clipper Mobile',
+      amountMinor: -5500,
+      currency: 'USD',
+      pending: false,
+      fingerprint: 'plaid:y',
+      supersedesFingerprint: 'plaid:x',
+    }]);
+    const after = repository.listTransactions({ accountId: account.id, limit: 50 }).items;
+    expect(after).toHaveLength(1);
+    expect(after[0]!.id).toBe(originalId);
+    expect(after[0]).toMatchObject({ pending: false, sourceId: 'y' });
+
+    expect(repository.deleteTransactionsByFingerprints(account.id, ['plaid:y'])).toBe(1);
+    expect(repository.listTransactions({ accountId: account.id, limit: 50 }).items).toHaveLength(0);
+    expect(repository.deleteTransactionsByFingerprints(account.id, [])).toBe(0);
+    repository.close();
+  });
+
   it('produces insights for non-transaction rule kinds', () => {
     const repository = new SqliteFinanceRepository(':memory:');
-    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()]);
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
     service.createRule({ text: 'connection sync health', scope: 'all', cadence: 'event' });
     service.createRule({ text: 'large brokerage cash drag', scope: 'brokerage', cadence: 'weekly' });
     service.createRule({ text: 'portfolio concentration', scope: 'brokerage', cadence: 'weekly' });
@@ -498,7 +614,7 @@ Soft
       },
       bytes: 1024,
     });
-    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()]);
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
 
     const overview = service.getCreditOverview();
     expect(overview.inquiries).toEqual([{ company: 'Example Auto Finance', inquiryDate: '2026-05-01', type: 'hard' }]);

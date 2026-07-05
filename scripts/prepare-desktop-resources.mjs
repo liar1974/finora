@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
-import { chmod, cp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -43,5 +43,29 @@ await mkdir(join(desktop, 'node'), { recursive: true });
 const nodeTarget = join(desktop, 'node', `node${executableSuffix}`);
 await cp(process.execPath, nodeTarget);
 if (process.platform !== 'win32') await chmod(nodeTarget, 0o755);
+
+// The built-in local model runs through node-llama-cpp, which is a native addon
+// and is therefore marked `--external` in the esbuild bundle. Ship a flat,
+// self-contained node_modules next to the backend entrypoint so Node can
+// resolve `node-llama-cpp` (and its prebuilt binary for THIS platform) at
+// runtime. npm produces a hoisted tree that resolves without symlinks.
+const backendDir = join(desktop, 'backend');
+const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+const llamaVersion = rootPackage.dependencies?.['node-llama-cpp'];
+if (!llamaVersion) throw new Error('node-llama-cpp is missing from package.json dependencies');
+await writeFile(
+  join(backendDir, 'package.json'),
+  `${JSON.stringify(
+    {
+      name: 'finora-desktop-backend',
+      private: true,
+      type: 'module',
+      dependencies: { 'node-llama-cpp': llamaVersion },
+    },
+    null,
+    2,
+  )}\n`,
+);
+run('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--prefix', backendDir]);
 
 console.log(`Desktop resources prepared at ${desktop}`);

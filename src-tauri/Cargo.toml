@@ -17,4 +17,11 @@ tauri-build = { version = "2.6.2", features = [] }
 [dependencies]
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-single-instance = "2"
+tauri-plugin-process = "2"
+# generate_context! expands to serde_json usage once the updater pubkey is
+# configured in tauri.conf.json, so the crate must be a direct dependency.
+serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+
+[target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
+tauri-plugin-updater = "2"

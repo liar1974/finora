@@ -296,10 +296,22 @@ async function route(
     return sendJson(response, 200, await service.chat(input.messages, input.section, input.contextAttachments));
   }
   if (url.pathname === '/v1/llm' && method === 'GET') {
-    return sendJson(response, 200, service.getLlmStatus());
+    return sendJson(response, 200, await service.getLlmStatus());
   }
   if (url.pathname === '/v1/llm/test' && method === 'POST') {
     return sendJson(response, 200, await service.testLocalModel());
+  }
+  if (url.pathname === '/v1/llm/model' && method === 'GET') {
+    return sendJson(response, 200, await service.getBuiltinModelStatus());
+  }
+  if (url.pathname === '/v1/llm/model/download' && method === 'POST') {
+    return sendJson(response, 200, await service.downloadBuiltinModel());
+  }
+  if (url.pathname === '/v1/llm/model/download' && method === 'DELETE') {
+    return sendJson(response, 200, await service.cancelBuiltinModelDownload());
+  }
+  if (url.pathname === '/v1/llm/model' && method === 'DELETE') {
+    return sendJson(response, 200, await service.deleteBuiltinModel());
   }
   if (url.pathname === '/v1/insights' && method === 'GET') {
     return sendJson(response, 200, { items: service.listInsights() });

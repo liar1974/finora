@@ -174,7 +174,7 @@ pub fn run() {
     let state_slot: Arc<Mutex<Option<BackendState>>> = Arc::new(Mutex::new(None));
     let cleanup_slot = state_slot.clone();
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
             |app, _arguments, _directory| {
                 if let Some(window) = app.get_webview_window("main") {
@@ -184,6 +184,18 @@ pub fn run() {
                 }
             },
         ))
+        .plugin(tauri_plugin_process::init());
+
+    // The updater plugin backs the one-click "Update now" button in the UI:
+    // it downloads the signed release artifact advertised by latest.json,
+    // verifies it against the embedded public key, installs it, and the UI then
+    // asks the process plugin to relaunch. Desktop targets only.
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+
+    builder
         .setup(move |app| {
             let data_directory = app
                 .path()

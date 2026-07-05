@@ -1,7 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions for the Finora window",
+  "description": "Permissions for the Finora window. The UI is served by the bundled local backend over http://127.0.0.1, so that loopback origin is granted IPC access for the auto-updater and relaunch.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://127.0.0.1:*/*"]
+  },
+  "permissions": ["core:default", "updater:default", "process:allow-restart"]
 }

@@ -12,9 +12,18 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/liar1974/finora/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU1NjczNDJBMUIyN0I3OEUKUldTT3R5Y2JLalJuNVNrU00vbVR6VWJUTDZMWWFvMndBemRnU2p1ME13V2tMZHNmMUk4aXZ6UlMK"
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "resources": ["resources/desktop"],
     "icon": [
       "icons/32x32.png",

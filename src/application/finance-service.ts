@@ -28,6 +28,7 @@ import {
 } from '../domain/invariants.js';
 import type { Account, AccountBalance, AlertRuleRecord, BrokerageTransaction, CreditReportRecord, ImportRecord, Transaction, TransactionInput } from '../domain/models.js';
 import { generateChatReply, LLM_PROVIDERS, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
+import { LocalModelEngine, ModelNotDownloadedError } from '../infrastructure/local-model.js';
 import { TelegramGateway, sendTelegramMessage } from '../infrastructure/telegram-gateway.js';
 
 export interface ChatMessage {
@@ -133,6 +134,7 @@ export class FinanceService {
   constructor(
     private readonly repository: FinanceRepository,
     private readonly parsers: readonly StatementParser[],
+    private readonly localModel: LocalModelEngine,
   ) {
     this.telegramGateway = new TelegramGateway({
       getToken: () => this.telegramToken(),
@@ -611,13 +613,30 @@ export class FinanceService {
             pending: transaction.pending,
             metadata: transaction as unknown as Record<string, unknown>,
             fingerprint: `plaid:${transaction.transaction_id}`,
+            // A posted transaction supersedes its pending predecessor in place so
+            // the stable row id (and therefore the notification identity) survives.
+            supersedesFingerprint: transaction.pending_transaction_id
+              ? `plaid:${transaction.pending_transaction_id}`
+              : null,
           });
         }
-        const saved = this.repository.saveProviderTransactions(transactions);
+        const saved = this.repository.reconcileProviderTransactions(transactions);
         out.transactions += saved.inserted;
         out.skipped += saved.skipped;
-        out.modified += data.modified.length;
-        out.removed += data.removed.length;
+        out.modified += data.modified.length + saved.updated;
+        // Plaid lists the pending id in `removed` once a charge posts; delete those
+        // rows so the ledger keeps a single entry per purchase.
+        const removedByAccount = new Map<string, string[]>();
+        for (const removed of data.removed) {
+          const account = removed.account_id ? accountMap.get(removed.account_id) : undefined;
+          if (!account || !removed.transaction_id) continue;
+          const fingerprints = removedByAccount.get(account.id) ?? [];
+          fingerprints.push(`plaid:${removed.transaction_id}`);
+          removedByAccount.set(account.id, fingerprints);
+        }
+        for (const [accountId, fingerprints] of removedByAccount) {
+          out.removed += this.repository.deleteTransactionsByFingerprints(accountId, fingerprints);
+        }
         nextCursor = data.next_cursor;
         hasMore = data.has_more;
       }
@@ -1138,8 +1157,7 @@ export class FinanceService {
       JSON.stringify(context, null, 2),
     ].join('\n');
     try {
-      const reply = await generateChatReply({
-        config: llm,
+      const reply = await this.llmReply(llm, {
         system,
         messages: messages.slice(-8),
         timeoutMs: 120_000,
@@ -1147,6 +1165,9 @@ export class FinanceService {
       });
       return { provider: llm.provider, model: llm.chatModel, local: llm.local, reply };
     } catch (error) {
+      if (error instanceof ModelNotDownloadedError) {
+        throw new AppError('invalid_input', error.message, { provider: llm.provider, reason: 'needs_download' });
+      }
       const message = error instanceof Error ? error.message : 'The configured model request failed';
       throw new AppError('external_service', `LLM request failed: ${message}`, {
         provider: llm.provider,
@@ -1158,8 +1179,7 @@ export class FinanceService {
   async testLocalModel() {
     const llm = this.llmConfig();
     try {
-      const reply = await generateChatReply({
-        config: llm,
+      const reply = await this.llmReply(llm, {
         system: 'You are a connectivity test. Reply with a short OK.',
         messages: [{ role: 'user', content: 'Confirm Finora can reach this model.' }],
         timeoutMs: 30_000,
@@ -1174,6 +1194,9 @@ export class FinanceService {
         reply,
       };
     } catch (error) {
+      if (error instanceof ModelNotDownloadedError) {
+        throw new AppError('invalid_input', error.message, { provider: llm.provider, reason: 'needs_download' });
+      }
       const message = error instanceof Error ? error.message : 'The configured model request failed';
       throw new AppError('external_service', `LLM connection failed: ${message}`, {
         provider: llm.provider,
@@ -1182,7 +1205,7 @@ export class FinanceService {
     }
   }
 
-  getLlmStatus() {
+  async getLlmStatus() {
     const llm = this.llmConfig();
     return {
       effective: {
@@ -1202,8 +1225,26 @@ export class FinanceService {
         needsKey: provider.needsKey,
         defaultModel: provider.defaultModel,
         defaultChatModel: provider.defaultChatModel,
+        local: Boolean(provider.local),
       })),
+      builtin: await this.localModel.status(),
     };
+  }
+
+  getBuiltinModelStatus() {
+    return this.localModel.status();
+  }
+
+  downloadBuiltinModel() {
+    return this.localModel.startDownload();
+  }
+
+  cancelBuiltinModelDownload() {
+    return this.localModel.cancelDownload();
+  }
+
+  deleteBuiltinModel() {
+    return this.localModel.deleteModel();
   }
 
   async importCreditReport(input: { filename: string; content: Uint8Array }) {
@@ -1351,6 +1392,7 @@ export class FinanceService {
     if (this.alertTimer) clearInterval(this.alertTimer);
     if (this.providerSyncKick) clearTimeout(this.providerSyncKick);
     if (this.providerSyncTimer) clearInterval(this.providerSyncTimer);
+    void this.localModel.unload();
     this.repository.close();
   }
 
@@ -1399,11 +1441,25 @@ export class FinanceService {
     return resolveLlmConfig((key) => this.repository.getAppSetting(key));
   }
 
+  // Single entry point for a chat completion: the built-in local model runs
+  // in-process through the engine, every other provider goes over the HTTP
+  // gateway. Callers stay provider-agnostic.
+  private async llmReply(config: ReturnType<typeof this.llmConfig>, input: {
+    system: string;
+    messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+    timeoutMs?: number;
+    maxTokens?: number;
+  }): Promise<string> {
+    if (config.provider === 'builtin') {
+      return this.localModel.generateReply(input);
+    }
+    return generateChatReply({ config, ...input });
+  }
+
   private async inferRuleWithModel(text: string, fallback: ReturnType<typeof inferRule>) {
     const llm = this.llmConfig();
     try {
-      const reply = await generateChatReply({
-        config: llm,
+      const reply = await this.llmReply(llm, {
         system: [
           'Infer rule delivery settings for Finora.',
           'Return only compact JSON with keys: scope, cadence.',

@@ -3,8 +3,9 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { generateText, type LanguageModel, type ModelMessage } from 'ai';
+import { BUILTIN_MODEL } from './local-model.js';
 
-export type LlmProviderKind = 'anthropic' | 'openai' | 'google' | 'openai-compatible';
+export type LlmProviderKind = 'anthropic' | 'openai' | 'google' | 'openai-compatible' | 'builtin';
 
 export interface LlmProvider {
   id: string;
@@ -34,6 +35,15 @@ export interface EffectiveLlmConfig extends LlmConfig {
 
 // Model selection is live, and every chat surface calls the same gateway.
 export const LLM_PROVIDERS: readonly LlmProvider[] = [
+  {
+    id: 'builtin',
+    label: 'Built-in local model (no API key)',
+    kind: 'builtin',
+    needsKey: false,
+    defaultModel: BUILTIN_MODEL.id,
+    defaultChatModel: BUILTIN_MODEL.id,
+    local: true,
+  },
   {
     id: 'ollama',
     label: 'Ollama (local)',
@@ -126,7 +136,7 @@ export const LLM_PROVIDERS: readonly LlmProvider[] = [
 const providersById = new Map(LLM_PROVIDERS.map((provider) => [provider.id, provider]));
 
 export function resolveLlmConfig(getSetting: (key: string) => string | null): EffectiveLlmConfig {
-  const configuredProvider = (getSetting('LLM_PROVIDER') || process.env.LLM_PROVIDER || 'ollama').toLowerCase();
+  const configuredProvider = (getSetting('LLM_PROVIDER') || process.env.LLM_PROVIDER || 'builtin').toLowerCase();
   const providerId = configuredProvider === 'local' ? 'ollama' : configuredProvider;
   const provider = providersById.get(providerId) || providersById.get('custom')!;
   const configuredBaseUrl = getSetting('LLM_BASE_URL') || process.env.LLM_BASE_URL || provider.baseUrl || '';
@@ -152,6 +162,9 @@ export async function generateChatReply(input: {
   timeoutMs?: number;
   maxTokens?: number;
 }): Promise<string> {
+  if (input.config.provider === 'builtin') {
+    throw new Error('The built-in local model must be generated through the local engine, not the HTTP gateway');
+  }
   assertConfigured(input.config);
   if (input.config.provider === 'ollama') return generateOllamaReply(input);
   const signal = AbortSignal.timeout(input.timeoutMs ?? 120_000);
@@ -245,6 +258,8 @@ function buildModel(config: EffectiveLlmConfig, chat: boolean): LanguageModel {
         baseURL: config.baseUrl,
         ...(config.apiKey ? { apiKey: config.apiKey } : {}),
       })(model);
+    case 'builtin':
+      throw new Error('The built-in local model is not an AI SDK provider');
   }
 }
 

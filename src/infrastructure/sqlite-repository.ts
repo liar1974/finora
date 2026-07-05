@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -210,7 +210,7 @@ export class SqliteFinanceRepository implements FinanceRepository {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.database = new DatabaseSync(path);
     this.database.exec('PRAGMA journal_mode = WAL;');
-    this.migrate();
+    this.migrate(path);
   }
 
   createAccount(input: AccountCreate): Account {
@@ -770,6 +770,89 @@ export class SqliteFinanceRepository implements FinanceRepository {
     ).changes === 1);
   }
 
+  reconcileProviderTransactions(transactions: ProviderTransactionInput[]): { inserted: number; updated: number; skipped: number } {
+    const insert = this.database.prepare(`
+      INSERT OR IGNORE INTO transactions (
+        id, account_id, source_id, date, description, amount_minor, currency,
+        category, pending, metadata, fingerprint, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const findRow = this.database.prepare(
+      'SELECT id FROM transactions WHERE account_id = ? AND fingerprint = ?',
+    );
+    const update = this.database.prepare(`
+      UPDATE transactions SET
+        source_id = ?, date = ?, description = ?, amount_minor = ?, currency = ?,
+        category = ?, pending = ?, metadata = ?, fingerprint = ?
+      WHERE id = ?
+    `);
+    const deleteById = this.database.prepare('DELETE FROM transactions WHERE id = ?');
+    const result = { inserted: 0, updated: 0, skipped: 0 };
+    const now = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      for (const transaction of transactions) {
+        const supersedes = transaction.supersedesFingerprint;
+        if (supersedes) {
+          const pendingRow = findRow.get(transaction.accountId, supersedes) as { id: string } | undefined;
+          if (pendingRow) {
+            const postedRow = findRow.get(transaction.accountId, transaction.fingerprint) as { id: string } | undefined;
+            if (postedRow && postedRow.id !== pendingRow.id) {
+              // The posted transaction is already stored under its own row; drop
+              // the now-obsolete pending row so the ledger keeps a single entry.
+              deleteById.run(pendingRow.id);
+            } else {
+              update.run(
+                transaction.sourceId ?? null,
+                transaction.date,
+                transaction.description,
+                transaction.amountMinor,
+                transaction.currency,
+                transaction.category ?? null,
+                transaction.pending ? 1 : 0,
+                JSON.stringify(transaction.metadata ?? {}),
+                transaction.fingerprint,
+                pendingRow.id,
+              );
+            }
+            result.updated += 1;
+            continue;
+          }
+        }
+        const inserted = insert.run(
+          randomUUID(),
+          transaction.accountId,
+          transaction.sourceId ?? null,
+          transaction.date,
+          transaction.description,
+          transaction.amountMinor,
+          transaction.currency,
+          transaction.category ?? null,
+          transaction.pending ? 1 : 0,
+          JSON.stringify(transaction.metadata ?? {}),
+          transaction.fingerprint,
+          now,
+        ).changes === 1;
+        if (inserted) result.inserted += 1;
+        else result.skipped += 1;
+      }
+      this.database.exec('COMMIT');
+      return result;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  deleteTransactionsByFingerprints(accountId: string, fingerprints: string[]): number {
+    if (fingerprints.length === 0) return 0;
+    const placeholders = fingerprints.map(() => '?').join(', ');
+    const statement = this.database.prepare(
+      `DELETE FROM transactions WHERE account_id = ? AND fingerprint IN (${placeholders})`,
+    );
+    return Number(statement.run(accountId, ...fingerprints).changes);
+  }
+
   saveProviderBrokerageTransactions(transactions: ProviderBrokerageTransactionInput[]): { inserted: number; skipped: number } {
     const insert = this.database.prepare(`
       INSERT OR IGNORE INTO brokerage_transactions (
@@ -868,13 +951,84 @@ export class SqliteFinanceRepository implements FinanceRepository {
     }
   }
 
-  private migrate(): void {
+  private migrate(databasePath: string): void {
+    // The schema_migrations ledger records which numbered migrations have run.
+    // Each migration below is applied exactly once, in order, inside its own
+    // transaction. Adding a new migration (new tables, ALTER TABLE, backfills)
+    // is as simple as appending an entry with the next version number; it will
+    // run automatically on the first launch of a build that ships it, which is
+    // what makes the desktop auto-update safe across schema changes.
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
         applied_at TEXT NOT NULL
       );
+    `);
 
+    const applied = new Set(
+      (
+        this.database.prepare('SELECT version FROM schema_migrations').all() as {
+          version: number | bigint;
+        }[]
+      ).map((row) => Number(row.version)),
+    );
+
+    const migrations: { version: number; up: () => void }[] = [
+      { version: 1, up: () => this.applyInitialSchema() },
+    ];
+
+    // Before mutating an existing user's data, snapshot it. This only runs when
+    // there is real data to protect (an already-migrated database) AND pending
+    // migrations — never on a fresh install. A migration that corrupts data via
+    // faulty backfill logic still commits, so this is the only recovery path.
+    const pending = migrations.some((migration) => !applied.has(migration.version));
+    if (pending && applied.size > 0 && databasePath !== ':memory:') {
+      this.backupBeforeMigrating(databasePath, Math.max(...applied));
+    }
+
+    for (const migration of migrations) {
+      if (applied.has(migration.version)) continue;
+      this.database.exec('BEGIN IMMEDIATE');
+      try {
+        migration.up();
+        this.database
+          .prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+          .run(migration.version, new Date().toISOString());
+        this.database.exec('COMMIT');
+      } catch (error) {
+        this.database.exec('ROLLBACK');
+        throw error;
+      }
+    }
+
+    // Indexes are declared IF NOT EXISTS, so reconcile them on every startup to
+    // cover databases created before a given index was introduced.
+    this.ensureIndexes();
+  }
+
+  private backupBeforeMigrating(databasePath: string, fromVersion: number): void {
+    const backupPath = `${databasePath}.backup-v${fromVersion}`;
+    try {
+      // A leftover backup at this path means a previous migration attempt from
+      // the same schema version rolled back; overwriting it is safe because the
+      // source state is identical.
+      rmSync(backupPath, { force: true });
+      // VACUUM INTO writes a single, consistent snapshot that already folds in
+      // any WAL contents, so there is no need to copy the -wal/-shm sidecars.
+      this.database.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
+    } catch (error) {
+      // Refuse to migrate without a recoverable backup: leaving the data
+      // untouched (and surfacing why) is safer than mutating it unprotected.
+      throw new Error(
+        `Could not back up the database before migrating (${backupPath}). Free up disk space or check permissions and relaunch. Original error: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  private applyInitialSchema(): void {
+    this.database.exec(`
       CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY,
         institution TEXT NOT NULL,
@@ -1079,17 +1233,13 @@ export class SqliteFinanceRepository implements FinanceRepository {
         created_at TEXT NOT NULL
       );
 
-      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-      VALUES (1, datetime('now'));
-
       INSERT OR IGNORE INTO app_settings(key, value, updated_at)
       VALUES
-        ('LLM_PROVIDER', 'ollama', datetime('now')),
-        ('LLM_BASE_URL', 'http://127.0.0.1:11434', datetime('now')),
-        ('LLM_MODEL', 'qwen3.5:9b', datetime('now')),
-        ('LLM_CHAT_MODEL', 'qwen3.5:9b', datetime('now'));
+        ('LLM_PROVIDER', 'builtin', datetime('now')),
+        ('LLM_BASE_URL', '', datetime('now')),
+        ('LLM_MODEL', 'qwen2.5-3b-instruct', datetime('now')),
+        ('LLM_CHAT_MODEL', 'qwen2.5-3b-instruct', datetime('now'));
     `);
-    this.ensureIndexes();
   }
 
   private saveProviderConnectionInTransaction(input: ProviderConnectionSave, now: string): ProviderConnection {

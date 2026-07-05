@@ -1,9 +1,28 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { generateChatReply, resolveLlmConfig } from '../src/infrastructure/llm-gateway.js';
+import { generateChatReply, LLM_PROVIDERS, resolveLlmConfig } from '../src/infrastructure/llm-gateway.js';
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe('LLM gateway', () => {
+  it('defaults to the key-free built-in local provider', () => {
+    const config = resolveLlmConfig(() => null);
+    expect(config).toMatchObject({
+      provider: 'builtin',
+      needsKey: false,
+      keySet: true,
+      local: true,
+      chatModel: 'qwen2.5-3b-instruct',
+    });
+    expect(LLM_PROVIDERS.some((provider) => provider.id === 'builtin' && !provider.needsKey && provider.local)).toBe(true);
+  });
+
+  it('never routes the built-in model through the HTTP gateway', async () => {
+    const config = resolveLlmConfig(() => null);
+    await expect(
+      generateChatReply({ config, system: 'x', messages: [{ role: 'user', content: 'hi' }] }),
+    ).rejects.toThrow(/built-in local model/i);
+  });
+
   it('normalizes Ollama to its OpenAI-compatible endpoint', () => {
     const values: Record<string, string> = {
       LLM_PROVIDER: 'ollama',

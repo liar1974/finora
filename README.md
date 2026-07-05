@@ -36,6 +36,11 @@ money.
 - **Read your credit report at home.** Load a credit report you downloaded from
   AnnualCreditReport.com and review it on your own computer, without giving it to
   a third party.
+- **Ask questions with no setup.** Finora includes a built-in local AI model, so
+  you can chat about your finances without an API key or any extra install. The
+  model downloads once from a public open-source model host and then runs
+  entirely on your computer. Prefer a hosted model? Bring your own Anthropic,
+  OpenAI, Google, or Ollama setup in **Settings → Models**.
 
 ## Download
 

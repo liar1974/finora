@@ -65,6 +65,10 @@ export interface ProviderTransactionInput extends TransactionInput {
   accountId: string;
   currency: string;
   fingerprint: string;
+  // When set, an existing row with this fingerprint (the pending charge) is
+  // updated in place to the posted values instead of inserting a new row, so
+  // the stable row id survives the Plaid pending→posted transition.
+  supersedesFingerprint?: string | null;
 }
 
 export interface ProviderBrokerageTransactionInput {
@@ -143,6 +147,8 @@ export interface FinanceRepository {
   findImport(accountId: string, contentHash: string): ImportRecord | null;
   saveImport(input: SaveImportInput): ImportRecord;
   saveProviderTransactions(transactions: ProviderTransactionInput[]): { inserted: number; skipped: number };
+  reconcileProviderTransactions(transactions: ProviderTransactionInput[]): { inserted: number; updated: number; skipped: number };
+  deleteTransactionsByFingerprints(accountId: string, fingerprints: string[]): number;
   saveProviderBrokerageTransactions(transactions: ProviderBrokerageTransactionInput[]): { inserted: number; skipped: number };
   saveProviderHoldings(holdings: ProviderHoldingInput[]): { inserted: number; skipped: number };
   saveProviderBalances(balances: ProviderBalanceInput[]): { inserted: number; skipped: number };

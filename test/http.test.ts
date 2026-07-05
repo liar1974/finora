@@ -1,8 +1,11 @@
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FinanceService } from '../src/application/finance-service.js';
 import { startHttpServer } from '../src/http/server.js';
+import { LocalModelEngine } from '../src/infrastructure/local-model.js';
 import { CsvStatementParser } from '../src/infrastructure/parsers/csv-parser.js';
 import { OfxStatementParser } from '../src/infrastructure/parsers/ofx-parser.js';
 import { SqliteFinanceRepository } from '../src/infrastructure/sqlite-repository.js';
@@ -14,6 +17,7 @@ async function httpFixture(options: { desktopToken?: string; onDesktopShutdown?:
   const service = new FinanceService(
     new SqliteFinanceRepository(':memory:'),
     [new OfxStatementParser(), new CsvStatementParser()],
+    new LocalModelEngine(join(tmpdir(), 'finora-test-models-missing')),
   );
   const server = startHttpServer(service, { host: '127.0.0.1', port: 0, ...options });
   await once(server, 'listening');

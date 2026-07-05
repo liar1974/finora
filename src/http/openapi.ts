@@ -150,6 +150,14 @@ export const openApiDocument = {
     '/v1/llm/test': {
       post: { summary: 'Test the configured chat model', responses: { '200': { description: 'Connectivity result' }, '502': { description: 'Model request failed' } } },
     },
+    '/v1/llm/model': {
+      get: { summary: 'Get built-in local model download status', responses: { '200': { description: 'Built-in model status' } } },
+      delete: { summary: 'Delete the downloaded built-in model', responses: { '200': { description: 'Built-in model status' } } },
+    },
+    '/v1/llm/model/download': {
+      post: { summary: 'Start or resume the built-in model download', responses: { '200': { description: 'Built-in model status' } } },
+      delete: { summary: 'Cancel an in-progress built-in model download', responses: { '200': { description: 'Built-in model status' } } },
+    },
     '/v1/telegram/connect': {
       post: { summary: 'Bind the configured Telegram bot to a chat', responses: { '200': { description: 'Bound chat' }, '422': { description: 'Missing token or chat' } } },
     },

@@ -5,6 +5,7 @@ export interface Config {
   host: string;
   port: number;
   databasePath: string;
+  modelsDir: string;
 }
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config {
@@ -17,5 +18,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config
     host: environment.FINORA_HOST ?? '127.0.0.1',
     port,
     databasePath: resolve(environment.FINORA_DATABASE_PATH ?? join(dataDirectory, 'finora.db')),
+    modelsDir: resolve(environment.FINORA_MODELS_DIR ?? join(dataDirectory, 'models')),
   };
 }

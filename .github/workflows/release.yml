@@ -72,6 +72,31 @@ jobs:
 
       - name: Build Tauri app
         run: pnpm exec tauri build ${{ matrix.tauri-args }}
+        env:
+          # Signs the updater artifacts (.app.tar.gz / -setup.exe / .AppImage) with
+          # the minisign key whose public half is embedded in tauri.conf.json. Add
+          # these as repository secrets; without them the .sig files are not produced
+          # and auto-update has nothing to verify against.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Disambiguate macOS updater bundle name
+        # Both macOS architectures emit an identically named "Finora.app.tar.gz",
+        # which would collide once artifacts are merged. Rename each per-arch so the
+        # updater manifest can reference them individually. Renaming does not affect
+        # the signature, which is computed over the file contents.
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.rust-target == 'aarch64-apple-darwin' && 'aarch64' || 'x64' }}"
+          dir="src-tauri/target/${{ matrix.rust-target }}/release/bundle/macos"
+          for ext in ".app.tar.gz" ".app.tar.gz.sig"; do
+            src="$dir/Finora$ext"
+            if [ -f "$src" ]; then
+              mv "$src" "$dir/Finora_${arch}$ext"
+              echo "Renamed Finora$ext -> Finora_${arch}$ext"
+            fi
+          done
 
       - name: Upload installers
         uses: actions/upload-artifact@v7
@@ -86,6 +111,7 @@ jobs:
             src-tauri/target/**/release/bundle/appimage/*.AppImage
             src-tauri/target/**/release/bundle/deb/*.deb
             src-tauri/target/**/release/bundle/rpm/*.rpm
+            src-tauri/target/**/release/bundle/**/*.sig
 
   publish:
     name: Publish GitHub release
@@ -95,6 +121,8 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v7
+
       - name: Download installers
         uses: actions/download-artifact@v8
         with:
@@ -127,6 +155,16 @@ jobs:
           copy_first "artifacts/*_x64.dmg"       "Finora-macOS-Intel.dmg"
           copy_first "artifacts/*-setup.exe"     "Finora-Windows-Setup.exe"
           copy_first "artifacts/*.AppImage"      "Finora-Linux-x86_64.AppImage"
+
+      - name: Generate updater manifest
+        # Builds latest.json from the signed updater artifacts. The desktop app's
+        # updater endpoint points at releases/latest/download/latest.json, so this
+        # file must ship with every release for one-click auto-update to work.
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+          ARTIFACTS_DIR: artifacts
+        run: node scripts/generate-latest-json.mjs
 
       - name: Publish release
         uses: softprops/action-gh-release@v3

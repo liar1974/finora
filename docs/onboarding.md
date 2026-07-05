@@ -172,10 +172,23 @@ you see everything together. Until then, this is where you start a connection.
 ### Settings — connections and alerts
 
 Add your Plaid keys and manage connected accounts under **Bank/Brokerage**,
-choose how you'd like to be notified under **Delivery**, and create alert rules
-under **Rules & Insights**.
+choose the language model under **Models**, decide how you'd like to be notified
+under **Delivery**, and create alert rules under **Rules & Insights**.
 
 ![Settings](media/screenshots/settings.png)
+
+#### Models — chat with no setup
+
+Finora comes with a **built-in local model** and uses it by default, so you can
+start chatting right away — no API key and no separate install. The model's
+weights aren't part of the download; the first time you want to use chat, open
+**Settings → Models** and click **Download model** (about 2 GB, fetched once
+from a public open-source model host and saved to a file on your computer).
+After that, chat and Telegram/Slack replies run entirely on your machine.
+
+Prefer a hosted model instead? Pick **Anthropic**, **OpenAI**, **Google**, or
+any OpenAI-compatible provider from the **Provider** dropdown and paste your
+API key. If you already run **Ollama**, that's an option too.
 
 Want alerts to reach you outside the app? See
 **[Get insights in Telegram or Slack](#5-get-insights-in-telegram-or-slack)**

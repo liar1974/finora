@@ -257,6 +257,117 @@ const notificationChannels = {
 let activeCreditUpload = null;
 const pendingChatContent = '__FINORA_THINKING__';
 
+// Auto-update is only meaningful inside the packaged desktop app, where Tauri
+// injects its IPC bridge. In a plain browser (web mode) window.__TAURI_INTERNALS__
+// is undefined, so the update banner and its dynamic imports never activate.
+const isDesktopApp = typeof window !== 'undefined' && !!window.__TAURI_INTERNALS__;
+// status: 'idle' | 'available' | 'downloading' | 'installing' | 'error'
+let updateState = { status: 'idle', version: null, currentVersion: null, progress: 0, error: null };
+let pendingUpdate = null;
+
+async function checkForUpdate() {
+  if (!isDesktopApp) return;
+  try {
+    const { check } = await import('@tauri-apps/plugin-updater');
+    const update = await check();
+    if (update) {
+      pendingUpdate = update;
+      updateState = {
+        status: 'available',
+        version: update.version,
+        currentVersion: update.currentVersion,
+        progress: 0,
+        error: null,
+      };
+    } else {
+      updateState = { status: 'idle', version: null, currentVersion: null, progress: 0, error: null };
+    }
+  } catch (error) {
+    // A missing/unreachable latest.json is normal (e.g. no release yet); keep it
+    // quiet rather than nagging the user with a failure they can't act on.
+    updateState = { status: 'idle', version: null, currentVersion: null, progress: 0, error: null };
+    console.warn('Update check failed:', error);
+  }
+  renderSidebar();
+}
+
+async function runUpdate() {
+  if (!pendingUpdate || updateState.status === 'downloading' || updateState.status === 'installing') return;
+  try {
+    updateState = { ...updateState, status: 'downloading', progress: 0, error: null };
+    renderSidebar();
+    let downloaded = 0;
+    let total = 0;
+    await pendingUpdate.downloadAndInstall((event) => {
+      if (event.event === 'Started') {
+        total = event.data?.contentLength || 0;
+      } else if (event.event === 'Progress') {
+        downloaded += event.data?.chunkLength || 0;
+        updateState.progress = total ? Math.min(1, downloaded / total) : 0;
+        renderSidebar();
+      } else if (event.event === 'Finished') {
+        updateState.progress = 1;
+      }
+    });
+    updateState = { ...updateState, status: 'installing', progress: 1 };
+    renderSidebar();
+    const { relaunch } = await import('@tauri-apps/plugin-process');
+    await relaunch();
+  } catch (error) {
+    updateState = { ...updateState, status: 'error', error: error?.message || String(error) };
+    renderSidebar();
+  }
+}
+
+function renderUpdateBanner() {
+  if (!isDesktopApp || updateState.status === 'idle') return null;
+  const wrap = el('div', 'updatebanner');
+
+  if (updateState.status === 'error') {
+    wrap.classList.add('is-error');
+    const title = el('div', 'updatetitle');
+    title.textContent = 'Update failed';
+    const detail = el('div', 'updatesub');
+    detail.textContent = updateState.error || 'Could not install the update.';
+    const retry = el('button', 'updatebtn');
+    retry.type = 'button';
+    retry.textContent = 'Try again';
+    retry.addEventListener('click', runUpdate);
+    wrap.append(title, detail, retry);
+    return wrap;
+  }
+
+  const title = el('div', 'updatetitle');
+  title.textContent = 'Update available';
+  const sub = el('div', 'updatesub');
+  sub.textContent = updateState.currentVersion
+    ? `v${updateState.currentVersion} → v${updateState.version}`
+    : `Version ${updateState.version}`;
+  wrap.append(title, sub);
+
+  if (updateState.status === 'downloading') {
+    const bar = el('div', 'updateprogress');
+    const fill = el('div', 'updateprogressfill');
+    fill.style.width = `${Math.round(updateState.progress * 100)}%`;
+    bar.appendChild(fill);
+    const label = el('div', 'updatesub');
+    label.textContent = `Downloading… ${Math.round(updateState.progress * 100)}%`;
+    wrap.append(bar, label);
+  } else if (updateState.status === 'installing') {
+    const label = el('div', 'updatesub');
+    label.textContent = 'Installing… the app will restart.';
+    wrap.append(label);
+  } else {
+    const btn = el('button', 'updatebtn');
+    btn.type = 'button';
+    btn.textContent = 'Update now';
+    btn.addEventListener('click', runUpdate);
+    wrap.append(btn);
+  }
+
+  return wrap;
+}
+
 async function api(path, options) {
   const request = { ...(options ?? {}) };
   request.headers = new Headers(request.headers);
@@ -1365,6 +1476,9 @@ function renderSidebar() {
     nav.appendChild(row);
   }
   side.appendChild(nav);
+
+  const banner = renderUpdateBanner();
+  if (banner) side.appendChild(banner);
 }
 
 function dateRangeControl() {
@@ -2715,23 +2829,34 @@ function providerCredentialGuide() {
   return guide;
 }
 
+function formatModelSize(bytes) {
+  const gb = Number(bytes || 0) / 1_000_000_000;
+  if (gb >= 1) return `${gb.toFixed(1)} GB`;
+  return `${Math.round(Number(bytes || 0) / 1_000_000)} MB`;
+}
+
 function renderSettingsModels(view) {
   const effective = state.llm?.effective || {};
   const providers = state.llm?.providers || [];
+  const isBuiltin = effective.provider === 'builtin';
   const providerOptions = providers.map((provider) =>
     `<option value="${esc(provider.id)}"${provider.id === effective.provider ? ' selected' : ''}>${esc(provider.label)}</option>`
   ).join('');
-  const formSection = settingsForm(
-    'Language model',
-    `Web chat and Telegram use the same configured model. Current route: ${esc(effective.label || 'not configured')} / ${esc(effective.chatModel || 'no chat model')}.`,
-    [
-      `<label>Provider<select name="LLM_PROVIDER">${providerOptions}</select></label>`,
+  // The built-in local model needs no key, base URL, or model names — those
+  // fields only make sense for the API-based and custom providers.
+  const rows = [`<label>Provider<select name="LLM_PROVIDER">${providerOptions}</select></label>`];
+  if (!isBuiltin) {
+    rows.push(
       settingRow('LLM_API_KEY', 'API key', 'password'),
       settingRow('LLM_BASE_URL', 'Base URL'),
       settingRow('LLM_MODEL', 'Extraction model'),
       settingRow('LLM_CHAT_MODEL', 'Chat model'),
-    ],
-  );
+    );
+  }
+  const subtitle = isBuiltin
+    ? 'Finora is using its built-in local model — no API key required. Download the model once below, then web chat and Telegram run fully on your computer.'
+    : `Web chat and Telegram use the same configured model. Current route: ${esc(effective.label || 'not configured')} / ${esc(effective.chatModel || 'no chat model')}.`;
+  const formSection = settingsForm('Language model', subtitle, rows);
   const actions = formSection.querySelector('.row');
   const test = el('button', 'ghost');
   test.type = 'button';
@@ -2754,6 +2879,97 @@ function renderSettingsModels(view) {
   });
   actions.append(test, status);
   view.appendChild(formSection);
+  if (isBuiltin) renderBuiltinModelCard(view, state.llm?.builtin);
+}
+
+function renderBuiltinModelCard(view, initial) {
+  const sec = el('div', 'sec');
+  view.appendChild(sec);
+
+  const render = (model) => {
+    if (!model) return;
+    const download = model.download || {};
+    const downloading = download.state === 'downloading';
+    const ready = model.present || download.state === 'ready';
+    const errored = download.state === 'error';
+    const total = download.totalSize || model.approxSizeBytes || 0;
+    const done = download.downloadedSize || 0;
+    const percent = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
+    let statusLine;
+    if (!model.engineAvailable) statusLine = `<span class="message error">Local engine unavailable: ${esc(model.engineError || 'unsupported platform')}</span>`;
+    else if (ready) statusLine = '<span class="message">Downloaded and ready — chat runs on your computer.</span>';
+    else if (downloading) statusLine = `<span class="message">Downloading… ${percent}% (${formatModelSize(done)} / ${formatModelSize(total)})</span>`;
+    else if (errored) statusLine = `<span class="message error">Download failed: ${esc(download.error || 'unknown error')}</span>`;
+    else statusLine = `<span class="message">Not downloaded yet — about ${formatModelSize(total)} to download once.</span>`;
+
+    const bar = downloading
+      ? `<div style="height:8px;border-radius:4px;background:rgba(127,127,127,0.2);overflow:hidden;margin:10px 0"><div style="height:100%;width:${percent}%;background:var(--accent,#4f8cff);transition:width .3s"></div></div>`
+      : '';
+
+    sec.innerHTML = `
+      <div class="sechdr"><h3>Built-in model</h3></div>
+      <div class="cardsub">${esc(model.label)} — a local open-source model, downloaded from a public model host to <code>~/.finora/models</code>. Your data never leaves your computer.</div>
+      ${bar}
+      <div class="row" style="align-items:center;gap:8px;margin-top:8px">${statusLine}</div>
+      <div class="row" style="gap:8px;margin-top:8px" data-actions></div>`;
+
+    const actions = sec.querySelector('[data-actions]');
+    if (!model.engineAvailable) return;
+    if (downloading) {
+      const cancel = el('button', 'ghost');
+      cancel.type = 'button';
+      cancel.textContent = 'Cancel';
+      cancel.addEventListener('click', () => act('/v1/llm/model/download', 'DELETE', cancel));
+      actions.append(cancel);
+    } else if (ready) {
+      const remove = el('button', 'ghost');
+      remove.type = 'button';
+      remove.textContent = 'Delete download';
+      remove.addEventListener('click', () => {
+        if (!confirm(`Delete the downloaded model (${formatModelSize(total)})? You can download it again later.`)) return;
+        act('/v1/llm/model', 'DELETE', remove);
+      });
+      actions.append(remove);
+    } else {
+      const start = el('button', 'primary');
+      start.type = 'button';
+      start.textContent = errored ? 'Retry download' : `Download model (${formatModelSize(total)})`;
+      start.addEventListener('click', () => act('/v1/llm/model/download', 'POST', start));
+      actions.append(start);
+    }
+  };
+
+  const act = async (path, method, button) => {
+    if (button) button.disabled = true;
+    try {
+      const model = await api(path, { method });
+      render(model);
+      poll();
+    } catch (error) {
+      toast(error.message);
+      if (button) button.disabled = false;
+    }
+  };
+
+  const poll = () => {
+    // Stop polling once the card leaves the DOM (user navigated away).
+    if (!document.body.contains(sec)) return;
+    setTimeout(async () => {
+      if (!document.body.contains(sec)) return;
+      try {
+        const model = await api('/v1/llm/model');
+        render(model);
+        if (model.download?.state === 'downloading') poll();
+      } catch {
+        // Transient error — try again on the next tick.
+        poll();
+      }
+    }, 1000);
+  };
+
+  render(initial);
+  if (initial?.download?.state === 'downloading') poll();
 }
 
 function renderSettingsAccounts(view) {
@@ -3640,3 +3856,4 @@ applyHash();
 loadData().then(render).catch((error) => {
   $('#view').replaceChildren(empty(error.message));
 });
+checkForUpdate();
