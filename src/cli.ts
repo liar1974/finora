@@ -13,6 +13,8 @@ Usage:
   finora ingest <file> --account <account-id> [--format auto|csv|ofx]
   finora transactions [--account <account-id>] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--limit 50]
   finora summary [--account <account-id>] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+  finora memory
+  finora reflect
   finora serve
   finora mcp
 `;
@@ -84,6 +86,14 @@ async function main() {
     if (command === 'summary') {
       const flags = parseFlags([subcommand, ...rest].filter((value): value is string => Boolean(value)));
       print(service.summarize(compact({ accountId: flags.account, from: flags.from, to: flags.to })));
+      return;
+    }
+    if (command === 'memory') {
+      print(service.recallMemory());
+      return;
+    }
+    if (command === 'reflect') {
+      print(await service.runReflection());
       return;
     }
     throw new Error(`Unknown command: ${[command, subcommand].filter(Boolean).join(' ')}`);

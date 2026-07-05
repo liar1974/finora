@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { extname } from 'node:path';
 import {
   Configuration,
@@ -11,6 +11,7 @@ import { Snaptrade } from 'snaptrade-typescript-sdk';
 import { AppError, asAppError } from './errors.js';
 import type {
   AccountCreate,
+  AgentEventInput,
   FinanceRepository,
   ProviderBalanceInput,
   ProviderBrokerageTransactionInput,
@@ -21,12 +22,24 @@ import type {
   TransactionQuery,
 } from './ports.js';
 import {
+  DEFAULT_PROFILE,
+  MEMORY_POLICY,
+  REFLECTION_SYSTEM_PROMPT,
+  applyRemember,
+  extractMarkdown,
+  memoryContext,
+  normalizeProfileMarkdown,
+  profileIsEmpty,
+  sectionFromKind,
+  type MemorySection,
+} from './memory.js';
+import {
   assertIsoDate,
   assertMinorAmount,
   normalizeCurrency,
   requireText,
 } from '../domain/invariants.js';
-import type { Account, AccountBalance, AlertRuleRecord, BrokerageTransaction, CreditReportRecord, ImportRecord, Transaction, TransactionInput } from '../domain/models.js';
+import type { Account, AccountBalance, AlertRuleRecord, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, ImportRecord, Transaction, TransactionInput } from '../domain/models.js';
 import { generateChatReply, LLM_PROVIDERS, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
 import { LocalModelEngine, ModelNotDownloadedError } from '../infrastructure/local-model.js';
 import { TelegramGateway, sendTelegramMessage } from '../infrastructure/telegram-gateway.js';
@@ -34,6 +47,18 @@ import { TelegramGateway, sendTelegramMessage } from '../infrastructure/telegram
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
+}
+
+/**
+ * The most recent daily reset boundary at or before `now` (default 04:00 local).
+ * A chat session that started before this boundary has crossed the daily
+ * rollover and is replaced with a fresh one on the next message.
+ */
+export function dailyResetBoundary(now: Date, hour = 4): Date {
+  const boundary = new Date(now);
+  boundary.setHours(hour, 0, 0, 0);
+  if (boundary.getTime() > now.getTime()) boundary.setDate(boundary.getDate() - 1);
+  return boundary;
 }
 
 export interface ChatContextAttachment {
@@ -123,13 +148,14 @@ interface CreditExtraction {
 
 export class FinanceService {
   private readonly telegramGateway: TelegramGateway;
-  private readonly telegramHistory = new Map<string, ChatMessage[]>();
   private backgroundServicesStarted = false;
   private alertKick: ReturnType<typeof setTimeout> | undefined;
   private alertTimer: ReturnType<typeof setInterval> | undefined;
   private providerSyncKick: ReturnType<typeof setTimeout> | undefined;
   private providerSyncTimer: ReturnType<typeof setInterval> | undefined;
   private providerSyncInFlight: Promise<unknown> | null = null;
+  private reflectionKick: ReturnType<typeof setTimeout> | undefined;
+  private reflectionTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(
     private readonly repository: FinanceRepository,
@@ -950,6 +976,23 @@ export class FinanceService {
       }, 60_000);
       this.providerSyncKick.unref();
     }
+
+    // Reflection ("dreaming"): distill the agent event log into durable memory.
+    // First pass 5 minutes after boot, then once a day. Timers are unref'd so
+    // they never keep the process alive.
+    this.reflectionKick = setTimeout(() => {
+      void this.runReflection().catch((error: unknown) => {
+        console.warn('Finora reflection failed:', error instanceof Error ? error.message : error);
+      });
+      this.reflectionTimer = setInterval(() => {
+        void this.runReflection().catch((error: unknown) => {
+          console.warn('Finora reflection failed:', error instanceof Error ? error.message : error);
+        });
+      }, 24 * 60 * 60 * 1_000);
+      this.reflectionTimer.unref();
+    }, 5 * 60_000);
+    this.reflectionKick.unref();
+
     if (!insightDeliveryEnabled()) return;
 
     this.alertKick = setTimeout(() => {
@@ -1091,9 +1134,112 @@ export class FinanceService {
     return { removed: this.repository.removeAlertMute(id) };
   }
 
+  // --- Agent memory ---------------------------------------------------------
+  // Memory is a single markdown profile with four fixed sections. `recallMemory`
+  // returns the whole document (lazily seeding the default), `remember` rewrites
+  // it with a durable fact, and reflection distills it from the event log.
+
+  recallMemory(): { markdown: string } {
+    const stored = this.repository.getUserProfileMarkdown();
+    if (stored != null) return { markdown: stored };
+    this.repository.saveUserProfileMarkdown(DEFAULT_PROFILE);
+    return { markdown: DEFAULT_PROFILE };
+  }
+
+  remember(input: { value: string; section?: string; kind?: string }): {
+    ok: true;
+    section: MemorySection;
+    saved: string;
+    omittedFinancialNumbers: boolean;
+  } {
+    const value = (input.value ?? '').trim();
+    if (!value) throw new AppError('invalid_input', 'A value to remember is required');
+    const section = sectionFromKind(input.kind, input.section);
+    const current = this.recallMemory().markdown;
+    const result = applyRemember(current, value, section);
+    this.repository.saveUserProfileMarkdown(result.markdown);
+    return { ok: true, section, saved: result.saved, omittedFinancialNumbers: result.omittedFinancialNumbers };
+  }
+
+  forgetMemory(): never {
+    // Faithful to the original MVP: memory is one rewritten document, so there is
+    // no targeted delete. Correct a fact with `remember` or let reflection revise it.
+    throw new AppError(
+      'invalid_input',
+      'Targeted forget is not supported. Memory is a single rewritten document; correct it with remember or let reflection revise it.',
+    );
+  }
+
+  // The asynchronous "dreaming" path: read every agent event since the cursor,
+  // ask the model to rewrite the profile, and advance the cursor. On any failure
+  // the cursor stays put so the same events are retried next run.
+  async runReflection(): Promise<{ status: 'no-events' | 'reflected' | 'skipped'; events?: number }> {
+    const now = new Date().toISOString();
+    const since = this.repository.getReflectionCursor();
+    const events = this.repository.listAgentEventsSince(since, now);
+    if (events.length === 0) {
+      this.repository.setReflectionCursor(now);
+      return { status: 'no-events' };
+    }
+    const current = this.recallMemory().markdown;
+    const transcript = events
+      .map((event) => {
+        const label = [event.eventType, event.role, event.toolName].filter(Boolean).join('/');
+        return `[${label}] ${event.content ?? ''}`;
+      })
+      .join('\n')
+      .slice(0, 12_000);
+    const llm = this.llmConfig();
+    try {
+      const reply = await this.llmReply(llm, {
+        system: REFLECTION_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              'Current profile:',
+              '',
+              current,
+              '',
+              'New interaction log (oldest first):',
+              '',
+              transcript,
+              '',
+              'Return the full rewritten profile as markdown.',
+            ].join('\n'),
+          },
+        ],
+        timeoutMs: 120_000,
+        maxTokens: 1_800,
+      });
+      const next = normalizeProfileMarkdown(extractMarkdown(reply));
+      if (profileIsEmpty(next)) {
+        this.repository.setReflectionCursor(now);
+        return { status: 'skipped', events: events.length };
+      }
+      this.repository.saveUserProfileMarkdown(next);
+      this.repository.setReflectionCursor(now);
+      return { status: 'reflected', events: events.length };
+    } catch (error) {
+      console.warn('Finora reflection failed:', error instanceof Error ? error.message : error);
+      return { status: 'skipped', events: events.length };
+    }
+  }
+
+  private recordAgentEvent(input: AgentEventInput): void {
+    // Audit failures must never break chat, so swallow and log.
+    try {
+      this.repository.appendAgentEvent(input);
+    } catch (error) {
+      console.warn('Finora agent event log failed:', error instanceof Error ? error.message : error);
+    }
+  }
+
   async chat(messages: ChatMessage[], section?: string, contextAttachments: ChatContextAttachment[] = []) {
     const prompt = messages.at(-1)?.content?.trim();
     if (!prompt) throw new AppError('invalid_input', 'A chat message is required');
+    const turnId = randomUUID();
+    this.recordAgentEvent({ turnId, eventType: 'user_message', role: 'user', content: prompt });
     const context = {
       ...this.chatContext(section),
       selectedContext: contextAttachments.map((item) => ({
@@ -1109,6 +1255,7 @@ export class FinanceService {
       })),
     };
     const llm = this.llmConfig();
+    const memory = this.recallMemory().markdown;
     const system = [
       'You are Finora, a local-first personal finance assistant.',
       'Use only the local context provided below. Do not claim to have synced live accounts.',
@@ -1116,6 +1263,10 @@ export class FinanceService {
       'All fields ending in Minor are minor currency units. Divide them by 100 before presenting dollars.',
       'Keep replies concise and use the user language when obvious.',
       'If a requested action is not available, say what local screen or setting to use.',
+      '',
+      MEMORY_POLICY,
+      '',
+      memoryContext(memory),
       '',
       'Local context:',
       JSON.stringify(context, null, 2),
@@ -1127,6 +1278,7 @@ export class FinanceService {
         timeoutMs: 120_000,
         maxTokens: 768,
       });
+      this.recordAgentEvent({ turnId, eventType: 'assistant_message', role: 'assistant', content: reply });
       return { provider: llm.provider, model: llm.chatModel, local: llm.local, reply };
     } catch (error) {
       if (error instanceof ModelNotDownloadedError) {
@@ -1356,6 +1508,10 @@ export class FinanceService {
     if (this.alertTimer) clearInterval(this.alertTimer);
     if (this.providerSyncKick) clearTimeout(this.providerSyncKick);
     if (this.providerSyncTimer) clearInterval(this.providerSyncTimer);
+    // Clear the reflection timers too, otherwise a pending pass can fire after
+    // close() and call runReflection() against an already-closed repository.
+    if (this.reflectionKick) clearTimeout(this.reflectionKick);
+    if (this.reflectionTimer) clearInterval(this.reflectionTimer);
     void this.localModel.unload();
     this.repository.close();
   }
@@ -1366,16 +1522,41 @@ export class FinanceService {
 
   private async replyToTelegram(text: string): Promise<string> {
     const chatId = this.repository.getAppSetting('TELEGRAM_CHAT_ID') || 'owner';
-    if (/^\/help(?:@\w+)?$/i.test(text) || /^\/start(?:@\w+)?$/i.test(text)) {
-      return 'Ask a question about the accounts, transactions, holdings, balances, rules, or insights stored in Finora.';
+    const sessionKey = `telegram:${chatId}`;
+    const command = text.trim().replace(/@\w+$/, '').toLowerCase();
+
+    if (command === '/help' || command === '/start') {
+      return 'Ask a question about the accounts, transactions, holdings, balances, rules, or insights stored in Finora. Send /reset to start a fresh conversation.';
     }
 
-    const history = this.telegramHistory.get(chatId) || [];
-    history.push({ role: 'user', content: text });
-    const result = await this.chat(history.slice(-8), 'telegram');
-    history.push({ role: 'assistant', content: result.reply });
-    this.telegramHistory.set(chatId, history.slice(-16));
+    const now = new Date();
+    if (command === '/reset' || command === '/new' || command === '/clear') {
+      this.repository.saveChatSession(this.freshChatSession(sessionKey, now));
+      return 'Started a fresh conversation. ✨';
+    }
+
+    // Reuse the persisted session so the conversation survives backend restarts.
+    // Start fresh on first contact or once it has crossed the daily 04:00
+    // rollover; length within a session is bounded by that daily boundary (and
+    // future compaction), not a fixed turn cap.
+    let session = this.repository.getChatSession(sessionKey);
+    if (!session || new Date(session.startedAt).getTime() < dailyResetBoundary(now).getTime()) {
+      session = this.freshChatSession(sessionKey, now);
+    }
+
+    const messages: ChatMessage[] = [...session.messages, { role: 'user', content: text }];
+    const result = await this.chat(messages, 'telegram');
+    this.repository.saveChatSession({
+      ...session,
+      lastInteractionAt: now.toISOString(),
+      messages: [...messages, { role: 'assistant', content: result.reply }],
+    });
     return result.reply;
+  }
+
+  private freshChatSession(sessionKey: string, now: Date): ChatSessionRecord {
+    const iso = now.toISOString();
+    return { sessionKey, sessionId: randomUUID(), startedAt: iso, lastInteractionAt: iso, messages: [] };
   }
 
   private selectParser(filename: string, content: Uint8Array, requested?: string): StatementParser {

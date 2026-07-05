@@ -89,6 +89,12 @@ const ruleRemoveSchema = z.object({
   id: z.string().uuid(),
 }).strict();
 
+const memoryRememberSchema = z.object({
+  value: z.string().trim().min(1).max(500),
+  section: z.enum(['Identity', 'Preferences', 'Goals & Background', 'Behavior Patterns']).optional(),
+  kind: z.string().trim().max(40).optional(),
+}).strict();
+
 const insightMuteCreateSchema = z.object({
   kind: z.string().trim().max(120).nullable().optional(),
   accountId: z.string().uuid().nullable().optional(),
@@ -345,6 +351,20 @@ async function route(
   if (url.pathname === '/v1/insight-mutes/remove' && method === 'POST') {
     const input = parseSchema(ruleRemoveSchema, await readJson(request));
     return sendJson(response, 200, service.removeInsightMute(input.id));
+  }
+  if (url.pathname === '/v1/memory' && method === 'GET') {
+    return sendJson(response, 200, service.recallMemory());
+  }
+  if (url.pathname === '/v1/memory' && method === 'POST') {
+    const input = parseSchema(memoryRememberSchema, await readJson(request));
+    return sendJson(response, 201, service.remember({
+      value: input.value,
+      ...(input.section ? { section: input.section } : {}),
+      ...(input.kind ? { kind: input.kind } : {}),
+    }));
+  }
+  if (url.pathname === '/v1/memory/reflect' && method === 'POST') {
+    return sendJson(response, 200, await service.runReflection());
   }
   throw new HttpError(404, 'route_not_found', 'Route not found');
 }

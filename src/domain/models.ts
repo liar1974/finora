@@ -200,3 +200,32 @@ export interface AlertMuteRecord {
   expiresAt: string | null;
   createdAt: string;
 }
+
+// Append-only record of a single step in an agent interaction (a chat turn, a
+// tool call, a tool result). This log is the substrate the reflection job reads
+// to distill durable facts into the user profile.
+export type AgentEventType = 'user_message' | 'assistant_message' | 'tool_call' | 'tool_result';
+
+export interface AgentEventRecord {
+  id: string;
+  turnId: string;
+  eventType: AgentEventType;
+  role: string | null;
+  toolName: string | null;
+  content: string | null;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+// A durable conversation for an inbound chat channel (e.g. a Telegram DM). The
+// key identifies the peer/channel; sessionId is the current conversation
+// instance and rotates whenever the session resets (explicit /reset or the daily
+// rollover). Persisting this lets a conversation survive backend restarts and
+// gives the reset policy a stable startedAt to key off.
+export interface ChatSessionRecord {
+  sessionKey: string;
+  sessionId: string;
+  startedAt: string;
+  lastInteractionAt: string;
+  messages: { role: 'user' | 'assistant'; content: string }[];
+}

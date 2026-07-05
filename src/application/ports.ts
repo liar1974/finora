@@ -1,12 +1,15 @@
 import type {
   Account,
   AccountBalance,
+  AgentEventRecord,
+  AgentEventType,
   AlertMuteRecord,
   AlertRuleRecord,
   AppSettingPreview,
   BrokerageHolding,
   BrokerageSummary,
   BrokerageTransaction,
+  ChatSessionRecord,
   CreditReportRecord,
   DashboardRecord,
   ImportRecord,
@@ -16,6 +19,15 @@ import type {
   Transaction,
   TransactionInput,
 } from '../domain/models.js';
+
+export interface AgentEventInput {
+  turnId: string;
+  eventType: AgentEventType;
+  role?: string | null;
+  toolName?: string | null;
+  content?: string | null;
+  payload?: Record<string, unknown> | undefined;
+}
 
 export interface AccountCreate {
   institution: string;
@@ -151,6 +163,14 @@ export interface FinanceRepository {
   saveProviderBrokerageTransactions(transactions: ProviderBrokerageTransactionInput[]): { inserted: number; skipped: number };
   saveProviderHoldings(holdings: ProviderHoldingInput[]): { inserted: number; skipped: number };
   saveProviderBalances(balances: ProviderBalanceInput[]): { inserted: number; skipped: number };
+  getUserProfileMarkdown(): string | null;
+  saveUserProfileMarkdown(markdown: string): void;
+  appendAgentEvent(input: AgentEventInput): void;
+  listAgentEventsSince(since: string | null, until: string): AgentEventRecord[];
+  getReflectionCursor(): string | null;
+  setReflectionCursor(at: string): void;
+  getChatSession(sessionKey: string): ChatSessionRecord | null;
+  saveChatSession(record: ChatSessionRecord): void;
   close(): void;
 }
 

@@ -27,6 +27,7 @@ describe('MCP server', () => {
     const tools = await client.listTools();
     expect(tools.tools.map((tool) => tool.name)).toEqual([
       'list_accounts', 'list_transactions', 'get_cash_flow_summary',
+      'recall', 'remember', 'forget',
     ]);
     const result = await client.callTool({ name: 'list_accounts', arguments: {} });
     expect(JSON.stringify(result.content)).toContain('Example Bank');

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
+import { dailyResetBoundary } from '../src/application/finance-service.js';
 import { SqliteFinanceRepository } from '../src/infrastructure/sqlite-repository.js';
 
 const tempDirs: string[] = [];
@@ -41,10 +42,10 @@ afterEach(() => {
 });
 
 describe('SqliteFinanceRepository migrations', () => {
-  it('applies the initial migration once on a fresh database', () => {
+  it('applies all migrations once on a fresh database', () => {
     const path = tempDbPath();
     new SqliteFinanceRepository(path);
-    expect(appliedVersions(path)).toEqual([1]);
+    expect(appliedVersions(path)).toEqual([1, 2, 3]);
   });
 
   it('is idempotent and preserves data when the database is reopened', () => {
@@ -54,7 +55,7 @@ describe('SqliteFinanceRepository migrations', () => {
 
     const second = new SqliteFinanceRepository(path);
 
-    expect(appliedVersions(path)).toEqual([1]);
+    expect(appliedVersions(path)).toEqual([1, 2, 3]);
     expect(second.listAccounts().map((account) => account.name)).toContain('Checking');
   });
 
@@ -99,5 +100,78 @@ describe('SqliteFinanceRepository pre-migration backup', () => {
     expect(() => new SqliteFinanceRepository(path)).toThrow(/back up the database/i);
     // The pending migration was never applied, so the data is untouched.
     expect(appliedVersions(path)).not.toContain(1);
+  });
+});
+
+describe('SqliteFinanceRepository chat sessions', () => {
+  it('returns null for an unknown session key', () => {
+    const repo = new SqliteFinanceRepository(tempDbPath());
+    expect(repo.getChatSession('telegram:owner')).toBeNull();
+  });
+
+  it('round-trips a session and persists it across reopen', () => {
+    const path = tempDbPath();
+    const record = {
+      sessionKey: 'telegram:owner',
+      sessionId: 'session-1',
+      startedAt: '2026-07-05T09:00:00.000Z',
+      lastInteractionAt: '2026-07-05T09:05:00.000Z',
+      messages: [
+        { role: 'user' as const, content: 'how much did I spend?' },
+        { role: 'assistant' as const, content: '$123.45' },
+      ],
+    };
+    new SqliteFinanceRepository(path).saveChatSession(record);
+
+    // A new repository instance (as after a backend restart) still sees it.
+    const reopened = new SqliteFinanceRepository(path).getChatSession('telegram:owner');
+    expect(reopened).toEqual(record);
+  });
+
+  it('upserts on the same session key', () => {
+    const path = tempDbPath();
+    const repo = new SqliteFinanceRepository(path);
+    repo.saveChatSession({
+      sessionKey: 'telegram:owner',
+      sessionId: 'old',
+      startedAt: '2026-07-04T09:00:00.000Z',
+      lastInteractionAt: '2026-07-04T09:00:00.000Z',
+      messages: [{ role: 'user', content: 'first' }],
+    });
+    repo.saveChatSession({
+      sessionKey: 'telegram:owner',
+      sessionId: 'new',
+      startedAt: '2026-07-05T09:00:00.000Z',
+      lastInteractionAt: '2026-07-05T09:00:00.000Z',
+      messages: [],
+    });
+    const session = repo.getChatSession('telegram:owner');
+    expect(session?.sessionId).toBe('new');
+    expect(session?.messages).toEqual([]);
+  });
+});
+
+describe('dailyResetBoundary', () => {
+  it('returns today 04:00 when now is after it', () => {
+    const now = new Date('2026-07-05T10:30:00');
+    const boundary = dailyResetBoundary(now);
+    expect(boundary.getDate()).toBe(now.getDate());
+    expect(boundary.getHours()).toBe(4);
+    expect(boundary.getTime()).toBeLessThanOrEqual(now.getTime());
+  });
+
+  it('rolls back to the previous day when now is before 04:00', () => {
+    const now = new Date('2026-07-05T02:00:00');
+    const boundary = dailyResetBoundary(now);
+    expect(boundary.getDate()).toBe(4); // yesterday's 04:00
+    expect(boundary.getHours()).toBe(4);
+    expect(boundary.getTime()).toBeLessThan(now.getTime());
+  });
+
+  it('treats a session started before the boundary as stale, and after as fresh', () => {
+    const now = new Date('2026-07-05T10:00:00');
+    const boundary = dailyResetBoundary(now).getTime();
+    expect(new Date('2026-07-04T22:00:00').getTime() < boundary).toBe(true);
+    expect(new Date('2026-07-05T08:00:00').getTime() < boundary).toBe(false);
   });
 });

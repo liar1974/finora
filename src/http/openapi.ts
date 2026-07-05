@@ -187,6 +187,13 @@ export const openApiDocument = {
     '/v1/insight-mutes/remove': {
       post: { summary: 'Remove an insight mute', responses: { '200': { description: 'Removal result' } } },
     },
+    '/v1/memory': {
+      get: { summary: 'Recall the durable user memory profile', responses: { '200': { description: 'Memory profile markdown' } } },
+      post: { summary: 'Remember a durable fact', responses: { '201': { description: 'Stored fact' }, '422': { description: 'Validation failed' } } },
+    },
+    '/v1/memory/reflect': {
+      post: { summary: 'Distill the agent event log into memory', responses: { '200': { description: 'Reflection result' } } },
+    },
   },
   components: {
     schemas: {

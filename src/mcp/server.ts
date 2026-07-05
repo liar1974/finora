@@ -9,6 +9,7 @@ import { createApplication } from '../composition.js';
 export function createMcpServer(service: FinanceService): McpServer {
   const server = new McpServer({ name: 'finora', version: '0.1.0' });
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false } as const;
+  const writeHint = { readOnlyHint: false, destructiveHint: false, openWorldHint: false } as const;
 
   server.registerTool('list_accounts', {
     title: 'List accounts',
@@ -39,6 +40,39 @@ export function createMcpServer(service: FinanceService): McpServer {
     },
     annotations: readOnly,
   }, async (input) => text(service.summarize(compact(input))));
+
+  server.registerTool('recall', {
+    title: 'Recall user memory',
+    description:
+      'Return the durable user memory profile as markdown. It has four fixed sections: Identity, Preferences, Goals & Background, Behavior Patterns. Never use it as a source of financial numbers.',
+    annotations: readOnly,
+  }, async () => text(service.recallMemory()));
+
+  server.registerTool('remember', {
+    title: 'Remember a durable fact',
+    description:
+      'Store a slow-changing fact about the user when they explicitly state one (identity, a preference or reporting convention, a goal/background, or a behavior pattern). Never store financial numbers, balances, amounts, or anything that could change with the next transaction — that is data, not memory.',
+    inputSchema: {
+      value: z.string().min(1).max(500).describe('The durable fact to remember'),
+      section: z
+        .enum(['Identity', 'Preferences', 'Goals & Background', 'Behavior Patterns'])
+        .optional()
+        .describe('Target section; inferred from kind when omitted'),
+      kind: z.string().max(40).optional().describe('identity | preference | goal | context | behavior'),
+    },
+    annotations: writeHint,
+  }, async (input) => text(service.remember({
+    value: input.value,
+    ...(input.section ? { section: input.section } : {}),
+    ...(input.kind ? { kind: input.kind } : {}),
+  })));
+
+  server.registerTool('forget', {
+    title: 'Forget (unsupported)',
+    description:
+      'Targeted forget is not supported: memory is one rewritten document. Correct a fact with remember instead.',
+    annotations: writeHint,
+  }, async () => text(service.forgetMemory()));
 
   server.registerResource('data-model', 'finora://data-model', {
     title: 'Finora data model',

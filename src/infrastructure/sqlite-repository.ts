@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { AppError } from '../application/errors.js';
 import type {
   AccountCreate,
+  AgentEventInput,
   FinanceRepository,
   ProviderBalanceInput,
   ProviderBrokerageTransactionInput,
@@ -18,6 +19,8 @@ import type {
 import type {
   Account,
   AccountBalance,
+  AgentEventRecord,
+  AgentEventType,
   AlertMuteRecord,
   AlertRuleRecord,
   AppSettingPreview,
@@ -25,6 +28,7 @@ import type {
   BrokerageSummary,
   BrokerageTransaction,
   ChartArtifact,
+  ChatSessionRecord,
   CreditReportRecord,
   DashboardRecord,
   ImportRecord,
@@ -44,6 +48,17 @@ interface AccountRow extends Record<string, unknown> {
   source: string;
   provider_account_id: string | null;
   metadata: string;
+  created_at: string;
+}
+
+interface AgentEventRow extends Record<string, unknown> {
+  id: string;
+  turn_id: string;
+  event_type: string;
+  role: string | null;
+  tool_name: string | null;
+  content: string | null;
+  payload: string;
   created_at: string;
 }
 
@@ -952,6 +967,8 @@ export class SqliteFinanceRepository implements FinanceRepository {
 
     const migrations: { version: number; up: () => void }[] = [
       { version: 1, up: () => this.applyInitialSchema() },
+      { version: 2, up: () => this.applyAgentMemorySchema() },
+      { version: 3, up: () => this.applyChatSessionsSchema() },
     ];
 
     // Before mutating an existing user's data, snapshot it. This only runs when
@@ -1217,6 +1234,184 @@ export class SqliteFinanceRepository implements FinanceRepository {
         ('LLM_MODEL', 'qwen2.5-3b-instruct', datetime('now')),
         ('LLM_CHAT_MODEL', 'qwen2.5-3b-instruct', datetime('now'));
     `);
+  }
+
+  private applyChatSessionsSchema(): void {
+    // Durable conversation state for inbound chat channels (e.g. Telegram DM).
+    // One row per session key; the reset policy rotates session_id and clears
+    // messages while the row (and its started_at) persists across restarts.
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS chat_sessions (
+        session_key TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        last_interaction_at TEXT NOT NULL,
+        messages TEXT NOT NULL DEFAULT '[]'
+      );
+    `);
+  }
+
+  getChatSession(sessionKey: string): ChatSessionRecord | null {
+    const row = this.database
+      .prepare(`
+        SELECT session_key, session_id, started_at, last_interaction_at, messages
+        FROM chat_sessions WHERE session_key = ?
+      `)
+      .get(sessionKey) as
+      | { session_key: string; session_id: string; started_at: string; last_interaction_at: string; messages: string }
+      | undefined;
+    if (!row) return null;
+    const parsed = JSON.parse(row.messages);
+    return {
+      sessionKey: row.session_key,
+      sessionId: row.session_id,
+      startedAt: row.started_at,
+      lastInteractionAt: row.last_interaction_at,
+      messages: Array.isArray(parsed) ? parsed : [],
+    };
+  }
+
+  saveChatSession(record: ChatSessionRecord): void {
+    this.database
+      .prepare(`
+        INSERT INTO chat_sessions(session_key, session_id, started_at, last_interaction_at, messages)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_key) DO UPDATE SET
+          session_id = excluded.session_id,
+          started_at = excluded.started_at,
+          last_interaction_at = excluded.last_interaction_at,
+          messages = excluded.messages
+      `)
+      .run(
+        record.sessionKey,
+        record.sessionId,
+        record.startedAt,
+        record.lastInteractionAt,
+        JSON.stringify(record.messages),
+      );
+  }
+
+  private applyAgentMemorySchema(): void {
+    // Agent memory. The user profile is one rewritten markdown document;
+    // agent_events is an append-only interaction log enforced by triggers
+    // (SQLite's analogue of a Postgres append-only trigger); reflection_state is
+    // the cursor the reflection job advances.
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS user_profiles (
+        id TEXT PRIMARY KEY DEFAULT 'default',
+        markdown TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_events (
+        id TEXT PRIMARY KEY,
+        turn_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        role TEXT,
+        tool_name TEXT,
+        content TEXT,
+        payload TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS agent_events_created_idx ON agent_events(created_at);
+      CREATE INDEX IF NOT EXISTS agent_events_turn_idx ON agent_events(turn_id);
+
+      CREATE TRIGGER IF NOT EXISTS agent_events_no_update
+        BEFORE UPDATE ON agent_events
+        BEGIN SELECT RAISE(ABORT, 'agent_events is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS agent_events_no_delete
+        BEFORE DELETE ON agent_events
+        BEGIN SELECT RAISE(ABORT, 'agent_events is append-only'); END;
+
+      CREATE TABLE IF NOT EXISTS reflection_state (
+        id TEXT PRIMARY KEY DEFAULT 'default',
+        last_reflected_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+  }
+
+  getUserProfileMarkdown(): string | null {
+    const row = this.database
+      .prepare("SELECT markdown FROM user_profiles WHERE id = 'default'")
+      .get() as { markdown: string } | undefined;
+    return row ? row.markdown : null;
+  }
+
+  saveUserProfileMarkdown(markdown: string): void {
+    const now = new Date().toISOString();
+    this.database
+      .prepare(`
+        INSERT INTO user_profiles(id, markdown, created_at, updated_at)
+        VALUES ('default', ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET markdown = excluded.markdown, updated_at = excluded.updated_at
+      `)
+      .run(markdown, now, now);
+  }
+
+  appendAgentEvent(input: AgentEventInput): void {
+    this.database
+      .prepare(`
+        INSERT INTO agent_events(id, turn_id, event_type, role, tool_name, content, payload, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        randomUUID(),
+        input.turnId,
+        input.eventType,
+        input.role ?? null,
+        input.toolName ?? null,
+        input.content ?? null,
+        JSON.stringify(input.payload ?? {}),
+        new Date().toISOString(),
+      );
+  }
+
+  listAgentEventsSince(since: string | null, until: string): AgentEventRecord[] {
+    // rowid is monotonic with insertion, so it breaks created_at ties back into
+    // true chronological order (events within one turn share a millisecond).
+    const rows = (
+      since
+        ? this.database
+            .prepare(
+              'SELECT * FROM agent_events WHERE created_at > ? AND created_at <= ? ORDER BY created_at ASC, rowid ASC',
+            )
+            .all(since, until)
+        : this.database
+            .prepare('SELECT * FROM agent_events WHERE created_at <= ? ORDER BY created_at ASC, rowid ASC')
+            .all(until)
+    ) as AgentEventRow[];
+    return rows.map((row) => ({
+      id: row.id,
+      turnId: row.turn_id,
+      eventType: row.event_type as AgentEventType,
+      role: row.role,
+      toolName: row.tool_name,
+      content: row.content,
+      payload: parseJsonObject(row.payload),
+      createdAt: row.created_at,
+    }));
+  }
+
+  getReflectionCursor(): string | null {
+    const row = this.database
+      .prepare("SELECT last_reflected_at FROM reflection_state WHERE id = 'default'")
+      .get() as { last_reflected_at: string | null } | undefined;
+    return row ? row.last_reflected_at : null;
+  }
+
+  setReflectionCursor(at: string): void {
+    const now = new Date().toISOString();
+    this.database
+      .prepare(`
+        INSERT INTO reflection_state(id, last_reflected_at, created_at, updated_at)
+        VALUES ('default', ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET last_reflected_at = excluded.last_reflected_at, updated_at = excluded.updated_at
+      `)
+      .run(at, now, now);
   }
 
   private saveProviderConnectionInTransaction(input: ProviderConnectionSave, now: string): ProviderConnection {
