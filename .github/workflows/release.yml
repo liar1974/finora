@@ -75,10 +75,10 @@ jobs:
         env:
           # Signs the updater artifacts (.app.tar.gz / -setup.exe / .AppImage) with
           # the minisign key whose public half is embedded in tauri.conf.json. Add
-          # these as repository secrets; without them the .sig files are not produced
-          # and auto-update has nothing to verify against.
+          # it as a repository secret; without it the .sig files are not produced
+          # and auto-update has nothing to verify against. The key was generated
+          # without a password, so no password secret is needed.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Disambiguate macOS updater bundle name
         # Both macOS architectures emit an identically named "Finora.app.tar.gz",

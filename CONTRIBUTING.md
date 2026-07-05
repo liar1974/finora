@@ -128,12 +128,12 @@ The desktop app updates itself via the Tauri updater. Its public key is embedded
 in `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`); the updater endpoint
 is `releases/latest/download/latest.json`. For the workflow to produce signed
 update artifacts and the `latest.json` manifest (via
-`scripts/generate-latest-json.mjs`), add two repository secrets:
+`scripts/generate-latest-json.mjs`), add one repository secret:
 
 - `TAURI_SIGNING_PRIVATE_KEY` — the minisign private key generated with
-  `pnpm exec tauri signer generate`.
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — its password (empty if the key has
-  none).
+  `pnpm exec tauri signer generate`. The current key has no password, so no
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is needed; if you regenerate the key with
+  a password, add that env var back to the release workflow.
 
 This signature is independent of OS code signing, so it works even though the
 installers are unsigned. Without these secrets the release still publishes, but
