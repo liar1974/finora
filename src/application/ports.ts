@@ -18,6 +18,7 @@ import type {
   ProviderConnection,
   QuestionRecord,
   RuleRecord,
+  RuleSpec,
   Transaction,
   TransactionInput,
 } from '../domain/models.js';
@@ -142,6 +143,7 @@ export interface FinanceRepository {
   saveProviderConnection(input: ProviderConnectionSave): ProviderConnection;
   listBrokerageTransactions(query: TransactionQuery): Page<BrokerageTransaction>;
   listBrokerageHoldings(accountId?: string): BrokerageHolding[];
+  runRuleQuery(sql: string, params: Record<string, unknown>): Record<string, unknown>[];
   listAccountBalances(accountId?: string): AccountBalance[];
   summarizeBrokerage(): BrokerageSummary[];
   listDashboards(): DashboardRecord[];
@@ -155,6 +157,8 @@ export interface FinanceRepository {
   saveRule(input: Omit<RuleRecord, 'id' | 'createdAt' | 'updatedAt'>): RuleRecord;
   toggleRule(id: string, enabled: boolean): RuleRecord | null;
   removeRule(id: string): boolean;
+  listRuleSpecs(): RuleSpec[];
+  upsertRuleSpec(spec: RuleSpec): void;
   listFindingMutes(): FindingMuteRecord[];
   saveFindingMute(input: Omit<FindingMuteRecord, 'id' | 'createdAt'>): FindingMuteRecord;
   removeFindingMute(id: string): boolean;

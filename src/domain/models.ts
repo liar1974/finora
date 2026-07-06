@@ -217,6 +217,35 @@ export interface RuleRecord {
   updatedAt: string;
 }
 
+// A user fact a rule depends on; a missing one becomes a ranked question.
+export interface RuleFactNeed {
+  key: string;
+  prompt: string;
+  unlockImpactMinor: number;
+  currency?: string | undefined;
+}
+
+// A rule definition as DATA (see docs/rules-design.md). Built-in specs ship as a
+// seed and download-delivered specs are upserted into the rule_specs table; the
+// engine interprets both uniformly. A spec carries EITHER sql (deterministic) or
+// prompt (LLM). keywords is a regex source string for natural-language inference.
+export interface RuleSpec {
+  kind: string;
+  domain: RuleDomain;
+  executionClass: RuleExecutionClass;
+  actionTier: RuleActionTier;
+  scope: string;
+  cadence: string;
+  alwaysOn: boolean;
+  keywords: string;
+  sql: string | null;
+  prompt: string | null;
+  facts: RuleFactNeed[];
+  enabled: boolean;
+  source: string; // builtin | downloaded | user
+  version: number;
+}
+
 // A single actionable finding, uniform across every evaluator. dollarImpactMinor
 // is signed integer minor units normalized to a twelve-month horizon so findings
 // are comparable; confidence is 0..1; score is the computed ranking value.

@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { AppError } from '../application/errors.js';
 import type {
   AccountCreate,
@@ -37,6 +37,7 @@ import type {
   ProviderConnection,
   QuestionRecord,
   RuleRecord,
+  RuleSpec,
   Transaction,
 } from '../domain/models.js';
 
@@ -94,6 +95,52 @@ const RULES_ENGINE_SCHEMA = `
     created_at TEXT NOT NULL
   );
 `;
+
+// Rule definitions as data. Built-in specs are seeded here on startup; downloaded
+// specs upsert into the same table, so the engine reads all rules from data.
+const RULE_SPECS_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS rule_specs (
+    kind TEXT PRIMARY KEY,
+    domain TEXT NOT NULL DEFAULT 'cash-flow',
+    execution_class TEXT NOT NULL DEFAULT 'D',
+    action_tier TEXT NOT NULL DEFAULT 'observer',
+    scope TEXT NOT NULL DEFAULT 'banking',
+    cadence TEXT NOT NULL DEFAULT 'event',
+    always_on INTEGER NOT NULL DEFAULT 0 CHECK (always_on IN (0, 1)),
+    keywords TEXT NOT NULL DEFAULT '',
+    sql TEXT,
+    prompt TEXT,
+    facts TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    version INTEGER NOT NULL DEFAULT 1,
+    source TEXT NOT NULL DEFAULT 'builtin',
+    updated_at TEXT NOT NULL
+  );
+`;
+
+// Backing implementations for the SQL rule primitives. Kept in the infrastructure
+// layer alongside the connection they are registered on.
+const FEE_TOKEN_PATTERN = /\b(fee|fees|overdraft|nsf|service charge|atm|late charge|late fee|interest charge|finance charge|maintenance fee|surcharge|annual fee)\b/i;
+
+function moneyValue(minor: unknown, currency: unknown): string {
+  const amount = Number(minor ?? 0) / 100;
+  const code = String(currency || 'USD');
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: code }).format(amount);
+  } catch {
+    return `${code} ${amount.toFixed(2)}`;
+  }
+}
+
+function normalizeMerchantValue(description: unknown): string {
+  return String(description ?? '')
+    .toLowerCase()
+    .replace(/[0-9]+/g, ' ')
+    .replace(/[^a-z一-鿿 ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 24);
+}
 
 interface AccountRow extends Record<string, unknown> {
   id: string;
@@ -268,6 +315,23 @@ interface FindingMuteRow extends Record<string, unknown> {
   created_at: string;
 }
 
+interface RuleSpecRow extends Record<string, unknown> {
+  kind: string;
+  domain: string;
+  execution_class: string;
+  action_tier: string;
+  scope: string;
+  cadence: string;
+  always_on: number;
+  keywords: string;
+  sql: string | null;
+  prompt: string | null;
+  facts: string;
+  enabled: number;
+  version: number;
+  source: string;
+}
+
 interface FactRow extends Record<string, unknown> {
   key: string;
   value: string;
@@ -308,7 +372,51 @@ export class SqliteFinanceRepository implements FinanceRepository {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.database = new DatabaseSync(path);
     this.database.exec('PRAGMA journal_mode = WAL;');
+    this.registerRuleFunctions();
     this.migrate(path);
+  }
+
+  // SQL scalar/aggregate primitives used by data-driven rule specs (see
+  // docs/rules-design.md). Registered before migrate so shipped views may use them.
+  private registerRuleFunctions(): void {
+    // Varargs so money(minor) and money(minor, currency) both work.
+    this.database.function('money', { varargs: true }, (...args: unknown[]) => moneyValue(args[0], args[1]));
+    this.database.function('normalize_merchant', { deterministic: true }, (description: unknown) => normalizeMerchantValue(description));
+    // Word-boundary fee/interest match (SQLite has no REGEXP; LIKE '%fee%' would
+    // match "coffee"). Returns 1/0.
+    this.database.function('fee_like', { deterministic: true }, (description: unknown) => (FEE_TOKEN_PATTERN.test(String(description ?? '')) ? 1 : 0));
+    // Accumulator is a JSON string so the type stays a SQL value; node:sqlite's
+    // types disallow a raw array accumulator.
+    this.database.aggregate('median', {
+      start: () => '[]',
+      step: (acc: string, value: unknown) => {
+        const values = JSON.parse(acc) as number[];
+        if (value !== null && value !== undefined) values.push(Number(value));
+        return JSON.stringify(values);
+      },
+      result: (acc: string) => {
+        const values = JSON.parse(acc) as number[];
+        if (values.length === 0) return 0;
+        const sorted = values.sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        return sorted.length % 2 ? sorted[mid]! : Math.round((sorted[mid - 1]! + sorted[mid]!) / 2);
+      },
+    });
+  }
+
+  // Execute a rule spec's read-only query. Only SELECT/WITH is allowed, and only
+  // the named params the query actually references are bound (node:sqlite rejects
+  // unknown params), so callers can pass a shared superset.
+  runRuleQuery(sql: string, params: Record<string, unknown>): Record<string, unknown>[] {
+    if (!/^\s*(select|with)\b/i.test(sql)) {
+      throw new Error('rule query must be a read-only SELECT or WITH');
+    }
+    const referenced = new Set((sql.match(/:[a-z_][a-z0-9_]*/gi) ?? []).map((token) => token.slice(1)));
+    const bound: Record<string, SQLInputValue> = {};
+    for (const key of referenced) {
+      if (key in params) bound[key] = params[key] as SQLInputValue;
+    }
+    return this.database.prepare(sql).all(bound) as unknown as Record<string, unknown>[];
   }
 
   createAccount(input: AccountCreate): Account {
@@ -560,6 +668,7 @@ export class SqliteFinanceRepository implements FinanceRepository {
     return rows.map(mapBrokerageHolding);
   }
 
+
   listAccountBalances(accountId?: string): AccountBalance[] {
     const clauses: string[] = [];
     const values: string[] = [];
@@ -751,6 +860,29 @@ export class SqliteFinanceRepository implements FinanceRepository {
   removeRule(id: string): boolean {
     const result = this.database.prepare('DELETE FROM rules WHERE id = ?').run(id);
     return result.changes > 0;
+  }
+
+  listRuleSpecs(): RuleSpec[] {
+    const rows = this.database.prepare(`
+      SELECT kind, domain, execution_class, action_tier, scope, cadence, always_on, keywords, sql, prompt, facts, enabled, version, source
+      FROM rule_specs
+      ORDER BY rowid
+    `).all() as RuleSpecRow[];
+    return rows.map(mapRuleSpec);
+  }
+
+  upsertRuleSpec(spec: RuleSpec): void {
+    this.database.prepare(`
+      INSERT INTO rule_specs (kind, domain, execution_class, action_tier, scope, cadence, always_on, keywords, sql, prompt, facts, enabled, version, source, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(kind) DO UPDATE SET
+        domain = excluded.domain, execution_class = excluded.execution_class, action_tier = excluded.action_tier,
+        scope = excluded.scope, cadence = excluded.cadence, always_on = excluded.always_on, keywords = excluded.keywords,
+        sql = excluded.sql, prompt = excluded.prompt, facts = excluded.facts, enabled = excluded.enabled,
+        version = excluded.version, source = excluded.source, updated_at = excluded.updated_at
+    `).run(spec.kind, spec.domain, spec.executionClass, spec.actionTier, spec.scope, spec.cadence, spec.alwaysOn ? 1 : 0,
+      spec.keywords, spec.sql, spec.prompt, JSON.stringify(spec.facts), spec.enabled ? 1 : 0, spec.version, spec.source,
+      new Date().toISOString());
   }
 
   listFindingMutes(): FindingMuteRecord[] {
@@ -1136,6 +1268,8 @@ export class SqliteFinanceRepository implements FinanceRepository {
       { version: 3, up: () => this.applyChatSessionsSchema() },
       { version: 4, up: () => this.applyRulesEngineReset() },
       { version: 5, up: () => this.addRuleScheduledDay() },
+      { version: 6, up: () => this.applyRecurringSeriesView() },
+      { version: 7, up: () => this.database.exec(RULE_SPECS_SCHEMA) },
     ];
 
     // Before mutating an existing user's data, snapshot it. This only runs when
@@ -1395,6 +1529,43 @@ export class SqliteFinanceRepository implements FinanceRepository {
   // Migration v5 adds the schedule day column for weekly/monthly rules. Guarded
   // because fresh installs already get the column from the v1/v4 baseline, so the
   // ALTER only runs on databases that applied v4 before the column existed.
+  // Shared recurring-charge primitive used by subscription/bill rule specs, so a
+  // downloaded rule can just SELECT FROM recurring_series. Groups the last ~400
+  // days of transactions by normalized merchant and direction, and derives count,
+  // span, latest/typical amount, and cadence. Uses the normalize_merchant and
+  // median UDFs registered on the connection.
+  private applyRecurringSeriesView(): void {
+    this.database.exec(`
+      CREATE VIEW IF NOT EXISTS recurring_series AS
+      WITH base AS (
+        SELECT account_id, id, date, description,
+          CASE WHEN amount_minor < 0 THEN 'out' ELSE 'in' END AS direction,
+          ABS(amount_minor) AS amt, currency,
+          normalize_merchant(description) AS merchant
+        FROM transactions
+        WHERE normalize_merchant(description) <> '' AND julianday('now') - julianday(date) <= 400
+      ), ranked AS (
+        SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id, merchant, direction ORDER BY date DESC, id DESC) AS rn_desc
+        FROM base b
+      )
+      SELECT
+        account_id, merchant, direction,
+        MIN(currency) AS currency,
+        COUNT(*) AS count,
+        (julianday(MAX(date)) - julianday(MIN(date))) AS span_days,
+        MAX(CASE WHEN rn_desc = 1 THEN amt END) AS latest_minor,
+        MAX(CASE WHEN rn_desc = 1 THEN description END) AS label,
+        MAX(CASE WHEN rn_desc = 1 THEN id END) AS latest_id,
+        median(CASE WHEN rn_desc > 1 THEN amt END) AS typical_minor,
+        MIN(date) AS first_date,
+        MAX(date) AS last_date,
+        MAX(1.0, MIN(52.0, 365.0 / ((julianday(MAX(date)) - julianday(MIN(date))) / (COUNT(*) - 1)))) AS periods_per_year,
+        group_concat(id) AS record_ids
+      FROM ranked
+      GROUP BY account_id, merchant, direction;
+    `);
+  }
+
   private addRuleScheduledDay(): void {
     const columns = this.database.prepare('PRAGMA table_info(rules)').all() as { name: string }[];
     if (!columns.some((column) => column.name === 'scheduled_day')) {
@@ -1850,6 +2021,30 @@ function mapRule(row: RuleRow): RuleRecord {
     enabled: row.enabled === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function mapRuleSpec(row: RuleSpecRow): RuleSpec {
+  let facts: RuleSpec['facts'] = [];
+  try {
+    const parsed: unknown = JSON.parse(row.facts);
+    if (Array.isArray(parsed)) facts = parsed as RuleSpec['facts'];
+  } catch { facts = []; }
+  return {
+    kind: row.kind,
+    domain: row.domain as RuleSpec['domain'],
+    executionClass: row.execution_class as RuleSpec['executionClass'],
+    actionTier: row.action_tier as RuleSpec['actionTier'],
+    scope: row.scope,
+    cadence: row.cadence,
+    alwaysOn: row.always_on === 1,
+    keywords: row.keywords,
+    sql: row.sql,
+    prompt: row.prompt,
+    facts,
+    enabled: row.enabled === 1,
+    version: Number(row.version),
+    source: row.source,
   };
 }
 

@@ -40,7 +40,7 @@ import {
   requireText,
 } from '../domain/invariants.js';
 import type { Account, AccountBalance, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, Finding, ImportRecord, QuestionRecord, RuleRecord, Transaction, TransactionInput } from '../domain/models.js';
-import { evaluateRules, executionStrategy, inferRule } from './rules-engine.js';
+import { builtinRuleSpecs, evaluateRules, executionStrategy, inferRule } from './rules-engine.js';
 import type { EvaluationData, QuestionDraft } from './rules-engine.js';
 import { generateChatReply, LLM_PROVIDERS, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
 import { LocalModelEngine, ModelNotDownloadedError } from '../infrastructure/local-model.js';
@@ -159,6 +159,9 @@ export class FinanceService {
       },
       onMessage: (text) => this.replyToTelegram(text),
     });
+    // Seed built-in rule specs (data) into the table. Idempotent; downloaded and
+    // user specs (other kinds) are untouched, so new rules stay pure data.
+    for (const spec of builtinRuleSpecs()) this.repository.upsertRuleSpec(spec);
   }
 
   createAccount(input: AccountCreate) {
@@ -1052,9 +1055,10 @@ export class FinanceService {
     return this.repository.listRules();
   }
 
+
   async previewRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
-    const heuristic = inferRule(text, input.scope, input.cadence);
+    const heuristic = inferRule(this.repository.listRuleSpecs(), text, input.scope, input.cadence);
     const refined = await this.inferRuleWithModel(text, heuristic);
     const inferred = { ...heuristic, scope: refined.scope, cadence: refined.cadence };
     const scheduledHour = input.scheduledHour ?? suggestedRuleHour(inferred.cadence);
@@ -1071,7 +1075,7 @@ export class FinanceService {
 
   createRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
-    const inferred = inferRule(text, input.scope, input.cadence);
+    const inferred = inferRule(this.repository.listRuleSpecs(), text, input.scope, input.cadence);
     return this.repository.saveRule({
       kind: inferred.kind,
       domain: inferred.domain,
@@ -1836,7 +1840,7 @@ export class FinanceService {
   // findings already ranked by score. The engine is the only place rule logic
   // lives; see docs/rules-design.md.
   private activeFindings(): Finding[] {
-    const { findings } = evaluateRules(this.repository.listRules(), this.buildEvaluationData());
+    const { findings } = evaluateRules(this.repository.listRuleSpecs(), this.repository.listRules(), this.buildEvaluationData(), (sql, params) => this.repository.runRuleQuery(sql, params));
     const now = Date.now();
     const mutes = this.repository.listFindingMutes().filter((mute) => {
       if (!mute.expiresAt) return true;
@@ -1851,12 +1855,6 @@ export class FinanceService {
 
   private buildEvaluationData(): EvaluationData {
     return {
-      accounts: this.repository.listAccounts(),
-      balances: latestByAccount(this.repository.listAccountBalances()),
-      transactions: this.repository.listTransactions({ limit: 200 }).items,
-      brokerageTransactions: this.repository.listBrokerageTransactions({ limit: 100 }).items,
-      holdings: this.repository.listBrokerageHoldings(),
-      connections: this.repository.listProviderConnections(),
       facts: new Map(this.repository.listFacts().map((fact) => [fact.key, fact])),
       nowMs: Date.now(),
     };
@@ -1866,7 +1864,7 @@ export class FinanceService {
   // keyed by fact so re-evaluation refreshes impact in place. A pending question
   // whose fact is now known is marked answered.
   private refreshQuestions(): QuestionDraft[] {
-    const { questions } = evaluateRules(this.repository.listRules(), this.buildEvaluationData());
+    const { questions } = evaluateRules(this.repository.listRuleSpecs(), this.repository.listRules(), this.buildEvaluationData(), (sql, params) => this.repository.runRuleQuery(sql, params));
     const openKeys = new Set(questions.map((question) => question.factKey));
     for (const question of questions) {
       this.repository.upsertQuestion({

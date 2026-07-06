@@ -324,6 +324,46 @@ describe('FinanceService', () => {
     service.close();
   });
 
+  it('flags the same subscription billed across two accounts', () => {
+    const service = application();
+    const monthly = (name: string) =>
+      `Date,Description,Amount\n2026-03-08,${name},-11.99\n2026-04-08,${name},-11.99\n2026-05-08,${name},-11.99\n2026-06-08,${name},-11.99\n`;
+    for (const card of ['Card A', 'Card B']) {
+      const account = service.createAccount({ institution: 'Example Bank', name: card, type: 'credit', currency: 'USD' });
+      service.importStatement({ accountId: account.id, filename: `${card}.csv`, content: Buffer.from(monthly('SPOTIFY')) });
+    }
+    const finding = service.listFindings().find((f) => f.kind === 'cross-card-subscription');
+    expect(finding?.title).toContain('SPOTIFY');
+    expect(finding && finding.dollarImpactMinor > 0).toBe(true);
+    service.close();
+  });
+
+  it('flags a material month-over-month net-worth drop', () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
+    service.createRule({ text: 'net worth movement', scope: 'all', cadence: 'monthly' });
+    const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    repository.saveProviderBalances([
+      { accountId: account.id, asOfDate: '2026-06-01', currentMinor: 1_000_000, currency: 'USD', fingerprint: 'b:jun' },
+      { accountId: account.id, asOfDate: '2026-07-04', currentMinor: 850_000, currency: 'USD', fingerprint: 'b:jul' },
+    ]);
+    const finding = service.listFindings().find((f) => f.kind === 'net-worth-movement');
+    expect(finding?.title).toContain('Net worth dropped');
+    expect(finding?.severity).toBe('medium');
+    service.close();
+  });
+
+  it('seeds built-in rule specs as data so the engine is table-driven', () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
+    const specs = repository.listRuleSpecs();
+    expect(specs.length).toBeGreaterThanOrEqual(20);
+    // Every rule is a data spec carrying its own query — no per-rule code.
+    expect(specs.every((spec) => Boolean(spec.sql) || Boolean(spec.prompt))).toBe(true);
+    expect(specs.find((spec) => spec.kind === 'credit-utilization')?.sql).toContain('utilization is elevated');
+    service.close();
+  });
+
   it('imports, deduplicates, lists, paginates, and summarizes transactions', async () => {
     const service = application();
     const account = service.createAccount({

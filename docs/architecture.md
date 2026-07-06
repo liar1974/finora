@@ -214,9 +214,10 @@ available.
 
 Rules are read-only at the trigger boundary, deterministic where correctness
 allows, explainable, and quiet unless there is something worth acting on. The
-full design — the rule-metadata-plus-evaluator-registry model, the `D` / `L` /
-`L+` execution classes, the facts-and-questions layer, the finding contract with
-dollar impact and confidence, the ranking function, and the action trust ladder —
+full design — rules as data (SQL specs in the `rule_specs` table, seeded on
+startup and interpreted uniformly), the `D` / `L` / `L+` execution classes, the
+facts-and-questions layer, the finding contract with dollar impact and
+confidence, the ranking function, and the action trust ladder —
 lives in
 [`rules-design.md`](./rules-design.md).
 

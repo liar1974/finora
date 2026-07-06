@@ -11,19 +11,14 @@
 // findings are comparable across rules.
 
 import type {
-  Account,
-  AccountBalance,
-  BrokerageHolding,
-  BrokerageTransaction,
   FactRecord,
   Finding,
   FindingEvidence,
-  ProviderConnection,
   RuleActionTier,
   RuleDomain,
   RuleExecutionClass,
   RuleRecord,
-  Transaction,
+  RuleSpec,
 } from '../domain/models.js';
 
 // ── Reference data ───────────────────────────────────────────────────────────
@@ -67,13 +62,9 @@ function capTier(tier: RuleActionTier, confidence: number): RuleActionTier {
 
 // ── Evaluator contract ───────────────────────────────────────────────────────
 
+// SQL specs read account data straight from the DB via runQuery, so the engine
+// itself only needs the facts (to gate fact-dependent rules) and the clock.
 export interface EvaluationData {
-  accounts: Account[];
-  balances: AccountBalance[]; // latest per account
-  transactions: Transaction[];
-  brokerageTransactions: BrokerageTransaction[];
-  holdings: BrokerageHolding[];
-  connections: ProviderConnection[];
   facts: Map<string, FactRecord>;
   nowMs: number;
 }
@@ -102,9 +93,12 @@ interface FactNeed {
   prompt: string;
   unlockImpactMinor: number; // estimated dollars the answer would unlock, for ranking questions
   currency?: string;
-  suggest?: (data: EvaluationData) => string | null; // derive-then-confirm
 }
 
+// The built-in rule definitions, authored in code and seeded into rule_specs as
+// data (see docs/rules-design.md). keywords is a RegExp for readability; it is
+// stored as a source string. Every rule carries a SQL query that selects the
+// finding-draft columns.
 interface Evaluator {
   kind: string;
   domain: RuleDomain;
@@ -114,7 +108,33 @@ interface Evaluator {
   keywords: RegExp; // for natural-language rule inference
   alwaysOn?: boolean; // runs even with no stored rule of this kind
   facts?: FactNeed[];
-  run(rule: RuleRecord, data: EvaluationData): Draft[];
+  sql: string;
+}
+
+// Runs a rule spec's read-only query with the bound param superset. Supplied by
+// the caller (the repository), keeping SQLite behind the port.
+export type RuleQueryRunner = (sql: string, params: Record<string, unknown>) => Record<string, unknown>[];
+
+// Map a SQL result row (snake_case finding columns) to a Draft.
+function rowToDraft(row: Record<string, unknown>): Draft {
+  const records = row.evidence_records ? String(row.evidence_records).split(',').filter(Boolean) : [];
+  const draft: Draft = {
+    key: String(row.key),
+    title: String(row.title),
+    detail: String(row.detail),
+    value: String(row.value),
+    confidence: Number(row.confidence),
+    evidence: { summary: String(row.evidence_summary ?? ''), records },
+    createdAt: String(row.created_at),
+  };
+  if (row.dollar_impact_minor != null) draft.dollarImpactMinor = Number(row.dollar_impact_minor);
+  if (row.currency != null) draft.currency = String(row.currency);
+  if (row.urgency != null) draft.urgency = Number(row.urgency);
+  if (row.effort != null) draft.effort = Number(row.effort);
+  if (row.severity != null) draft.severity = String(row.severity) as 'high' | 'medium' | 'low';
+  if (row.action_label != null) draft.actionLabel = String(row.action_label);
+  if (row.account_id != null) draft.accountId = String(row.account_id);
+  return draft;
 }
 
 export interface QuestionDraft {
@@ -133,120 +153,16 @@ export interface EngineResult {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function money(amountMinor: number, currency = 'USD'): string {
-  try {
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency: currency || 'USD' }).format(amountMinor / 100);
-  } catch {
-    return `${currency || 'USD'} ${(amountMinor / 100).toFixed(2)}`;
-  }
-}
 
-function isCreditAccount(account: Account | undefined): boolean {
-  if (!account) return false;
-  return account.domain === 'credit' || /credit|card/i.test(`${account.type || ''} ${account.name || ''}`);
-}
 
-function annualNumber(value: string | undefined): number | null {
-  if (value == null) return null;
-  const n = Number(String(value).replace(/[^0-9.\-]/g, ''));
-  return Number.isFinite(n) ? n : null;
-}
 
-// A percentage fact may be entered as "6" or "0.06"; normalize to a fraction.
-function pctFraction(value: string | undefined): number | null {
-  const n = annualNumber(value);
-  if (n == null) return null;
-  return n > 1 ? n / 100 : n;
-}
 
-function median(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  if (sorted.length === 0) return 0;
-  return sorted.length % 2 ? sorted[mid]! : Math.round((sorted[mid - 1]! + sorted[mid]!) / 2);
-}
 
-// Collapse a merchant description to a stable grouping key: lowercase, drop
-// digits and punctuation so "NETFLIX 8842" and "Netflix#1190" group together.
-function normalizeMerchant(description: string): string {
-  return description
-    .toLowerCase()
-    .replace(/[0-9]+/g, ' ')
-    .replace(/[^a-z一-鿿 ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 24);
-}
 
-interface RecurringSeries {
-  merchant: string;
-  label: string; // original latest description, for display
-  accountId: string;
-  currency: string;
-  typicalMinor: number; // median of prior charges, for increase comparison
-  latestMinor: number;
-  count: number;
-  periodsPerYear: number;
-  recordIds: string[];
-  firstDate: string;
-  lastDate: string;
-}
 
-// Deterministic recurring-charge detection over the outflow stream: group by
-// normalized merchant, keep series of >= minCount charges spanning >= minSpanDays,
-// and estimate cadence from the average gap. No user input; feeds subscription and
-// new-charge rules. Established subscriptions use the strict defaults; newly
-// started ones are found with a relaxed minimum.
-function detectRecurring(transactions: Transaction[], nowMs: number, opts: { minCount?: number; minSpanDays?: number } = {}): RecurringSeries[] {
-  const minCount = opts.minCount ?? 3;
-  const minSpanDays = opts.minSpanDays ?? 60;
-  const horizon = nowMs - 400 * 86_400_000;
-  const groups = new Map<string, Transaction[]>();
-  for (const txn of transactions) {
-    if (txn.amountMinor >= 0) continue;
-    const time = new Date(txn.date).getTime();
-    const key = normalizeMerchant(txn.description);
-    if (!key || !Number.isFinite(time) || time < horizon) continue;
-    const groupKey = `${txn.accountId}:${key}`;
-    const bucket = groups.get(groupKey);
-    if (bucket) bucket.push(txn);
-    else groups.set(groupKey, [txn]);
-  }
-  const series: RecurringSeries[] = [];
-  for (const bucket of groups.values()) {
-    if (bucket.length < minCount) continue;
-    const sorted = bucket.slice().sort((a, b) => (a.date < b.date ? -1 : 1));
-    const spanDays = (new Date(sorted[sorted.length - 1]!.date).getTime() - new Date(sorted[0]!.date).getTime()) / 86_400_000;
-    if (spanDays < minSpanDays) continue;
-    const amounts = sorted.map((t) => Math.abs(t.amountMinor));
-    const latest = sorted[sorted.length - 1]!;
-    series.push({
-      merchant: normalizeMerchant(latest.description),
-      label: latest.description,
-      accountId: latest.accountId,
-      currency: latest.currency,
-      typicalMinor: median(amounts.slice(0, -1)),
-      latestMinor: Math.abs(latest.amountMinor),
-      count: sorted.length,
-      periodsPerYear: Math.max(1, Math.min(52, 365 / (spanDays / (sorted.length - 1)))),
-      recordIds: sorted.slice(-4).map((t) => t.id),
-      firstDate: sorted[0]!.date,
-      lastDate: latest.date,
-    });
-  }
-  return series;
-}
 
-// Plaid personal-finance categories that are not discretionary spending, excluded
-// from the category-spike and runway rules.
-const NON_DISCRETIONARY_CATEGORY = /transfer|income|loan_payments|rent_and_utilities|bank_fees/i;
 
-function prettyCategory(category: string): string {
-  const text = category.replace(/_/g, ' ').toLowerCase().trim();
-  return text ? text.charAt(0).toUpperCase() + text.slice(1) : 'Spending';
-}
 
-const FEE_PATTERN = /\b(fee|fees|overdraft|nsf|service charge|atm|late charge|late fee|interest charge|finance charge|maintenance fee|surcharge|annual fee)\b/i;
 
 // ── Evaluators ───────────────────────────────────────────────────────────────
 
@@ -257,35 +173,37 @@ const idleCash: Evaluator = {
   defaultTier: 'advisor',
   scope: 'banking',
   keywords: /idle|cash|savings|high[- ]?yield|hysa|现金|闲置/,
-  run(rule, data) {
-    const spread = REFERENCE_TABLES.highYieldSavingsApr - REFERENCE_TABLES.checkingApr;
-    return data.balances
-      .filter((balance) => {
-        const account = data.accounts.find((a) => a.id === balance.accountId);
-        if (!account || account.domain === 'brokerage') return false;
-        const cash = balance.availableMinor ?? balance.currentMinor;
-        return balance.currentMinor > 0 && cash !== null && cash / balance.currentMinor >= 0.3;
-      })
-      .map((balance) => {
-        const account = data.accounts.find((a) => a.id === balance.accountId);
-        const cash = balance.availableMinor ?? balance.currentMinor;
-        const impact = Math.round(cash * spread); // one year of forgone yield
-        return {
-          key: balance.accountId,
-          title: `${account?.name || 'Account'} has idle cash`,
-          detail: `${money(cash, balance.currency)} sitting at roughly ${(REFERENCE_TABLES.checkingApr * 100).toFixed(2)}% could earn about ${money(impact, balance.currency)}/yr at ${(REFERENCE_TABLES.highYieldSavingsApr * 100).toFixed(1)}%.`,
-          value: money(impact, balance.currency),
-          dollarImpactMinor: impact,
-          currency: balance.currency,
-          confidence: 0.8,
-          effort: 3,
-          evidence: { summary: `Available cash ${money(cash, balance.currency)} priced against the ${REFERENCE_TABLES.version} savings benchmark.`, records: [balance.accountId] },
-          actionLabel: 'Move to a high-yield savings account',
-          accountId: balance.accountId,
-          createdAt: balance.createdAt,
-        } satisfies Draft;
-      });
-  },
+  sql: `
+    WITH latest AS (
+      SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn FROM account_balances b
+    ), c AS (
+      SELECT lb.account_id, lb.currency, lb.current_minor, lb.created_at,
+             COALESCE(lb.available_minor, lb.current_minor) AS cash,
+             CAST(ROUND(COALESCE(lb.available_minor, lb.current_minor) * (:hysa_apr - :checking_apr)) AS INT) AS impact,
+             a.name AS account_name
+      FROM latest lb JOIN accounts a ON a.id = lb.account_id
+      WHERE lb.rn = 1 AND a.domain <> 'brokerage' AND a.domain <> 'credit'
+        AND lower(a.type || ' ' || a.name) NOT LIKE '%credit%'
+        AND lower(a.type || ' ' || a.name) NOT LIKE '%card%'
+        AND lb.current_minor > 0
+        AND 1.0 * COALESCE(lb.available_minor, lb.current_minor) / lb.current_minor >= 0.3
+    )
+    SELECT
+      account_id AS key,
+      account_name || ' has idle cash' AS title,
+      money(cash, currency) || ' sitting at roughly ' || printf('%.2f', :checking_apr * 100) || '% could earn about ' || money(impact, currency) || '/yr at ' || printf('%.1f', :hysa_apr * 100) || '%.' AS detail,
+      money(impact, currency) AS value,
+      impact AS dollar_impact_minor,
+      currency AS currency,
+      0.8 AS confidence,
+      3 AS effort,
+      'Available cash ' || money(cash, currency) || ' priced against the savings benchmark.' AS evidence_summary,
+      account_id AS evidence_records,
+      'Move to a high-yield savings account' AS action_label,
+      account_id AS account_id,
+      created_at AS created_at
+    FROM c
+  `,
 };
 
 const idleBrokerageCash: Evaluator = {
@@ -296,33 +214,28 @@ const idleBrokerageCash: Evaluator = {
   scope: 'brokerage',
   keywords: /cash drag|brokerage cash|sweep|uninvested|现金拖累/,
   alwaysOn: true,
-  run(rule, data) {
-    const apr = REFERENCE_TABLES.highYieldSavingsApr;
-    return data.balances
-      .filter((balance) => {
-        const account = data.accounts.find((a) => a.id === balance.accountId);
-        return account?.domain === 'brokerage' && balance.currentMinor > 0 && balance.cashMinor !== null && balance.cashMinor / balance.currentMinor >= 0.3;
-      })
-      .map((balance) => {
-        const account = data.accounts.find((a) => a.id === balance.accountId);
-        const cash = balance.cashMinor ?? 0;
-        const impact = Math.round(cash * apr);
-        return {
-          key: balance.accountId,
-          title: `${account?.name || 'Brokerage'} cash drag`,
-          detail: `${money(cash, balance.currency)} uninvested of ${money(balance.currentMinor, balance.currency)}; about ${money(impact, balance.currency)}/yr in a swept money-market rate.`,
-          value: `${Math.round((cash / balance.currentMinor) * 100)}%`,
-          dollarImpactMinor: impact,
-          currency: balance.currency,
-          confidence: 0.7,
-          effort: 2,
-          evidence: { summary: `Uninvested cash ${money(cash, balance.currency)} of ${money(balance.currentMinor, balance.currency)}.`, records: [balance.accountId] },
-          actionLabel: 'Invest or sweep the idle cash',
-          accountId: balance.accountId,
-          createdAt: balance.createdAt,
-        } satisfies Draft;
-      });
-  },
+  sql: `
+    WITH latest AS (
+      SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn FROM account_balances b
+    )
+    SELECT
+      lb.account_id AS key,
+      a.name || ' cash drag' AS title,
+      money(lb.cash_minor, lb.currency) || ' uninvested of ' || money(lb.current_minor, lb.currency) || '; about ' || money(CAST(ROUND(lb.cash_minor * :hysa_apr) AS INT), lb.currency) || '/yr in a swept money-market rate.' AS detail,
+      CAST(ROUND(100.0 * lb.cash_minor / lb.current_minor) AS INT) || '%' AS value,
+      CAST(ROUND(lb.cash_minor * :hysa_apr) AS INT) AS dollar_impact_minor,
+      lb.currency AS currency,
+      0.7 AS confidence,
+      2 AS effort,
+      'Uninvested cash ' || money(lb.cash_minor, lb.currency) || ' of ' || money(lb.current_minor, lb.currency) || '.' AS evidence_summary,
+      lb.account_id AS evidence_records,
+      'Invest or sweep the idle cash' AS action_label,
+      lb.account_id AS account_id,
+      lb.created_at AS created_at
+    FROM latest lb JOIN accounts a ON a.id = lb.account_id
+    WHERE lb.rn = 1 AND a.domain = 'brokerage' AND lb.current_minor > 0
+      AND lb.cash_minor IS NOT NULL AND 1.0 * lb.cash_minor / lb.current_minor >= 0.3
+  `,
 };
 
 const largeTransaction: Evaluator = {
@@ -332,28 +245,25 @@ const largeTransaction: Evaluator = {
   defaultTier: 'observer',
   scope: 'banking',
   keywords: /large|big|unusual|charge|transaction|spend|消费|大额/,
-  run(rule, data) {
-    return data.transactions
-      .filter((txn) => txn.createdAt >= rule.createdAt && txn.amountMinor < 0 && Math.abs(txn.amountMinor) >= 50_000)
-      .slice(0, 20)
-      .map((txn) => {
-        const account = data.accounts.find((a) => a.id === txn.accountId);
-        const magnitude = Math.abs(txn.amountMinor);
-        return {
-          key: txn.id,
-          title: `Large transaction: ${txn.description}`,
-          detail: `${account?.name || 'Account'} · ${txn.date} · ${money(txn.amountMinor, txn.currency)}`,
-          value: money(txn.amountMinor, txn.currency),
-          dollarImpactMinor: magnitude,
-          currency: txn.currency,
-          confidence: 0.5, // awareness: probably legitimate, low actionability
-          effort: 2,
-          evidence: { summary: `Outflow of ${money(magnitude, txn.currency)} on ${txn.date}.`, records: [txn.id] },
-          accountId: txn.accountId,
-          createdAt: txn.createdAt,
-        } satisfies Draft;
-      });
-  },
+  sql: `
+    SELECT
+      t.id AS key,
+      'Large transaction: ' || t.description AS title,
+      COALESCE(a.name, 'Account') || ' · ' || t.date || ' · ' || money(t.amount_minor, t.currency) AS detail,
+      money(t.amount_minor, t.currency) AS value,
+      ABS(t.amount_minor) AS dollar_impact_minor,
+      t.currency AS currency,
+      0.5 AS confidence,
+      2 AS effort,
+      'Outflow of ' || money(ABS(t.amount_minor), t.currency) || ' on ' || t.date || '.' AS evidence_summary,
+      t.id AS evidence_records,
+      t.account_id AS account_id,
+      t.created_at AS created_at
+    FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id
+    WHERE t.created_at >= :rule_created_at AND t.amount_minor < 0 AND ABS(t.amount_minor) >= 50000
+    ORDER BY ABS(t.amount_minor) DESC
+    LIMIT 20
+  `,
 };
 
 const duplicateCharge: Evaluator = {
@@ -363,40 +273,34 @@ const duplicateCharge: Evaluator = {
   defaultTier: 'advisor',
   scope: 'banking',
   keywords: /duplicate|double|charged twice|重复|重复扣费/,
-  run(rule, data) {
-    const drafts: Draft[] = [];
-    const recent = data.transactions
-      .filter((txn) => txn.createdAt >= rule.createdAt && txn.amountMinor < 0)
-      .slice(0, 200);
-    const seen = new Map<string, Transaction>();
-    for (const txn of recent) {
-      const merchant = txn.description.trim().toLowerCase().slice(0, 24);
-      const groupKey = `${txn.accountId}:${txn.amountMinor}:${merchant}`;
-      const prior = seen.get(groupKey);
-      if (prior) {
-        const daysApart = Math.abs(new Date(txn.date).getTime() - new Date(prior.date).getTime()) / 86_400_000;
-        if (Number.isFinite(daysApart) && daysApart <= 3) {
-          const magnitude = Math.abs(txn.amountMinor);
-          drafts.push({
-            key: `${prior.id}:${txn.id}`,
-            title: `Possible duplicate charge: ${txn.description}`,
-            detail: `${money(txn.amountMinor, txn.currency)} on ${prior.date} and ${txn.date}.`,
-            value: money(magnitude, txn.currency),
-            dollarImpactMinor: magnitude,
-            currency: txn.currency,
-            confidence: 0.55,
-            effort: 3,
-            evidence: { summary: `Two charges of ${money(magnitude, txn.currency)} within ${Math.round(daysApart)} day(s).`, records: [prior.id, txn.id] },
-            actionLabel: 'Review and dispute the duplicate',
-            accountId: txn.accountId,
-            createdAt: txn.createdAt,
-          });
-        }
-      }
-      seen.set(groupKey, txn);
-    }
-    return drafts.slice(0, 20);
-  },
+  sql: `
+    WITH d AS (
+      SELECT t1.id AS id1, t2.id AS id2, t1.account_id, t1.amount_minor, t1.currency, t1.description,
+             t1.date AS d1, t2.date AS d2, ABS(julianday(t1.date) - julianday(t2.date)) AS gap
+      FROM transactions t1 JOIN transactions t2
+        ON t1.account_id = t2.account_id AND t1.amount_minor = t2.amount_minor
+        AND normalize_merchant(t1.description) = normalize_merchant(t2.description)
+        AND t1.id < t2.id
+      WHERE t1.amount_minor < 0 AND t1.created_at >= :rule_created_at AND t2.created_at >= :rule_created_at
+        AND ABS(julianday(t1.date) - julianday(t2.date)) <= 3
+    )
+    SELECT
+      id1 || ':' || id2 AS key,
+      'Possible duplicate charge: ' || description AS title,
+      money(amount_minor, currency) || ' on ' || d1 || ' and ' || d2 || '.' AS detail,
+      money(ABS(amount_minor), currency) AS value,
+      ABS(amount_minor) AS dollar_impact_minor,
+      currency,
+      0.55 AS confidence,
+      3 AS effort,
+      'Two charges of ' || money(ABS(amount_minor), currency) || ' within ' || CAST(ROUND(gap) AS INT) || ' day(s).' AS evidence_summary,
+      id1 || ',' || id2 AS evidence_records,
+      'Review and dispute the duplicate' AS action_label,
+      account_id AS account_id,
+      :now_iso AS created_at
+    FROM d
+    LIMIT 20
+  `,
 };
 
 const portfolioConcentration: Evaluator = {
@@ -407,24 +311,29 @@ const portfolioConcentration: Evaluator = {
   scope: 'brokerage',
   keywords: /concentration|portfolio|holding|allocation|持仓|集中/,
   alwaysOn: true,
-  run(rule, data) {
-    const total = data.holdings.reduce((sum, h) => sum + h.valueMinor, 0);
-    const largest = data.holdings.slice().sort((a, b) => b.valueMinor - a.valueMinor)[0];
-    if (!largest || total <= 0 || largest.valueMinor / total < 0.2) return [];
-    const account = data.accounts.find((a) => a.id === largest.accountId);
-    const ratio = largest.valueMinor / total;
-    return [{
-      key: largest.id,
-      title: `${largest.symbol || largest.name || 'Top holding'} concentration`,
-      detail: `${account?.name || 'Brokerage'} holds ${money(largest.valueMinor, largest.currency)} of ${money(total, largest.currency)} tracked holdings.`,
-      value: `${Math.round(ratio * 100)}%`,
-      confidence: 0.7,
-      severity: ratio >= 0.4 ? 'high' : 'medium',
-      evidence: { summary: `Largest holding is ${Math.round(ratio * 100)}% of tracked value.`, records: [largest.id] },
-      accountId: largest.accountId,
-      createdAt: largest.createdAt,
-    }];
-  },
+  sql: `
+    WITH latest_h AS (
+      SELECT h.*, ROW_NUMBER() OVER (
+        PARTITION BY account_id, COALESCE(security_id, symbol, name, security_type, ''), currency
+        ORDER BY as_of_date DESC, created_at DESC, id DESC) AS rn
+      FROM brokerage_holdings h
+    ), h AS (SELECT * FROM latest_h WHERE rn = 1),
+    tot AS (SELECT SUM(value_minor) AS total FROM h),
+    top AS (SELECT * FROM h ORDER BY value_minor DESC LIMIT 1)
+    SELECT
+      top.id AS key,
+      COALESCE(top.symbol, top.name, 'Top holding') || ' concentration' AS title,
+      COALESCE(a.name, 'Brokerage') || ' holds ' || money(top.value_minor, top.currency) || ' of ' || money(tot.total, top.currency) || ' tracked holdings.' AS detail,
+      CAST(ROUND(100.0 * top.value_minor / tot.total) AS INT) || '%' AS value,
+      0.7 AS confidence,
+      CASE WHEN 1.0 * top.value_minor / tot.total >= 0.4 THEN 'high' ELSE 'medium' END AS severity,
+      'Largest holding is ' || CAST(ROUND(100.0 * top.value_minor / tot.total) AS INT) || '% of tracked value.' AS evidence_summary,
+      top.id AS evidence_records,
+      top.account_id AS account_id,
+      top.created_at AS created_at
+    FROM top CROSS JOIN tot LEFT JOIN accounts a ON a.id = top.account_id
+    WHERE tot.total > 0 AND 1.0 * top.value_minor / tot.total >= 0.2
+  `,
 };
 
 const creditUtilization: Evaluator = {
@@ -434,30 +343,30 @@ const creditUtilization: Evaluator = {
   defaultTier: 'advisor',
   scope: 'credit',
   keywords: /utilization|credit|card|score|信用|利用率/,
-  run(rule, data) {
-    return data.balances
-      .filter((balance) => {
-        const account = data.accounts.find((a) => a.id === balance.accountId);
-        return isCreditAccount(account) && balance.limitMinor !== null && balance.limitMinor > 0 && balance.currentMinor > 0 && balance.currentMinor / balance.limitMinor >= 0.3;
-      })
-      .map((balance) => {
-        const account = data.accounts.find((a) => a.id === balance.accountId);
-        const ratio = balance.currentMinor / (balance.limitMinor as number);
-        return {
-          key: balance.accountId,
-          title: `${account?.name || 'Credit account'} utilization is elevated`,
-          detail: `${money(balance.currentMinor, balance.currency)} balance on ${money(balance.limitMinor || 0, balance.currency)} limit.`,
-          value: `${Math.round(ratio * 100)}%`,
-          confidence: 0.9,
-          severity: ratio >= 0.7 ? 'high' : 'medium',
-          urgency: ratio >= 0.7 ? 1.5 : 1,
-          evidence: { summary: `Utilization ${Math.round(ratio * 100)}% before statement close.`, records: [balance.accountId] },
-          actionLabel: 'Pay down before the statement closes',
-          accountId: balance.accountId,
-          createdAt: balance.createdAt,
-        } satisfies Draft;
-      });
-  },
+  sql: `
+    WITH latest AS (
+      SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn
+      FROM account_balances b
+    )
+    SELECT
+      lb.account_id AS key,
+      a.name || ' utilization is elevated' AS title,
+      money(lb.current_minor, lb.currency) || ' balance on ' || money(lb.limit_minor, lb.currency) || ' limit.' AS detail,
+      CAST(ROUND(100.0 * lb.current_minor / lb.limit_minor) AS INT) || '%' AS value,
+      0.9 AS confidence,
+      CASE WHEN 1.0 * lb.current_minor / lb.limit_minor >= 0.7 THEN 'high' ELSE 'medium' END AS severity,
+      CASE WHEN 1.0 * lb.current_minor / lb.limit_minor >= 0.7 THEN 1.5 ELSE 1 END AS urgency,
+      'Utilization ' || CAST(ROUND(100.0 * lb.current_minor / lb.limit_minor) AS INT) || '% before statement close.' AS evidence_summary,
+      lb.account_id AS evidence_records,
+      'Pay down before the statement closes' AS action_label,
+      lb.account_id AS account_id,
+      lb.created_at AS created_at
+    FROM latest lb JOIN accounts a ON a.id = lb.account_id
+    WHERE lb.rn = 1
+      AND (a.domain = 'credit' OR lower(a.type || ' ' || a.name) LIKE '%credit%' OR lower(a.type || ' ' || a.name) LIKE '%card%')
+      AND lb.limit_minor IS NOT NULL AND lb.limit_minor > 0 AND lb.current_minor > 0
+      AND 1.0 * lb.current_minor / lb.limit_minor >= 0.3
+  `,
 };
 
 const connectionHealth: Evaluator = {
@@ -468,20 +377,22 @@ const connectionHealth: Evaluator = {
   scope: 'all',
   keywords: /connection|sync|token|cursor|plaid|snaptrade|link/,
   alwaysOn: true,
-  run(rule, data) {
-    return data.connections
-      .filter((c) => c.status !== 'active' || !c.hasAccessToken || (c.provider === 'plaid' && !c.hasCursor))
-      .map((c) => ({
-        key: `${c.provider}:${c.externalId}`,
-        title: `${c.institution || c.provider} connection needs review`,
-        detail: `Status ${c.status}; token saved: ${c.hasAccessToken ? 'yes' : 'no'}; cursor saved: ${c.hasCursor ? 'yes' : 'no'}.`,
-        value: 'Review',
-        confidence: 0.95,
-        severity: 'high' as const,
-        evidence: { summary: `Provider connection is not fully healthy.`, records: [`${c.provider}:${c.externalId}`] },
-        createdAt: c.updatedAt,
-      } satisfies Draft));
-  },
+  sql: `
+    SELECT
+      provider || ':' || external_id AS key,
+      COALESCE(institution, provider) || ' connection needs review' AS title,
+      'Status ' || status
+        || '; token saved: ' || (CASE WHEN access_token IS NOT NULL THEN 'yes' ELSE 'no' END)
+        || '; cursor saved: ' || (CASE WHEN cursor IS NOT NULL THEN 'yes' ELSE 'no' END) || '.' AS detail,
+      'Review' AS value,
+      0.95 AS confidence,
+      'high' AS severity,
+      'Provider connection is not fully healthy.' AS evidence_summary,
+      provider || ':' || external_id AS evidence_records,
+      updated_at AS created_at
+    FROM provider_connections
+    WHERE status <> 'active' OR access_token IS NULL OR (provider = 'plaid' AND cursor IS NULL)
+  `,
 };
 
 // Fact-gated: demonstrates the facts-and-questions layer. Its external data — the
@@ -499,33 +410,36 @@ const employerMatch: Evaluator = {
     { key: 'retirement_contribution_pct', prompt: 'What percent of salary do you contribute to your 401(k)?', unlockImpactMinor: 240_000 },
     { key: 'employer_match_pct', prompt: 'Up to what percent of salary does your employer match?', unlockImpactMinor: 240_000 },
   ],
-  run(rule, data) {
-    const income = annualNumber(data.facts.get('annual_income')?.value);
-    const contrib = pctFraction(data.facts.get('retirement_contribution_pct')?.value);
-    const match = pctFraction(data.facts.get('employer_match_pct')?.value);
-    if (income == null || contrib == null || match == null) return [];
-    const missedFraction = Math.max(0, match - contrib);
-    if (missedFraction <= 0) return [];
-    const impact = Math.round(income * 100 * missedFraction); // income is major units; convert to minor
-    // Confidence blends the confidence of the facts the estimate rests on.
-    const factConfidence = Math.min(
-      data.facts.get('annual_income')?.confidence ?? 0.7,
-      data.facts.get('retirement_contribution_pct')?.confidence ?? 0.7,
-      data.facts.get('employer_match_pct')?.confidence ?? 0.7,
-    );
-    return [{
-      key: 'employer-match',
-      title: 'You are leaving employer 401(k) match on the table',
-      detail: `Contributing ${(contrib * 100).toFixed(1)}% against a ${(match * 100).toFixed(1)}% match forgoes about ${money(impact)}/yr in free money.`,
-      value: `${money(impact)}/yr`,
-      dollarImpactMinor: impact,
-      confidence: factConfidence,
-      effort: 3,
-      evidence: { summary: `Match ${(match * 100).toFixed(1)}% minus contribution ${(contrib * 100).toFixed(1)}% on ${money(income * 100)} income.`, records: ['fact:employer_match_pct', 'fact:retirement_contribution_pct', 'fact:annual_income'] },
-      actionLabel: 'Raise contribution to at least the full match',
-      createdAt: new Date(data.nowMs).toISOString(),
-    }];
-  },
+  sql: `
+    WITH f AS (
+      SELECT
+        MAX(CASE WHEN key = 'annual_income' THEN CAST(REPLACE(REPLACE(value, '$', ''), ',', '') AS REAL) END) AS income,
+        MAX(CASE WHEN key = 'retirement_contribution_pct' THEN CAST(value AS REAL) END) AS contrib_raw,
+        MAX(CASE WHEN key = 'employer_match_pct' THEN CAST(value AS REAL) END) AS match_raw,
+        MIN(confidence) AS conf
+      FROM facts WHERE key IN ('annual_income', 'retirement_contribution_pct', 'employer_match_pct')
+    ),
+    n AS (
+      SELECT income, conf,
+        CASE WHEN contrib_raw > 1 THEN contrib_raw / 100.0 ELSE contrib_raw END AS contrib,
+        CASE WHEN match_raw > 1 THEN match_raw / 100.0 ELSE match_raw END AS matchp
+      FROM f
+    )
+    SELECT
+      'employer-match' AS key,
+      'You are leaving employer 401(k) match on the table' AS title,
+      'Contributing ' || printf('%.1f', contrib * 100) || '% against a ' || printf('%.1f', matchp * 100) || '% match forgoes about ' || money(CAST(ROUND(income * 100 * (matchp - contrib)) AS INT)) || '/yr in free money.' AS detail,
+      money(CAST(ROUND(income * 100 * (matchp - contrib)) AS INT)) || '/yr' AS value,
+      CAST(ROUND(income * 100 * (matchp - contrib)) AS INT) AS dollar_impact_minor,
+      COALESCE(conf, 0.7) AS confidence,
+      3 AS effort,
+      'Match ' || printf('%.1f', matchp * 100) || '% minus contribution ' || printf('%.1f', contrib * 100) || '% on ' || money(CAST(income * 100 AS INT)) || ' income.' AS evidence_summary,
+      'fact:employer_match_pct,fact:retirement_contribution_pct,fact:annual_income' AS evidence_records,
+      'Raise contribution to at least the full match' AS action_label,
+      :now_iso AS created_at
+    FROM n
+    WHERE income IS NOT NULL AND contrib IS NOT NULL AND matchp IS NOT NULL AND (matchp - contrib) > 0
+  `,
 };
 
 // Cash flow: a checking/savings balance that is low or overdrawn. Risk-based, so
@@ -538,30 +452,31 @@ const lowBalance: Evaluator = {
   scope: 'banking',
   keywords: /low balance|overdraft|overdrawn|negative balance|低余额|余额不足/,
   alwaysOn: true,
-  run(rule, data) {
-    return data.balances
-      .filter((balance) => {
-        const account = data.accounts.find((a) => a.id === balance.accountId);
-        return Boolean(account) && account!.domain !== 'brokerage' && !isCreditAccount(account) && balance.currentMinor < 10_000;
-      })
-      .map((balance) => {
-        const account = data.accounts.find((a) => a.id === balance.accountId);
-        const overdrawn = balance.currentMinor < 0;
-        return {
-          key: balance.accountId,
-          title: overdrawn ? `${account?.name || 'Account'} is overdrawn` : `${account?.name || 'Account'} balance is low`,
-          detail: `Current balance ${money(balance.currentMinor, balance.currency)}.`,
-          value: money(balance.currentMinor, balance.currency),
-          confidence: 0.95,
-          severity: overdrawn ? 'high' as const : 'medium' as const,
-          urgency: overdrawn ? 2 : 1,
-          evidence: { summary: `Balance ${money(balance.currentMinor, balance.currency)} on a spending account.`, records: [balance.accountId] },
-          ...(overdrawn ? { actionLabel: 'Transfer funds to avoid overdraft fees' } : {}),
-          accountId: balance.accountId,
-          createdAt: balance.createdAt,
-        } satisfies Draft;
-      });
-  },
+  sql: `
+    WITH latest AS (
+      SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn
+      FROM account_balances b
+    )
+    SELECT
+      lb.account_id AS key,
+      a.name || (CASE WHEN lb.current_minor < 0 THEN ' is overdrawn' ELSE ' balance is low' END) AS title,
+      'Current balance ' || money(lb.current_minor, lb.currency) || '.' AS detail,
+      money(lb.current_minor, lb.currency) AS value,
+      0.95 AS confidence,
+      CASE WHEN lb.current_minor < 0 THEN 'high' ELSE 'medium' END AS severity,
+      CASE WHEN lb.current_minor < 0 THEN 2 ELSE 1 END AS urgency,
+      'Balance ' || money(lb.current_minor, lb.currency) || ' on a spending account.' AS evidence_summary,
+      lb.account_id AS evidence_records,
+      CASE WHEN lb.current_minor < 0 THEN 'Transfer funds to avoid overdraft fees' ELSE NULL END AS action_label,
+      lb.account_id AS account_id,
+      :now_iso AS created_at
+    FROM latest lb JOIN accounts a ON a.id = lb.account_id
+    WHERE lb.rn = 1
+      AND a.domain <> 'brokerage' AND a.domain <> 'credit'
+      AND lower(a.type || ' ' || a.name) NOT LIKE '%credit%'
+      AND lower(a.type || ' ' || a.name) NOT LIKE '%card%'
+      AND lb.current_minor < 10000
+  `,
 };
 
 // Spending: money lost to bank/card fees and interest. One aggregate finding over
@@ -574,30 +489,29 @@ const feesAndInterest: Evaluator = {
   scope: 'banking',
   keywords: /fee|fees|interest charge|finance charge|overdraft|费用|利息/,
   alwaysOn: true,
-  run(rule, data) {
-    const windowStart = data.nowMs - 90 * 86_400_000;
-    const fees = data.transactions.filter((txn) => {
-      const time = new Date(txn.date).getTime();
-      return txn.amountMinor < 0 && Number.isFinite(time) && time >= windowStart && FEE_PATTERN.test(txn.description);
-    });
-    if (fees.length === 0) return [];
-    const sum = fees.reduce((total, txn) => total + Math.abs(txn.amountMinor), 0);
-    const annual = Math.round(sum * (365 / 90));
-    const currency = fees[0]!.currency;
-    return [{
-      key: 'fees-90d',
-      title: `You paid ${money(sum, currency)} in fees & interest`,
-      detail: `${fees.length} fee or interest charge(s) in the last 90 days — about ${money(annual, currency)}/yr.`,
-      value: money(annual, currency),
-      dollarImpactMinor: annual,
-      currency,
-      confidence: 0.7,
-      effort: 3,
-      evidence: { summary: `Sum of ${fees.length} fee/interest charges over 90 days.`, records: fees.slice(0, 10).map((t) => t.id) },
-      actionLabel: 'Review and dispute avoidable fees',
-      createdAt: new Date(data.nowMs).toISOString(),
-    }];
-  },
+  sql: `
+    WITH fees AS (
+      SELECT id, ABS(amount_minor) AS amt, currency
+      FROM transactions
+      WHERE amount_minor < 0 AND julianday(:now_iso) - julianday(date) <= 90
+        AND fee_like(description) = 1
+    )
+    SELECT
+      'fees-90d' AS key,
+      'You paid ' || money(SUM(amt), MIN(currency)) || ' in fees & interest' AS title,
+      COUNT(*) || ' fee or interest charge(s) in the last 90 days — about ' || money(CAST(ROUND(SUM(amt) * 365.0 / 90) AS INT), MIN(currency)) || '/yr.' AS detail,
+      money(CAST(ROUND(SUM(amt) * 365.0 / 90) AS INT), MIN(currency)) AS value,
+      CAST(ROUND(SUM(amt) * 365.0 / 90) AS INT) AS dollar_impact_minor,
+      MIN(currency) AS currency,
+      0.7 AS confidence,
+      3 AS effort,
+      'Sum of ' || COUNT(*) || ' fee/interest charges over 90 days.' AS evidence_summary,
+      (SELECT group_concat(id) FROM (SELECT id FROM fees LIMIT 10)) AS evidence_records,
+      'Review and dispute avoidable fees' AS action_label,
+      :now_iso AS created_at
+    FROM fees
+    HAVING COUNT(*) > 0
+  `,
 };
 
 // Spending: a recurring charge whose latest amount rose against its own history —
@@ -610,28 +524,26 @@ const subscriptionPriceIncrease: Evaluator = {
   scope: 'banking',
   keywords: /price increase|went up|price hike|raised|涨价|加价/,
   alwaysOn: true,
-  run(rule, data) {
-    return detectRecurring(data.transactions, data.nowMs)
-      .filter((s) => !FEE_PATTERN.test(s.label) && s.typicalMinor > 0 && s.latestMinor > s.typicalMinor * 1.1)
-      .map((s) => {
-        const annualDelta = Math.round((s.latestMinor - s.typicalMinor) * s.periodsPerYear);
-        return {
-          key: s.merchant,
-          title: `${s.label} charge went up`,
-          detail: `Now ${money(s.latestMinor, s.currency)} vs a usual ${money(s.typicalMinor, s.currency)} — about ${money(annualDelta, s.currency)}/yr more.`,
-          value: money(annualDelta, s.currency),
-          dollarImpactMinor: annualDelta,
-          currency: s.currency,
-          confidence: 0.6,
-          effort: 2,
-          evidence: { summary: `Latest ${money(s.latestMinor, s.currency)} exceeds prior median ${money(s.typicalMinor, s.currency)} across ${s.count} charges.`, records: s.recordIds },
-          actionLabel: 'Review or renegotiate the increase',
-          accountId: s.accountId,
-          createdAt: s.lastDate,
-        } satisfies Draft;
-      })
-      .filter((draft) => (draft.dollarImpactMinor ?? 0) >= 1_200);
-  },
+  sql: `
+    SELECT
+      merchant AS key,
+      label || ' charge went up' AS title,
+      'Now ' || money(latest_minor, currency) || ' vs a usual ' || money(typical_minor, currency) || ' — about ' || money(CAST(ROUND((latest_minor - typical_minor) * periods_per_year) AS INT), currency) || '/yr more.' AS detail,
+      money(CAST(ROUND((latest_minor - typical_minor) * periods_per_year) AS INT), currency) AS value,
+      CAST(ROUND((latest_minor - typical_minor) * periods_per_year) AS INT) AS dollar_impact_minor,
+      currency,
+      0.6 AS confidence,
+      2 AS effort,
+      'Latest ' || money(latest_minor, currency) || ' exceeds prior median ' || money(typical_minor, currency) || ' across ' || count || ' charges.' AS evidence_summary,
+      record_ids AS evidence_records,
+      'Review or renegotiate the increase' AS action_label,
+      account_id AS account_id,
+      last_date AS created_at
+    FROM recurring_series
+    WHERE direction = 'out' AND count >= 3 AND span_days >= 60 AND fee_like(label) = 0
+      AND typical_minor > 0 AND latest_minor > typical_minor * 1.1
+      AND ROUND((latest_minor - typical_minor) * periods_per_year) >= 1200
+  `,
 };
 
 // Spending: the running annual cost of each detected subscription, so ghost or
@@ -643,30 +555,27 @@ const recurringSubscriptions: Evaluator = {
   defaultTier: 'advisor',
   scope: 'banking',
   keywords: /subscription|recurring|membership|订阅|会员/,
-  run(rule, data) {
-    return detectRecurring(data.transactions, data.nowMs)
-      .filter((s) => !FEE_PATTERN.test(s.label))
-      .map((s) => {
-        const annual = Math.round(s.latestMinor * s.periodsPerYear);
-        return {
-          key: s.merchant,
-          title: `Subscription: ${s.label}`,
-          detail: `About ${money(annual, s.currency)}/yr — ${s.count} charges of ~${money(s.latestMinor, s.currency)}.`,
-          value: money(annual, s.currency),
-          dollarImpactMinor: annual,
-          currency: s.currency,
-          confidence: 0.5,
-          effort: 1,
-          evidence: { summary: `${s.count} recurring charges of ~${money(s.latestMinor, s.currency)}.`, records: s.recordIds },
-          actionLabel: 'Cancel if you no longer use it',
-          accountId: s.accountId,
-          createdAt: s.lastDate,
-        } satisfies Draft;
-      })
-      .filter((draft) => (draft.dollarImpactMinor ?? 0) >= 6_000)
-      .sort((a, b) => (b.dollarImpactMinor ?? 0) - (a.dollarImpactMinor ?? 0))
-      .slice(0, 15);
-  },
+  sql: `
+    SELECT
+      merchant AS key,
+      'Subscription: ' || label AS title,
+      'About ' || money(CAST(ROUND(latest_minor * periods_per_year) AS INT), currency) || '/yr — ' || count || ' charges of ~' || money(latest_minor, currency) || '.' AS detail,
+      money(CAST(ROUND(latest_minor * periods_per_year) AS INT), currency) AS value,
+      CAST(ROUND(latest_minor * periods_per_year) AS INT) AS dollar_impact_minor,
+      currency,
+      0.5 AS confidence,
+      1 AS effort,
+      count || ' recurring charges of ~' || money(latest_minor, currency) || '.' AS evidence_summary,
+      record_ids AS evidence_records,
+      'Cancel if you no longer use it' AS action_label,
+      account_id AS account_id,
+      last_date AS created_at
+    FROM recurring_series
+    WHERE direction = 'out' AND count >= 3 AND span_days >= 60 AND fee_like(label) = 0
+      AND ROUND(latest_minor * periods_per_year) >= 6000
+    ORDER BY latest_minor * periods_per_year DESC
+    LIMIT 15
+  `,
 };
 
 // Spending: a discretionary category whose last-30-day spend is materially above
@@ -678,39 +587,42 @@ const spendingCategorySpike: Evaluator = {
   defaultTier: 'observer',
   scope: 'banking',
   keywords: /spending spike|category spend|lifestyle|overspend|超支|消费激增/,
-  run(rule, data) {
-    const current = new Map<string, number>();
-    const baseline = new Map<string, number>();
-    for (const txn of data.transactions) {
-      if (txn.amountMinor >= 0) continue;
-      const category = (txn.category || '').trim();
-      if (!category || NON_DISCRETIONARY_CATEGORY.test(category)) continue;
-      const ageDays = (data.nowMs - new Date(txn.date).getTime()) / 86_400_000;
-      if (!Number.isFinite(ageDays) || ageDays < 0) continue;
-      const amount = Math.abs(txn.amountMinor);
-      if (ageDays <= 30) current.set(category, (current.get(category) ?? 0) + amount);
-      else if (ageDays <= 120) baseline.set(category, (baseline.get(category) ?? 0) + amount);
-    }
-    const drafts: Draft[] = [];
-    for (const [category, currentAmount] of current) {
-      const avg = (baseline.get(category) ?? 0) / 3;
-      const overage = currentAmount - avg;
-      if (avg <= 0 || currentAmount < avg * 1.4 || overage < 5_000) continue;
-      drafts.push({
-        key: category,
-        title: `${prettyCategory(category)} spending is up`,
-        detail: `${money(currentAmount)} in the last 30 days vs about ${money(Math.round(avg))} in a typical month.`,
-        value: `+${money(Math.round(overage))}`,
-        dollarImpactMinor: Math.round(overage),
-        confidence: 0.6,
-        effort: 2,
-        evidence: { summary: `Last 30 days ${money(currentAmount)} vs 3-month average ${money(Math.round(avg))}.`, records: [category] },
-        actionLabel: 'Review this category',
-        createdAt: new Date(data.nowMs).toISOString(),
-      });
-    }
-    return drafts.sort((a, b) => (b.dollarImpactMinor ?? 0) - (a.dollarImpactMinor ?? 0)).slice(0, 5);
-  },
+  sql: `
+    WITH cur AS (
+      SELECT category, SUM(ABS(amount_minor)) AS amt FROM transactions
+      WHERE amount_minor < 0 AND category IS NOT NULL AND category <> ''
+        AND lower(category) NOT LIKE '%transfer%' AND lower(category) NOT LIKE '%income%'
+        AND lower(category) NOT LIKE '%loan_payments%' AND lower(category) NOT LIKE '%rent_and_utilities%'
+        AND lower(category) NOT LIKE '%bank_fees%'
+        AND julianday(:now_iso) - julianday(date) <= 30
+      GROUP BY category
+    ),
+    base AS (
+      SELECT category, SUM(ABS(amount_minor)) / 3.0 AS avg FROM transactions
+      WHERE amount_minor < 0 AND category IS NOT NULL AND category <> ''
+        AND lower(category) NOT LIKE '%transfer%' AND lower(category) NOT LIKE '%income%'
+        AND lower(category) NOT LIKE '%loan_payments%' AND lower(category) NOT LIKE '%rent_and_utilities%'
+        AND lower(category) NOT LIKE '%bank_fees%'
+        AND julianday(:now_iso) - julianday(date) > 30 AND julianday(:now_iso) - julianday(date) <= 120
+      GROUP BY category
+    )
+    SELECT
+      cur.category AS key,
+      UPPER(SUBSTR(REPLACE(lower(cur.category), '_', ' '), 1, 1)) || SUBSTR(REPLACE(lower(cur.category), '_', ' '), 2) || ' spending is up' AS title,
+      money(CAST(cur.amt AS INT)) || ' in the last 30 days vs about ' || money(CAST(base.avg AS INT)) || ' in a typical month.' AS detail,
+      '+' || money(CAST(cur.amt - base.avg AS INT)) AS value,
+      CAST(cur.amt - base.avg AS INT) AS dollar_impact_minor,
+      0.6 AS confidence,
+      2 AS effort,
+      'Last 30 days ' || money(CAST(cur.amt AS INT)) || ' vs 3-month average ' || money(CAST(base.avg AS INT)) || '.' AS evidence_summary,
+      cur.category AS evidence_records,
+      'Review this category' AS action_label,
+      :now_iso AS created_at
+    FROM cur JOIN base ON base.category = cur.category
+    WHERE base.avg > 0 AND cur.amt >= base.avg * 1.4 AND (cur.amt - base.avg) >= 5000
+    ORDER BY (cur.amt - base.avg) DESC
+    LIMIT 5
+  `,
 };
 
 // Spending: a recurring charge that only started recently — a new subscription or
@@ -722,30 +634,27 @@ const newRecurringCharge: Evaluator = {
   defaultTier: 'advisor',
   scope: 'banking',
   keywords: /new subscription|new recurring|free trial|trial|新订阅|试用/,
-  run(rule, data) {
-    return detectRecurring(data.transactions, data.nowMs, { minCount: 2, minSpanDays: 18 })
-      .filter((s) => !FEE_PATTERN.test(s.label) && s.count <= 4)
-      .filter((s) => (data.nowMs - new Date(s.firstDate).getTime()) / 86_400_000 <= 50)
-      .map((s) => {
-        const annual = Math.round(s.latestMinor * s.periodsPerYear);
-        return {
-          key: s.merchant,
-          title: `New recurring charge: ${s.label}`,
-          detail: `Recently started at ${money(s.latestMinor, s.currency)} — about ${money(annual, s.currency)}/yr if it continues.`,
-          value: money(annual, s.currency),
-          dollarImpactMinor: annual,
-          currency: s.currency,
-          confidence: 0.5,
-          effort: 2,
-          evidence: { summary: `First seen ${s.firstDate}, ${s.count} charges of ~${money(s.latestMinor, s.currency)}.`, records: s.recordIds },
-          actionLabel: 'Confirm this is a subscription you want',
-          accountId: s.accountId,
-          createdAt: s.lastDate,
-        } satisfies Draft;
-      })
-      .filter((draft) => (draft.dollarImpactMinor ?? 0) >= 6_000)
-      .slice(0, 10);
-  },
+  sql: `
+    SELECT
+      merchant AS key,
+      'New recurring charge: ' || label AS title,
+      'Recently started at ' || money(latest_minor, currency) || ' — about ' || money(CAST(ROUND(latest_minor * periods_per_year) AS INT), currency) || '/yr if it continues.' AS detail,
+      money(CAST(ROUND(latest_minor * periods_per_year) AS INT), currency) AS value,
+      CAST(ROUND(latest_minor * periods_per_year) AS INT) AS dollar_impact_minor,
+      currency,
+      0.5 AS confidence,
+      2 AS effort,
+      'First seen ' || first_date || ', ' || count || ' charges of ~' || money(latest_minor, currency) || '.' AS evidence_summary,
+      record_ids AS evidence_records,
+      'Confirm this is a subscription you want' AS action_label,
+      account_id AS account_id,
+      last_date AS created_at
+    FROM recurring_series
+    WHERE direction = 'out' AND count >= 2 AND count <= 4 AND span_days >= 18 AND fee_like(label) = 0
+      AND julianday(:now_iso) - julianday(first_date) <= 50
+      AND ROUND(latest_minor * periods_per_year) >= 6000
+    LIMIT 10
+  `,
 };
 
 // Cash flow: months of runway = liquid cash / average monthly spending. Surfaces
@@ -758,35 +667,34 @@ const cashRunway: Evaluator = {
   scope: 'banking',
   keywords: /runway|months of cash|cushion|emergency fund|现金储备|可支撑/,
   alwaysOn: true,
-  run(rule, data) {
-    const spendingBalances = data.balances.filter((balance) => {
-      const account = data.accounts.find((a) => a.id === balance.accountId);
-      return Boolean(account) && account!.domain !== 'brokerage' && !isCreditAccount(account);
-    });
-    // Without any spending-account balance we cannot know the cash on hand, so we
-    // do not infer runway from nothing.
-    if (spendingBalances.length === 0) return [];
-    const liquid = spendingBalances.reduce((sum, balance) => sum + Math.max(0, balance.availableMinor ?? balance.currentMinor), 0);
-    const windowStart = data.nowMs - 90 * 86_400_000;
-    const outflow = data.transactions
-      .filter((txn) => txn.amountMinor < 0 && new Date(txn.date).getTime() >= windowStart && !/transfer/i.test(txn.category || ''))
-      .reduce((sum, txn) => sum + Math.abs(txn.amountMinor), 0);
-    const monthly = outflow / 3;
-    if (monthly <= 0) return [];
-    const months = liquid / monthly;
-    if (months >= 2) return [];
-    return [{
-      key: 'runway',
-      title: 'Low cash runway',
-      detail: `${money(liquid)} liquid against about ${money(Math.round(monthly))}/mo spending — roughly ${months.toFixed(1)} months.`,
-      value: `${months.toFixed(1)} mo`,
-      confidence: 0.7,
-      severity: months < 1 ? 'high' as const : 'medium' as const,
-      urgency: months < 1 ? 1.5 : 1,
-      evidence: { summary: `Liquid ${money(liquid)} / monthly spend ${money(Math.round(monthly))}.`, records: [] },
-      createdAt: new Date(data.nowMs).toISOString(),
-    } satisfies Draft];
-  },
+  sql: `
+    WITH lb AS (
+      SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn FROM account_balances b
+    ),
+    liquid AS (
+      SELECT COUNT(*) AS cnt, COALESCE(SUM(MAX(0, COALESCE(lb.available_minor, lb.current_minor))), 0) AS amt
+      FROM lb JOIN accounts a ON a.id = lb.account_id
+      WHERE lb.rn = 1 AND a.domain <> 'brokerage'
+        AND NOT (a.domain = 'credit' OR lower(a.type || ' ' || a.name) LIKE '%credit%' OR lower(a.type || ' ' || a.name) LIKE '%card%')
+    ),
+    spend AS (
+      SELECT SUM(ABS(amount_minor)) / 3.0 AS monthly FROM transactions
+      WHERE amount_minor < 0 AND julianday(:now_iso) - julianday(date) <= 90 AND lower(COALESCE(category, '')) NOT LIKE '%transfer%'
+    )
+    SELECT
+      'runway' AS key,
+      'Low cash runway' AS title,
+      money(liquid.amt) || ' liquid against about ' || money(CAST(spend.monthly AS INT)) || '/mo spending — roughly ' || printf('%.1f', liquid.amt / spend.monthly) || ' months.' AS detail,
+      printf('%.1f', liquid.amt / spend.monthly) || ' mo' AS value,
+      0.7 AS confidence,
+      CASE WHEN liquid.amt / spend.monthly < 1 THEN 'high' ELSE 'medium' END AS severity,
+      CASE WHEN liquid.amt / spend.monthly < 1 THEN 1.5 ELSE 1 END AS urgency,
+      'Liquid ' || money(liquid.amt) || ' / monthly spend ' || money(CAST(spend.monthly AS INT)) || '.' AS evidence_summary,
+      '' AS evidence_records,
+      :now_iso AS created_at
+    FROM liquid CROSS JOIN spend
+    WHERE liquid.cnt > 0 AND spend.monthly > 0 AND liquid.amt / spend.monthly < 2
+  `,
 };
 
 // Connections: the freshest balance or transaction is well in the past, so the
@@ -799,27 +707,453 @@ const staleData: Evaluator = {
   scope: 'all',
   keywords: /stale|out of date|not updated|needs refresh|过期|未更新/,
   alwaysOn: true,
-  run(rule, data) {
-    if (data.accounts.length === 0) return [];
-    const times: number[] = [];
-    for (const balance of data.balances) times.push(new Date(balance.asOfDate).getTime());
-    for (const txn of data.transactions) times.push(new Date(txn.date).getTime());
-    const newest = Math.max(...times.filter((t) => Number.isFinite(t)));
-    if (!Number.isFinite(newest)) return [];
-    const ageDays = Math.round((data.nowMs - newest) / 86_400_000);
-    if (ageDays < 21) return [];
-    return [{
-      key: 'stale',
-      title: 'Account data may be stale',
-      detail: `Newest activity is about ${ageDays} days old. Resync your connections to refresh balances and transactions.`,
-      value: `${ageDays}d`,
-      confidence: 0.8,
-      severity: 'medium' as const,
-      evidence: { summary: `Most recent balance/transaction is ${ageDays} days old.`, records: [] },
-      actionLabel: 'Resync connected accounts',
-      createdAt: new Date(data.nowMs).toISOString(),
-    } satisfies Draft];
-  },
+  sql: `
+    WITH newest AS (
+      SELECT MAX(d) AS d FROM (
+        SELECT MAX(as_of_date) AS d FROM account_balances
+        UNION ALL SELECT MAX(date) FROM transactions
+      )
+    )
+    SELECT
+      'stale' AS key,
+      'Account data may be stale' AS title,
+      'Newest activity is about ' || CAST(ROUND(julianday(:now_iso) - julianday(n.d)) AS INT) || ' days old. Resync your connections to refresh balances and transactions.' AS detail,
+      CAST(ROUND(julianday(:now_iso) - julianday(n.d)) AS INT) || 'd' AS value,
+      0.8 AS confidence,
+      'medium' AS severity,
+      'Most recent balance/transaction is ' || CAST(ROUND(julianday(:now_iso) - julianday(n.d)) AS INT) || ' days old.' AS evidence_summary,
+      '' AS evidence_records,
+      'Resync connected accounts' AS action_label,
+      :now_iso AS created_at
+    FROM newest n
+    WHERE n.d IS NOT NULL
+      AND (SELECT COUNT(*) FROM accounts) > 0
+      AND julianday(:now_iso) - julianday(n.d) >= 21
+  `,
+};
+
+
+
+
+// Spending: the same subscription billed on more than one account — paying twice.
+const crossCardSubscription: Evaluator = {
+  kind: 'cross-card-subscription',
+  domain: 'spending',
+  executionClass: 'D',
+  defaultTier: 'advisor',
+  scope: 'banking',
+  keywords: /duplicate subscription|two cards|paying twice|重复订阅/,
+  alwaysOn: true,
+  sql: `
+    WITH s AS (
+      SELECT merchant, currency, account_id, label, record_ids,
+             CAST(ROUND(latest_minor * periods_per_year) AS INT) AS annual
+      FROM recurring_series
+      WHERE direction = 'out' AND count >= 3 AND span_days >= 60 AND fee_like(label) = 0
+    ),
+    g AS (
+      SELECT merchant, MIN(currency) AS currency, COUNT(DISTINCT account_id) AS accts,
+             SUM(annual) AS total_annual, MAX(annual) AS max_annual,
+             MIN(label) AS label, group_concat(record_ids) AS records
+      FROM s GROUP BY merchant HAVING COUNT(DISTINCT account_id) >= 2
+    )
+    SELECT
+      merchant AS key,
+      'Duplicate subscription: ' || label AS title,
+      'Billed on ' || accts || ' accounts — about ' || money(total_annual - max_annual, currency) || '/yr is a duplicate.' AS detail,
+      money(total_annual - max_annual, currency) AS value,
+      (total_annual - max_annual) AS dollar_impact_minor,
+      currency,
+      0.6 AS confidence,
+      2 AS effort,
+      'Same merchant recurring on ' || accts || ' accounts.' AS evidence_summary,
+      records AS evidence_records,
+      'Cancel the duplicate subscription' AS action_label,
+      :now_iso AS created_at
+    FROM g
+    WHERE (total_annual - max_annual) >= 3000
+  `,
+};
+
+// Spending: a large charge at a merchant with no prior history in the window.
+const unfamiliarMerchantCharge: Evaluator = {
+  kind: 'unfamiliar-merchant-charge',
+  domain: 'spending',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'banking',
+  keywords: /new merchant|unfamiliar|unrecognized|first[- ]time|陌生商户/,
+  sql: `
+    SELECT
+      t.id AS key,
+      'Large charge at a new merchant: ' || t.description AS title,
+      money(t.amount_minor, t.currency) || ' on ' || t.date || ' — first charge seen at this merchant.' AS detail,
+      money(t.amount_minor, t.currency) AS value,
+      ABS(t.amount_minor) AS dollar_impact_minor,
+      t.currency AS currency,
+      0.4 AS confidence,
+      2 AS effort,
+      'No prior charge at ' || t.description || ' in the loaded history.' AS evidence_summary,
+      t.id AS evidence_records,
+      t.account_id AS account_id,
+      t.created_at AS created_at
+    FROM transactions t
+    WHERE t.amount_minor < 0 AND ABS(t.amount_minor) >= 20000
+      AND julianday(:now_iso) - julianday(t.date) <= 30
+      AND normalize_merchant(t.description) <> ''
+      AND normalize_merchant(t.description) NOT IN (
+        SELECT normalize_merchant(description) FROM transactions
+        WHERE amount_minor < 0 AND julianday(:now_iso) - julianday(date) > 30
+      )
+    ORDER BY ABS(t.amount_minor) DESC
+    LIMIT 10
+  `,
+};
+
+// Credit: interest charged on a card — the cost of carrying a balance.
+const cardInterest: Evaluator = {
+  kind: 'card-interest',
+  domain: 'credit',
+  executionClass: 'D',
+  defaultTier: 'advisor',
+  scope: 'credit',
+  keywords: /card interest|carrying a balance|paying interest|信用卡利息/,
+  sql: `
+    WITH ci AS (
+      SELECT t.account_id, ABS(t.amount_minor) AS amt, t.id
+      FROM transactions t JOIN accounts a ON a.id = t.account_id
+      WHERE t.amount_minor < 0 AND julianday(:now_iso) - julianday(t.date) <= 90
+        AND (a.domain = 'credit' OR lower(a.type || ' ' || a.name) LIKE '%credit%' OR lower(a.type || ' ' || a.name) LIKE '%card%')
+        AND lower(t.description) LIKE '%interest%'
+    )
+    SELECT
+      ci.account_id AS key,
+      'You are paying interest on ' || COALESCE(a.name, 'a card') AS title,
+      money(SUM(ci.amt)) || ' in interest over 90 days — about ' || money(CAST(ROUND(SUM(ci.amt) * 365.0 / 90) AS INT)) || '/yr from carrying a balance.' AS detail,
+      money(CAST(ROUND(SUM(ci.amt) * 365.0 / 90) AS INT)) AS value,
+      CAST(ROUND(SUM(ci.amt) * 365.0 / 90) AS INT) AS dollar_impact_minor,
+      0.8 AS confidence,
+      3 AS effort,
+      'Interest charges on the card total ' || money(SUM(ci.amt)) || ' in 90 days.' AS evidence_summary,
+      (SELECT group_concat(id) FROM (SELECT id FROM ci c2 WHERE c2.account_id = ci.account_id LIMIT 5)) AS evidence_records,
+      'Pay down the balance to stop interest' AS action_label,
+      ci.account_id AS account_id,
+      :now_iso AS created_at
+    FROM ci JOIN accounts a ON a.id = ci.account_id
+    GROUP BY ci.account_id
+  `,
+};
+
+// Cash flow: over the last 30 days spending outran income, drawing down savings.
+const cashFlowNegative: Evaluator = {
+  kind: 'cash-flow-negative',
+  domain: 'cash-flow',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'banking',
+  keywords: /cash flow|spending exceed|burning savings|入不敷出|现金流/,
+  alwaysOn: true,
+  sql: `
+    WITH flows AS (
+      SELECT
+        SUM(CASE WHEN amount_minor > 0 AND lower(COALESCE(category, '')) NOT LIKE '%transfer%' THEN amount_minor ELSE 0 END) AS inflow,
+        SUM(CASE WHEN amount_minor < 0 AND lower(COALESCE(category, '')) NOT LIKE '%transfer%' AND lower(COALESCE(category, '')) NOT LIKE '%loan_payments%' THEN ABS(amount_minor) ELSE 0 END) AS outflow
+      FROM transactions WHERE julianday(:now_iso) - julianday(date) <= 30
+    )
+    SELECT
+      'cashflow-30d' AS key,
+      'Spending outpaced income this month' AS title,
+      money(outflow) || ' out vs ' || money(inflow) || ' in over 30 days — ' || money(outflow - inflow) || ' drawn from savings.' AS detail,
+      '-' || money(outflow - inflow) AS value,
+      (outflow - inflow) AS dollar_impact_minor,
+      0.6 AS confidence,
+      2 AS effort,
+      '30-day outflow ' || money(outflow) || ' exceeds inflow ' || money(inflow) || '.' AS evidence_summary,
+      '' AS evidence_records,
+      :now_iso AS created_at
+    FROM flows
+    WHERE inflow > 0 AND (outflow - inflow) >= 10000
+  `,
+};
+
+// Cash flow: recurring bills coming due before the next expected deposit exceed
+// the cash on hand — a forward-looking overdraft risk.
+const upcomingBills: Evaluator = {
+  kind: 'upcoming-bills',
+  domain: 'cash-flow',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'banking',
+  keywords: /bill runway|upcoming bills|due soon|账单|透支/,
+  alwaysOn: true,
+  sql: `
+    WITH income AS (
+      SELECT julianday(last_date) + 365.0 / periods_per_year AS next_jd
+      FROM recurring_series WHERE direction = 'in' AND count >= 2 AND span_days >= 20
+      ORDER BY latest_minor DESC LIMIT 1
+    ),
+    window_end AS (
+      SELECT MIN(COALESCE((SELECT next_jd FROM income), julianday(:now_iso) + 14), julianday(:now_iso) + 14) AS jd
+    ),
+    bills AS (
+      SELECT latest_minor, (julianday(last_date) + 365.0 / periods_per_year) AS next_jd
+      FROM recurring_series WHERE direction = 'out' AND count >= 3 AND span_days >= 60
+    ),
+    due AS (
+      SELECT COALESCE(SUM(latest_minor), 0) AS amt, COUNT(*) AS n
+      FROM bills CROSS JOIN window_end
+      WHERE next_jd >= julianday(:now_iso) AND next_jd <= window_end.jd
+    ),
+    lb AS (
+      SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn FROM account_balances b
+    ),
+    liquid AS (
+      SELECT COALESCE(SUM(MAX(0, COALESCE(lb.available_minor, lb.current_minor))), 0) AS amt
+      FROM lb JOIN accounts a ON a.id = lb.account_id
+      WHERE lb.rn = 1 AND a.domain <> 'brokerage'
+        AND NOT (a.domain = 'credit' OR lower(a.type || ' ' || a.name) LIKE '%credit%' OR lower(a.type || ' ' || a.name) LIKE '%card%')
+    )
+    SELECT
+      'upcoming-bills' AS key,
+      'Upcoming bills may overdraw you' AS title,
+      'About ' || money(due.amt) || ' in bills due before your next deposit vs ' || money(liquid.amt) || ' available — ' || money(due.amt - liquid.amt) || ' short.' AS detail,
+      '-' || money(due.amt - liquid.amt) AS value,
+      (due.amt - liquid.amt) AS dollar_impact_minor,
+      0.6 AS confidence,
+      'high' AS severity,
+      2 AS urgency,
+      2 AS effort,
+      due.n || ' recurring bills totaling ' || money(due.amt) || ' before the next deposit.' AS evidence_summary,
+      '' AS evidence_records,
+      'Move funds in before the bills hit' AS action_label,
+      :now_iso AS created_at
+    FROM due CROSS JOIN liquid
+    WHERE due.amt > 0 AND liquid.amt < due.amt
+  `,
+};
+
+// Cash flow: net worth fell materially month over month (drops only).
+const netWorthMovement: Evaluator = {
+  kind: 'net-worth-movement',
+  domain: 'cash-flow',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'all',
+  keywords: /net worth|net-worth|balance sheet|净值|资产净值/,
+  sql: `
+    WITH is_credit AS (
+      SELECT id, (domain = 'credit' OR lower(type || ' ' || name) LIKE '%credit%' OR lower(type || ' ' || name) LIKE '%card%') AS credit FROM accounts
+    ),
+    asof AS (
+      SELECT b.account_id, b.current_minor, b.as_of_date,
+             ROW_NUMBER() OVER (PARTITION BY b.account_id ORDER BY b.as_of_date DESC, b.id DESC) AS rn_now,
+             ROW_NUMBER() OVER (PARTITION BY b.account_id ORDER BY (b.as_of_date <= :prior_30d_iso) DESC, b.as_of_date DESC, b.id DESC) AS rn_prior
+      FROM account_balances b
+    ),
+    nw AS (
+      SELECT
+        COALESCE(SUM(CASE WHEN c.credit THEN -MAX(0, n.current_minor) ELSE n.current_minor END), 0) AS now_nw,
+        COALESCE(SUM(CASE WHEN c.credit THEN -MAX(0, p.current_minor) ELSE p.current_minor END), 0) AS prior_nw
+      FROM (SELECT * FROM asof WHERE rn_now = 1) n
+      JOIN is_credit c ON c.id = n.account_id
+      LEFT JOIN (SELECT * FROM asof WHERE rn_prior = 1 AND as_of_date <= :prior_30d_iso) p ON p.account_id = n.account_id
+    )
+    SELECT
+      'networth-30d' AS key,
+      'Net worth dropped this month' AS title,
+      money(now_nw) || ' now vs ' || money(prior_nw) || ' about 30 days ago — down ' || money(prior_nw - now_nw) || ' (' || CAST(ROUND(100.0 * (now_nw - prior_nw) / ABS(prior_nw)) AS INT) || '%).' AS detail,
+      CAST(ROUND(100.0 * (now_nw - prior_nw) / ABS(prior_nw)) AS INT) || '%' AS value,
+      ABS(now_nw - prior_nw) AS dollar_impact_minor,
+      0.7 AS confidence,
+      'medium' AS severity,
+      'Net worth ' || money(prior_nw) || ' → ' || money(now_nw) || '.' AS evidence_summary,
+      '' AS evidence_records,
+      :now_iso AS created_at
+    FROM nw
+    WHERE prior_nw <> 0 AND (now_nw - prior_nw) <= -0.05 * ABS(prior_nw) AND ABS(now_nw - prior_nw) >= 100000
+  `,
+};
+
+// Investments: recent executed buy/sell orders.
+const executedTrades: Evaluator = {
+  kind: 'executed-trades',
+  domain: 'investments',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'brokerage',
+  keywords: /executed|order|trade|bought|sold|成交|下单/,
+  sql: `
+    SELECT
+      t.id AS key,
+      (CASE WHEN lower(t.investment_type) LIKE '%sell%' THEN 'Sold ' ELSE 'Bought ' END) || COALESCE(t.symbol, t.description) AS title,
+      COALESCE(a.name, 'Brokerage') || ' · ' || t.date || ' · ' || money(ABS(t.amount_minor), t.currency) AS detail,
+      money(ABS(t.amount_minor), t.currency) AS value,
+      ABS(t.amount_minor) AS dollar_impact_minor,
+      t.currency AS currency,
+      0.4 AS confidence,
+      1 AS effort,
+      'low' AS severity,
+      COALESCE(t.investment_type, '') || ' ' || COALESCE(t.symbol, '') || ' ' || money(ABS(t.amount_minor), t.currency) || '.' AS evidence_summary,
+      t.id AS evidence_records,
+      t.account_id AS account_id,
+      t.created_at AS created_at
+    FROM brokerage_transactions t LEFT JOIN accounts a ON a.id = t.account_id
+    WHERE t.created_at >= :rule_created_at AND (lower(t.investment_type) LIKE '%buy%' OR lower(t.investment_type) LIKE '%sell%')
+    LIMIT 20
+  `,
+};
+
+// Investments: dividends and interest received (tax-relevant income).
+const dividendsReceived: Evaluator = {
+  kind: 'dividends-received',
+  domain: 'investments',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'brokerage',
+  keywords: /dividend|股息|分红/,
+  sql: `
+    WITH inc AS (
+      SELECT id, ABS(amount_minor) AS amt, currency
+      FROM brokerage_transactions
+      WHERE (lower(investment_type) LIKE '%dividend%' OR lower(investment_type) LIKE '%interest%')
+        AND julianday(:now_iso) - julianday(date) <= 90
+    )
+    SELECT
+      'dividends-90d' AS key,
+      'You received ' || money(SUM(amt), MIN(currency)) || ' in dividends & interest' AS title,
+      COUNT(*) || ' income payment(s) over 90 days — keep for tax time.' AS detail,
+      money(SUM(amt), MIN(currency)) AS value,
+      SUM(amt) AS dollar_impact_minor,
+      MIN(currency) AS currency,
+      0.6 AS confidence,
+      1 AS effort,
+      'low' AS severity,
+      COUNT(*) || ' dividend/interest transactions.' AS evidence_summary,
+      (SELECT group_concat(id) FROM (SELECT id FROM inc LIMIT 5)) AS evidence_records,
+      :now_iso AS created_at
+    FROM inc
+    HAVING COUNT(*) > 0
+  `,
+};
+
+// Investments: one position is an outsized share of total net worth.
+const singleNameExposure: Evaluator = {
+  kind: 'single-name-exposure',
+  domain: 'investments',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'all',
+  keywords: /single name|single stock|one position|net worth exposure|单一标的/,
+  sql: `
+    WITH latest_h AS (
+      SELECT h.*, ROW_NUMBER() OVER (
+        PARTITION BY account_id, COALESCE(security_id, symbol, name, security_type, ''), currency
+        ORDER BY as_of_date DESC, created_at DESC, id DESC) AS rn
+      FROM brokerage_holdings h
+    ), h AS (SELECT * FROM latest_h WHERE rn = 1),
+    latest_b AS (
+      SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn FROM account_balances b
+    ),
+    liquid AS (
+      SELECT COALESCE(SUM(MAX(0, lb.current_minor)), 0) AS amt
+      FROM latest_b lb JOIN accounts a ON a.id = lb.account_id
+      WHERE lb.rn = 1 AND NOT (a.domain = 'credit' OR lower(a.type || ' ' || a.name) LIKE '%credit%' OR lower(a.type || ' ' || a.name) LIKE '%card%')
+    ),
+    htot AS (SELECT COALESCE(SUM(value_minor), 0) AS amt FROM h),
+    top AS (SELECT * FROM h ORDER BY value_minor DESC LIMIT 1)
+    SELECT
+      top.id AS key,
+      COALESCE(top.symbol, top.name, 'One holding') || ' is ' || CAST(ROUND(100.0 * top.value_minor / (liquid.amt + htot.amt)) AS INT) || '% of your net worth' AS title,
+      money(top.value_minor, top.currency) || ' in a single position out of ' || money(liquid.amt + htot.amt, top.currency) || ' tracked assets.' AS detail,
+      CAST(ROUND(100.0 * top.value_minor / (liquid.amt + htot.amt)) AS INT) || '%' AS value,
+      0.7 AS confidence,
+      CASE WHEN 1.0 * top.value_minor / (liquid.amt + htot.amt) >= 0.3 THEN 'high' ELSE 'medium' END AS severity,
+      'Largest position is ' || CAST(ROUND(100.0 * top.value_minor / (liquid.amt + htot.amt)) AS INT) || '% of total assets.' AS evidence_summary,
+      top.id AS evidence_records,
+      top.account_id AS account_id,
+      top.created_at AS created_at
+    FROM top CROSS JOIN liquid CROSS JOIN htot
+    WHERE (liquid.amt + htot.amt) > 0 AND top.value_minor > 0 AND 1.0 * top.value_minor / (liquid.amt + htot.amt) >= 0.15
+  `,
+};
+
+// Investments: a holding's value swung sharply since the prior snapshot.
+const holdingSwing: Evaluator = {
+  kind: 'holding-swing',
+  domain: 'investments',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'brokerage',
+  keywords: /holding move|value swing|price swing|持仓波动|价格波动/,
+  sql: `
+    WITH snaps AS (
+      SELECT account_id, COALESCE(symbol, security_id, name) AS sec, symbol, name, currency, value_minor, as_of_date, id,
+             DENSE_RANK() OVER (PARTITION BY account_id, COALESCE(symbol, security_id, name) ORDER BY as_of_date DESC) AS drank
+      FROM brokerage_holdings
+    ),
+    pair AS (
+      SELECT account_id, sec,
+        MAX(CASE WHEN drank = 1 THEN value_minor END) AS latest_v,
+        MAX(CASE WHEN drank = 1 THEN symbol END) AS symbol,
+        MAX(CASE WHEN drank = 1 THEN name END) AS name,
+        MAX(CASE WHEN drank = 1 THEN currency END) AS currency,
+        MAX(CASE WHEN drank = 1 THEN id END) AS latest_id,
+        MAX(CASE WHEN drank = 1 THEN as_of_date END) AS latest_date,
+        MAX(CASE WHEN drank = 2 THEN value_minor END) AS prior_v,
+        MAX(CASE WHEN drank = 2 THEN as_of_date END) AS prior_date,
+        MAX(CASE WHEN drank = 2 THEN id END) AS prior_id
+      FROM snaps WHERE drank <= 2 GROUP BY account_id, sec
+    )
+    SELECT
+      account_id || ':' || COALESCE(symbol, name) AS key,
+      COALESCE(symbol, name, 'A holding') || ' moved ' || (CASE WHEN latest_v > prior_v THEN '+' ELSE '' END) || CAST(ROUND(100.0 * (latest_v - prior_v) / prior_v) AS INT) || '%' AS title,
+      money(prior_v, currency) || ' → ' || money(latest_v, currency) || ' since ' || prior_date || '.' AS detail,
+      (CASE WHEN latest_v > prior_v THEN '+' ELSE '' END) || CAST(ROUND(100.0 * (latest_v - prior_v) / prior_v) AS INT) || '%' AS value,
+      ABS(latest_v - prior_v) AS dollar_impact_minor,
+      currency,
+      0.7 AS confidence,
+      'medium' AS severity,
+      prior_date || ' → ' || latest_date || ': ' || money(prior_v, currency) || ' → ' || money(latest_v, currency) || '.' AS evidence_summary,
+      prior_id || ',' || latest_id AS evidence_records,
+      account_id AS account_id,
+      latest_date AS created_at
+    FROM pair
+    WHERE prior_v > 0 AND ABS(latest_v - prior_v) * 1.0 / prior_v >= 0.15 AND ABS(latest_v - prior_v) >= 100000
+    ORDER BY ABS(latest_v - prior_v) DESC
+    LIMIT 10
+  `,
+};
+
+// Investments: a symbol sold and repurchased within 30 days — a possible wash
+// sale worth a manual review at tax time (no cost basis, so review only).
+const washSaleRisk: Evaluator = {
+  kind: 'wash-sale-risk',
+  domain: 'investments',
+  executionClass: 'D',
+  defaultTier: 'advisor',
+  scope: 'brokerage',
+  keywords: /wash sale|洗售|亏损卖出/,
+  sql: `
+    SELECT
+      s.symbol || ':' || s.id AS key,
+      'Possible wash sale: ' || s.symbol AS title,
+      'Sold ' || s.symbol || ' on ' || s.date || ' and bought it again near ' || MIN(b.date) || ' — if the sale was at a loss, that loss may be disallowed.' AS detail,
+      s.symbol AS value,
+      0.5 AS confidence,
+      'medium' AS severity,
+      3 AS effort,
+      'Sell ' || s.date || ' and buy ' || MIN(b.date) || ' of ' || s.symbol || ' within 30 days.' AS evidence_summary,
+      s.id || ',' || MIN(b.id) AS evidence_records,
+      'Review for a wash sale before filing' AS action_label,
+      s.account_id AS account_id,
+      s.created_at AS created_at
+    FROM brokerage_transactions s JOIN brokerage_transactions b
+      ON b.symbol = s.symbol AND lower(b.investment_type) LIKE '%buy%'
+      AND ABS(julianday(b.date) - julianday(s.date)) <= 30
+    WHERE s.symbol IS NOT NULL AND lower(s.investment_type) LIKE '%sell%'
+    GROUP BY s.symbol
+    LIMIT 10
+  `,
 };
 
 // Order matters for natural-language inference: the first evaluator whose
@@ -829,26 +1163,64 @@ const EVALUATORS: Evaluator[] = [
   connectionHealth,
   staleData,
   creditUtilization,
+  cardInterest,
   employerMatch,
   cashRunway,
+  cashFlowNegative,
   lowBalance,
+  upcomingBills,
+  netWorthMovement,
   feesAndInterest,
   subscriptionPriceIncrease,
+  crossCardSubscription,
   newRecurringCharge,
   recurringSubscriptions,
   spendingCategorySpike,
+  duplicateCharge,
+  unfamiliarMerchantCharge,
   idleBrokerageCash,
   portfolioConcentration,
-  duplicateCharge,
+  singleNameExposure,
+  holdingSwing,
+  executedTrades,
+  dividendsReceived,
+  washSaleRisk,
+  // Broad-keyword fallbacks last: idle-cash matches "cash", large-transaction
+  // matches "charge"/"transaction", so more specific evaluators win inference.
   idleCash,
   largeTransaction,
 ];
 
-const REGISTRY = new Map<string, Evaluator>(EVALUATORS.map((e) => [e.kind, e]));
+// The built-in rules as DATA, seeded into the rule_specs table on startup. From
+// then on the engine reads every spec (built-in + downloaded) from the table, so
+// adding a rule is a data change — no code. See docs/rules-design.md.
+export function builtinRuleSpecs(): RuleSpec[] {
+  return EVALUATORS.map((e) => ({
+    kind: e.kind,
+    domain: e.domain,
+    executionClass: e.executionClass,
+    actionTier: e.defaultTier,
+    scope: e.scope,
+    cadence: 'event',
+    alwaysOn: e.alwaysOn ?? false,
+    keywords: e.keywords.source,
+    sql: e.sql ?? null,
+    prompt: null,
+    facts: (e.facts ?? []).map((f) => ({
+      key: f.key,
+      prompt: f.prompt,
+      unlockImpactMinor: f.unlockImpactMinor,
+      ...(f.currency ? { currency: f.currency } : {}),
+    })),
+    enabled: true,
+    source: 'builtin',
+    version: 1,
+  }));
+}
 
 // ── Interpreter ──────────────────────────────────────────────────────────────
 
-function finalize(rule: RuleRecord, evaluator: Evaluator, draft: Draft): Finding {
+function finalize(rule: RuleRecord, spec: RuleSpec, draft: Draft): Finding {
   const dollarImpactMinor = draft.dollarImpactMinor ?? 0;
   const currency = draft.currency ?? 'USD';
   const urgency = draft.urgency ?? 1;
@@ -861,7 +1233,7 @@ function finalize(rule: RuleRecord, evaluator: Evaluator, draft: Draft): Finding
     id: `${rule.kind}:${rule.id || 'builtin'}:${draft.key}`,
     ruleId: rule.id || null,
     kind: rule.kind,
-    domain: evaluator.domain,
+    domain: spec.domain,
     scope: rule.scope,
     title: draft.title,
     detail: draft.detail,
@@ -881,17 +1253,17 @@ function finalize(rule: RuleRecord, evaluator: Evaluator, draft: Draft): Finding
   };
 }
 
-// A synthetic rule for always-on evaluators that have no stored rule.
-function builtinRule(evaluator: Evaluator, nowIso: string): RuleRecord {
+// A synthetic rule for always-on specs that have no stored rule.
+function builtinRule(spec: RuleSpec, nowIso: string): RuleRecord {
   return {
     id: '',
-    kind: evaluator.kind,
-    domain: evaluator.domain,
-    sourceText: `Built-in ${evaluator.kind}`,
-    executionClass: evaluator.executionClass,
-    actionTier: evaluator.defaultTier,
-    scope: evaluator.scope,
-    cadence: 'event',
+    kind: spec.kind,
+    domain: spec.domain,
+    sourceText: `Built-in ${spec.kind}`,
+    executionClass: spec.executionClass,
+    actionTier: spec.actionTier,
+    scope: spec.scope,
+    cadence: spec.cadence,
     channel: 'auto',
     scheduledHour: null,
     scheduledDay: null,
@@ -901,12 +1273,13 @@ function builtinRule(evaluator: Evaluator, nowIso: string): RuleRecord {
   };
 }
 
-// Evaluate enabled rules plus any always-on evaluator not already covered by a
-// stored rule. A rule blocked on a missing required fact yields questions instead
-// of findings, ranked by the dollars the answer would unlock. Findings below the
-// suppression floor are dropped unless they are explicit high-severity safety
-// findings. The caller applies mutes and delivery on top of this.
-export function evaluateRules(rules: RuleRecord[], data: EvaluationData): EngineResult {
+// Evaluate enabled rules plus any always-on spec not already covered by a stored
+// rule, resolving each rule's definition from the given specs (loaded from the
+// rule_specs table). A rule blocked on a missing required fact yields a question
+// instead of a finding. Findings below the suppression floor are dropped unless
+// they carry an explicit non-low severity. The caller applies mutes and delivery.
+export function evaluateRules(specs: RuleSpec[], rules: RuleRecord[], data: EvaluationData, runQuery: RuleQueryRunner): EngineResult {
+  const registry = new Map(specs.filter((s) => s.enabled).map((s) => [s.kind, s]));
   const findings: Finding[] = [];
   const questions = new Map<string, QuestionDraft>();
   const enabled = rules.filter((rule) => rule.enabled);
@@ -915,13 +1288,13 @@ export function evaluateRules(rules: RuleRecord[], data: EvaluationData): Engine
 
   const runnable: RuleRecord[] = [
     ...enabled,
-    ...EVALUATORS.filter((e) => e.alwaysOn && !covered.has(e.kind)).map((e) => builtinRule(e, nowIso)),
+    ...specs.filter((s) => s.enabled && s.alwaysOn && !covered.has(s.kind)).map((s) => builtinRule(s, nowIso)),
   ];
 
   for (const rule of runnable) {
-    const evaluator = REGISTRY.get(rule.kind);
-    if (!evaluator) continue;
-    const missing = (evaluator.facts ?? []).filter((need) => !data.facts.has(need.key));
+    const spec = registry.get(rule.kind);
+    if (!spec) continue;
+    const missing = spec.facts.filter((need) => !data.facts.has(need.key));
     if (missing.length > 0) {
       for (const need of missing) {
         questions.set(need.key, {
@@ -930,16 +1303,23 @@ export function evaluateRules(rules: RuleRecord[], data: EvaluationData): Engine
           ruleKind: rule.kind,
           unlockImpactMinor: need.unlockImpactMinor,
           currency: need.currency ?? 'USD',
-          suggestedValue: need.suggest ? need.suggest(data) : null,
+          suggestedValue: null,
         });
       }
       continue; // blocked on a fact — produces a question, not a finding
     }
-    for (const draft of evaluator.run(rule, data)) {
-      const finding = finalize(rule, evaluator, draft);
-      // Suppress only low-severity findings that also fall below the dollar floor.
-      // An evaluator that explicitly asserts medium/high severity (a risk with no
-      // dollar value, e.g. utilization or concentration) always surfaces.
+    if (!spec.sql) continue; // prompt/LLM specs run once the L/L+ path exists
+    const rows = runQuery(spec.sql, {
+      rule_id: rule.id || '',
+      rule_created_at: rule.createdAt,
+      now_iso: nowIso,
+      now_ms: data.nowMs,
+      prior_30d_iso: new Date(data.nowMs - 30 * 86_400_000).toISOString(),
+      hysa_apr: REFERENCE_TABLES.highYieldSavingsApr,
+      checking_apr: REFERENCE_TABLES.checkingApr,
+    });
+    for (const draft of rows.map(rowToDraft)) {
+      const finding = finalize(rule, spec, draft);
       if (finding.score >= SUPPRESS_SCORE || finding.severity !== 'low') findings.push(finding);
     }
   }
@@ -971,16 +1351,20 @@ function inferCadence(lower: string): string {
   return 'event';
 }
 
-export function inferRule(text: string, scope?: string, cadence?: string): InferredRule {
+// Match the first spec whose keyword pattern hits (specs are ordered specific ->
+// broad by the seed), falling back to large-transaction.
+export function inferRule(specs: RuleSpec[], text: string, scope?: string, cadence?: string): InferredRule {
   const lower = text.toLowerCase();
-  const evaluator = EVALUATORS.find((e) => e.keywords.test(lower)) ?? largeTransaction;
-  const chosenScope = (scope && SCOPES.includes(scope) ? scope : evaluator.scope);
+  const match = specs.find((s) => s.keywords && new RegExp(s.keywords, 'i').test(lower))
+    ?? specs.find((s) => s.kind === 'large-transaction')
+    ?? specs[0];
+  const chosenScope = (scope && SCOPES.includes(scope) ? scope : match?.scope ?? 'banking');
   const chosenCadence = (cadence && CADENCES.includes(cadence) ? cadence : inferCadence(lower));
   return {
-    kind: evaluator.kind,
-    domain: evaluator.domain,
-    executionClass: evaluator.executionClass,
-    actionTier: evaluator.defaultTier,
+    kind: match?.kind ?? 'large-transaction',
+    domain: match?.domain ?? 'spending',
+    executionClass: match?.executionClass ?? 'D',
+    actionTier: match?.actionTier ?? 'observer',
     scope: SCOPES.includes(chosenScope) ? chosenScope : 'banking',
     cadence: CADENCES.includes(chosenCadence) ? chosenCadence : 'event',
     channel: 'auto',
