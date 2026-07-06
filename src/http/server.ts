@@ -78,6 +78,7 @@ const ruleCreateSchema = z.object({
   cadence: z.string().trim().max(40).optional(),
   channel: z.string().trim().max(40).optional(),
   scheduledHour: z.number().int().min(0).max(23).nullable().optional(),
+  scheduledDay: z.number().int().min(0).max(31).nullable().optional(),
 }).strict();
 
 const ruleToggleSchema = z.object({
@@ -95,11 +96,22 @@ const memoryRememberSchema = z.object({
   kind: z.string().trim().max(40).optional(),
 }).strict();
 
-const insightMuteCreateSchema = z.object({
+const findingMuteCreateSchema = z.object({
   kind: z.string().trim().max(120).nullable().optional(),
   accountId: z.string().uuid().nullable().optional(),
   label: z.string().trim().max(160).nullable().optional(),
   days: z.number().int().min(0).max(365).nullable().optional(),
+}).strict();
+
+const factSaveSchema = z.object({
+  key: z.string().trim().min(1).max(120),
+  value: z.string().trim().min(1).max(500),
+  source: z.enum(['user', 'derived', 'reference']).optional(),
+  refreshAfter: z.string().trim().max(40).nullable().optional(),
+}).strict();
+
+const factRemoveSchema = z.object({
+  key: z.string().trim().min(1).max(120),
 }).strict();
 
 export interface ServerOptions {
@@ -319,8 +331,8 @@ async function route(
   if (url.pathname === '/v1/llm/model' && method === 'DELETE') {
     return sendJson(response, 200, await service.deleteBuiltinModel());
   }
-  if (url.pathname === '/v1/insights' && method === 'GET') {
-    return sendJson(response, 200, { items: service.listInsights() });
+  if (url.pathname === '/v1/findings' && method === 'GET') {
+    return sendJson(response, 200, { items: service.listFindings() });
   }
   if (url.pathname === '/v1/rules' && method === 'GET') {
     return sendJson(response, 200, { items: service.listRules() });
@@ -341,16 +353,34 @@ async function route(
     const input = parseSchema(ruleRemoveSchema, await readJson(request));
     return sendJson(response, 200, service.removeRule(input.id));
   }
-  if (url.pathname === '/v1/insight-mutes' && method === 'GET') {
-    return sendJson(response, 200, { items: service.listInsightMutes() });
+  if (url.pathname === '/v1/questions' && method === 'GET') {
+    return sendJson(response, 200, { items: service.listQuestions() });
   }
-  if (url.pathname === '/v1/insight-mutes' && method === 'POST') {
-    const input = parseSchema(insightMuteCreateSchema, await readJson(request));
-    return sendJson(response, 201, service.createInsightMute(input));
-  }
-  if (url.pathname === '/v1/insight-mutes/remove' && method === 'POST') {
+  if (url.pathname === '/v1/questions/dismiss' && method === 'POST') {
     const input = parseSchema(ruleRemoveSchema, await readJson(request));
-    return sendJson(response, 200, service.removeInsightMute(input.id));
+    return sendJson(response, 200, service.dismissQuestion(input.id));
+  }
+  if (url.pathname === '/v1/facts' && method === 'GET') {
+    return sendJson(response, 200, { items: service.listFacts() });
+  }
+  if (url.pathname === '/v1/facts' && method === 'POST') {
+    const input = parseSchema(factSaveSchema, await readJson(request));
+    return sendJson(response, 201, service.saveFact(input));
+  }
+  if (url.pathname === '/v1/facts/remove' && method === 'POST') {
+    const input = parseSchema(factRemoveSchema, await readJson(request));
+    return sendJson(response, 200, service.removeFact(input.key));
+  }
+  if (url.pathname === '/v1/finding-mutes' && method === 'GET') {
+    return sendJson(response, 200, { items: service.listFindingMutes() });
+  }
+  if (url.pathname === '/v1/finding-mutes' && method === 'POST') {
+    const input = parseSchema(findingMuteCreateSchema, await readJson(request));
+    return sendJson(response, 201, service.createFindingMute(input));
+  }
+  if (url.pathname === '/v1/finding-mutes/remove' && method === 'POST') {
+    const input = parseSchema(ruleRemoveSchema, await readJson(request));
+    return sendJson(response, 200, service.removeFindingMute(input.id));
   }
   if (url.pathname === '/v1/memory' && method === 'GET') {
     return sendJson(response, 200, service.recallMemory());

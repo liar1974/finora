@@ -52,7 +52,7 @@ describe('FinanceService', () => {
     service.close();
   });
 
-  it('surfaces rule-driven new credit card transaction insights locally and delivers them to Telegram once', async () => {
+  it('surfaces a large-transaction finding with dollar impact and confidence, delivering it once', async () => {
     const repository = new SqliteFinanceRepository(':memory:');
     repository.saveAppSettings({
       TELEGRAM_BOT_TOKEN: 'test-token',
@@ -61,7 +61,7 @@ describe('FinanceService', () => {
     });
     const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
     service.createRule({
-      text: 'any new credit card transactions',
+      text: 'flag large transactions',
       scope: 'banking',
       cadence: 'event',
       channel: 'telegram',
@@ -75,7 +75,7 @@ describe('FinanceService', () => {
     service.importStatement({
       accountId: account.id,
       filename: 'card.csv',
-      content: Buffer.from('Date,Description,Amount\n2026-07-01,Coffee Shop,-5.25\n'),
+      content: Buffer.from('Date,Description,Amount\n2026-07-01,Coffee Shop,-600.00\n'),
     });
     const sent: Record<string, unknown>[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -83,17 +83,18 @@ describe('FinanceService', () => {
       return Response.json({ ok: true, result: {} });
     }));
 
-    expect(service.listInsights()).toEqual(expect.arrayContaining([
+    expect(service.listFindings()).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        title: 'New credit card transaction: Coffee Shop',
-        source: 'rule',
-        value: '-$5.25',
+        title: 'Large transaction: Coffee Shop',
+        value: '-$600.00',
+        dollarImpactMinor: 60000,
+        confidence: 0.5,
       }),
     ]));
     await expect(service.deliverInsightsToIm()).resolves.toMatchObject({ count: 1, sent: true });
     await expect(service.deliverInsightsToIm()).resolves.toMatchObject({ count: 0, sent: false, reason: 'no-new-insights' });
     expect(sent).toHaveLength(1);
-    expect(sent[0]?.text).toContain('New credit card transaction: Coffee Shop');
+    expect(sent[0]?.text).toContain('Large transaction: Coffee Shop');
     expect(sent[0]?.text).toContain('Rewards Credit Card');
     service.close();
   });
@@ -106,7 +107,7 @@ describe('FinanceService', () => {
       NOTIFICATION_CHANNEL: 'telegram',
     });
     const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
-    service.createRule({ text: 'any new credit card transactions', scope: 'banking', cadence: 'event' });
+    service.createRule({ text: 'flag large transactions', scope: 'banking', cadence: 'event' });
     const account = service.createAccount({
       institution: 'Robinhood',
       name: 'Robinhood Credit Card',
@@ -125,7 +126,7 @@ describe('FinanceService', () => {
       sourceId: 'plaid-pending',
       date: '2026-07-03',
       description: '99 Ranch Market',
-      amountMinor: -1874,
+      amountMinor: -60000,
       currency: 'USD',
       pending: true,
       fingerprint: 'plaid:pending',
@@ -138,7 +139,7 @@ describe('FinanceService', () => {
       sourceId: 'plaid-posted',
       date: '2026-07-02',
       description: '99 Ranch Market',
-      amountMinor: -1874,
+      amountMinor: -60000,
       currency: 'USD',
       pending: false,
       fingerprint: 'plaid:posted',
@@ -267,20 +268,59 @@ describe('FinanceService', () => {
       },
     ]);
 
-    const insights = service.listInsights();
-    const titles = insights.map((insight) => insight.title);
+    const findings = service.listFindings();
+    const titles = findings.map((finding) => finding.title);
     expect(titles).toEqual(expect.arrayContaining([
       'Example Bank connection needs review',
-      'Investing has idle cash',
+      'Investing cash drag',
       'BND concentration',
       'Rewards Credit Card utilization is elevated',
     ]));
-    expect(insights.filter((insight) => insight.ruleId).map((insight) => insight.title)).toEqual(expect.arrayContaining([
+    expect(findings.filter((finding) => finding.ruleId).map((finding) => finding.title)).toEqual(expect.arrayContaining([
       'Example Bank connection needs review',
-      'Investing has idle cash',
+      'Investing cash drag',
       'BND concentration',
       'Rewards Credit Card utilization is elevated',
     ]));
+    service.close();
+  });
+
+  it('gates a fact-dependent rule behind ranked questions, then unlocks a finding once facts are provided', () => {
+    const service = application();
+    service.createRule({ text: 'check my 401k employer match', scope: 'all', cadence: 'monthly' });
+
+    // Blocked on missing facts: no finding, but questions ranked by unlockable impact.
+    expect(service.listFindings().some((f) => f.kind === 'employer-match')).toBe(false);
+    const questions = service.listQuestions();
+    expect(questions.map((q) => q.factKey).sort()).toEqual(['annual_income', 'employer_match_pct', 'retirement_contribution_pct']);
+    expect(questions.every((q) => q.unlockImpactMinor > 0)).toBe(true);
+
+    service.saveFact({ key: 'annual_income', value: '120000' });
+    service.saveFact({ key: 'retirement_contribution_pct', value: '3' });
+    service.saveFact({ key: 'employer_match_pct', value: '6' });
+
+    expect(service.listQuestions()).toHaveLength(0);
+    const finding = service.listFindings().find((f) => f.kind === 'employer-match');
+    // 6% match minus 3% contribution on $120k = $3,600/yr; user-entered facts cap the tier at advisor.
+    expect(finding).toMatchObject({ dollarImpactMinor: 360000, confidence: 0.7, actionTier: 'advisor' });
+    service.close();
+  });
+
+  it('detects a subscription price increase and annualizes the delta', () => {
+    const service = application();
+    service.createRule({ text: 'flag subscription price increases', scope: 'banking', cadence: 'weekly' });
+    const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    service.importStatement({
+      accountId: account.id,
+      filename: 'subs.csv',
+      content: Buffer.from(
+        'Date,Description,Amount\n2026-03-05,ACME STREAMING,-60.00\n2026-04-05,ACME STREAMING,-60.00\n2026-05-05,ACME STREAMING,-60.00\n2026-06-05,ACME STREAMING,-80.00\n',
+      ),
+    });
+    const finding = service.listFindings().find((f) => f.kind === 'subscription-price-increase');
+    expect(finding?.title).toContain('ACME STREAMING');
+    // $20/mo more, annualized to roughly $240; surfaces above the suppression floor.
+    expect(finding && finding.dollarImpactMinor >= 20000).toBe(true);
     service.close();
   });
 

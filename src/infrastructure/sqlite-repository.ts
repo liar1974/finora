@@ -21,8 +21,6 @@ import type {
   AccountBalance,
   AgentEventRecord,
   AgentEventType,
-  AlertMuteRecord,
-  AlertRuleRecord,
   AppSettingPreview,
   BrokerageHolding,
   BrokerageSummary,
@@ -31,12 +29,71 @@ import type {
   ChatSessionRecord,
   CreditReportRecord,
   DashboardRecord,
+  FactRecord,
+  FindingMuteRecord,
   ImportRecord,
   MoneySummary,
   Page,
   ProviderConnection,
+  QuestionRecord,
+  RuleRecord,
   Transaction,
 } from '../domain/models.js';
+
+// Shared by the fresh-install baseline and the v4 reset migration so both paths
+// converge on the same rules-engine schema. Findings are computed on read and not
+// persisted; only rule specs, user facts, pending questions, and mutes are stored.
+const RULES_ENGINE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS rules (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    domain TEXT NOT NULL DEFAULT 'cash-flow',
+    source_text TEXT NOT NULL,
+    execution_class TEXT NOT NULL DEFAULT 'D' CHECK (execution_class IN ('D', 'L', 'L+')),
+    action_tier TEXT NOT NULL DEFAULT 'observer' CHECK (action_tier IN ('observer', 'advisor', 'guardian', 'navigator')),
+    scope TEXT NOT NULL DEFAULT 'banking',
+    cadence TEXT NOT NULL DEFAULT 'event',
+    channel TEXT NOT NULL DEFAULT 'auto',
+    scheduled_hour INTEGER CHECK (scheduled_hour IS NULL OR (scheduled_hour >= 0 AND scheduled_hour <= 23)),
+    scheduled_day INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS rules_enabled_idx ON rules(enabled);
+
+  CREATE TABLE IF NOT EXISTS facts (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'derived', 'reference')),
+    confidence REAL NOT NULL DEFAULT 0.7,
+    refresh_after TEXT,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS questions (
+    id TEXT PRIMARY KEY,
+    fact_key TEXT NOT NULL UNIQUE,
+    prompt TEXT NOT NULL,
+    rule_kind TEXT NOT NULL,
+    unlock_impact_minor INTEGER NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    suggested_value TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'answered', 'dismissed')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS finding_mutes (
+    id TEXT PRIMARY KEY,
+    kind TEXT,
+    account_id TEXT,
+    label TEXT,
+    expires_at TEXT,
+    created_at TEXT NOT NULL
+  );
+`;
 
 interface AccountRow extends Record<string, unknown> {
   id: string;
@@ -185,26 +242,52 @@ interface CreditReportRow extends Record<string, unknown> {
   created_at: string;
 }
 
-interface AlertRuleRow extends Record<string, unknown> {
+interface RuleRow extends Record<string, unknown> {
   id: string;
   kind: string;
+  domain: string;
   source_text: string;
+  execution_class: string;
+  action_tier: string;
   scope: string;
   cadence: string;
   channel: string;
   scheduled_hour: number | null;
+  scheduled_day: number | null;
   enabled: number;
   created_at: string;
   updated_at: string;
 }
 
-interface AlertMuteRow extends Record<string, unknown> {
+interface FindingMuteRow extends Record<string, unknown> {
   id: string;
   kind: string | null;
   account_id: string | null;
   label: string | null;
   expires_at: string | null;
   created_at: string;
+}
+
+interface FactRow extends Record<string, unknown> {
+  key: string;
+  value: string;
+  source: string;
+  confidence: number;
+  refresh_after: string | null;
+  updated_at: string;
+}
+
+interface QuestionRow extends Record<string, unknown> {
+  id: string;
+  fact_key: string;
+  prompt: string;
+  rule_kind: string;
+  unlock_impact_minor: number;
+  currency: string;
+  suggested_value: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
 }
 
 interface ImportRow extends Record<string, unknown> {
@@ -635,61 +718,143 @@ export class SqliteFinanceRepository implements FinanceRepository {
     }
   }
 
-  listAlertRules(): AlertRuleRecord[] {
+  listRules(): RuleRecord[] {
     const rows = this.database.prepare(`
-      SELECT id, kind, source_text, scope, cadence, channel, scheduled_hour, enabled, created_at, updated_at
-      FROM alert_rules
+      SELECT id, kind, domain, source_text, execution_class, action_tier, scope, cadence, channel, scheduled_hour, scheduled_day, enabled, created_at, updated_at
+      FROM rules
       ORDER BY enabled DESC, cadence, scope, created_at DESC
-    `).all() as AlertRuleRow[];
-    return rows.map(mapAlertRule);
+    `).all() as RuleRow[];
+    return rows.map(mapRule);
   }
 
-  saveAlertRule(input: Omit<AlertRuleRecord, 'id' | 'createdAt' | 'updatedAt'>): AlertRuleRecord {
+  saveRule(input: Omit<RuleRecord, 'id' | 'createdAt' | 'updatedAt'>): RuleRecord {
     const now = new Date().toISOString();
-    const row: AlertRuleRecord = { id: randomUUID(), createdAt: now, updatedAt: now, ...input };
+    const row: RuleRecord = { id: randomUUID(), createdAt: now, updatedAt: now, ...input };
     this.database.prepare(`
-      INSERT INTO alert_rules (id, kind, source_text, scope, cadence, channel, scheduled_hour, enabled, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(row.id, row.kind, row.sourceText, row.scope, row.cadence, row.channel, row.scheduledHour, row.enabled ? 1 : 0, now, now);
+      INSERT INTO rules (id, kind, domain, source_text, execution_class, action_tier, scope, cadence, channel, scheduled_hour, scheduled_day, enabled, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(row.id, row.kind, row.domain, row.sourceText, row.executionClass, row.actionTier, row.scope, row.cadence, row.channel, row.scheduledHour, row.scheduledDay, row.enabled ? 1 : 0, now, now);
     return row;
   }
 
-  toggleAlertRule(id: string, enabled: boolean): AlertRuleRecord | null {
+  toggleRule(id: string, enabled: boolean): RuleRecord | null {
     this.database.prepare(`
-      UPDATE alert_rules SET enabled = ?, updated_at = ? WHERE id = ?
+      UPDATE rules SET enabled = ?, updated_at = ? WHERE id = ?
     `).run(enabled ? 1 : 0, new Date().toISOString(), id);
     const row = this.database.prepare(`
-      SELECT id, kind, source_text, scope, cadence, channel, scheduled_hour, enabled, created_at, updated_at
-      FROM alert_rules WHERE id = ?
-    `).get(id) as AlertRuleRow | undefined;
-    return row ? mapAlertRule(row) : null;
+      SELECT id, kind, domain, source_text, execution_class, action_tier, scope, cadence, channel, scheduled_hour, scheduled_day, enabled, created_at, updated_at
+      FROM rules WHERE id = ?
+    `).get(id) as RuleRow | undefined;
+    return row ? mapRule(row) : null;
   }
 
-  removeAlertRule(id: string): boolean {
-    const result = this.database.prepare('DELETE FROM alert_rules WHERE id = ?').run(id);
+  removeRule(id: string): boolean {
+    const result = this.database.prepare('DELETE FROM rules WHERE id = ?').run(id);
     return result.changes > 0;
   }
 
-  listAlertMutes(): AlertMuteRecord[] {
+  listFindingMutes(): FindingMuteRecord[] {
     const rows = this.database.prepare(`
       SELECT id, kind, account_id, label, expires_at, created_at
-      FROM alert_mutes
+      FROM finding_mutes
       ORDER BY created_at DESC
-    `).all() as AlertMuteRow[];
-    return rows.map(mapAlertMute);
+    `).all() as FindingMuteRow[];
+    return rows.map(mapFindingMute);
   }
 
-  saveAlertMute(input: Omit<AlertMuteRecord, 'id' | 'createdAt'>): AlertMuteRecord {
-    const row: AlertMuteRecord = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
+  saveFindingMute(input: Omit<FindingMuteRecord, 'id' | 'createdAt'>): FindingMuteRecord {
+    const row: FindingMuteRecord = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
     this.database.prepare(`
-      INSERT INTO alert_mutes (id, kind, account_id, label, expires_at, created_at)
+      INSERT INTO finding_mutes (id, kind, account_id, label, expires_at, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(row.id, row.kind, row.accountId, row.label, row.expiresAt, row.createdAt);
     return row;
   }
 
-  removeAlertMute(id: string): boolean {
-    const result = this.database.prepare('DELETE FROM alert_mutes WHERE id = ?').run(id);
+  removeFindingMute(id: string): boolean {
+    const result = this.database.prepare('DELETE FROM finding_mutes WHERE id = ?').run(id);
+    return result.changes > 0;
+  }
+
+  listFacts(): FactRecord[] {
+    const rows = this.database.prepare(`
+      SELECT key, value, source, confidence, refresh_after, updated_at
+      FROM facts
+      ORDER BY key
+    `).all() as FactRow[];
+    return rows.map(mapFact);
+  }
+
+  getFact(key: string): FactRecord | null {
+    const row = this.database.prepare(`
+      SELECT key, value, source, confidence, refresh_after, updated_at
+      FROM facts WHERE key = ?
+    `).get(key) as FactRow | undefined;
+    return row ? mapFact(row) : null;
+  }
+
+  upsertFact(input: Omit<FactRecord, 'updatedAt'>): FactRecord {
+    const now = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO facts (key, value, source, confidence, refresh_after, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        source = excluded.source,
+        confidence = excluded.confidence,
+        refresh_after = excluded.refresh_after,
+        updated_at = excluded.updated_at
+    `).run(input.key, input.value, input.source, input.confidence, input.refreshAfter, now);
+    return { ...input, updatedAt: now };
+  }
+
+  removeFact(key: string): boolean {
+    const result = this.database.prepare('DELETE FROM facts WHERE key = ?').run(key);
+    return result.changes > 0;
+  }
+
+  listQuestions(status?: QuestionRecord['status']): QuestionRecord[] {
+    const rows = status
+      ? this.database.prepare(`
+          SELECT id, fact_key, prompt, rule_kind, unlock_impact_minor, currency, suggested_value, status, created_at, updated_at
+          FROM questions WHERE status = ?
+          ORDER BY unlock_impact_minor DESC, created_at DESC
+        `).all(status) as QuestionRow[]
+      : this.database.prepare(`
+          SELECT id, fact_key, prompt, rule_kind, unlock_impact_minor, currency, suggested_value, status, created_at, updated_at
+          FROM questions
+          ORDER BY unlock_impact_minor DESC, created_at DESC
+        `).all() as QuestionRow[];
+    return rows.map(mapQuestion);
+  }
+
+  // Questions are keyed by fact_key so re-evaluation refreshes the impact estimate
+  // and suggested value in place rather than piling up duplicates.
+  upsertQuestion(input: Omit<QuestionRecord, 'id' | 'createdAt' | 'updatedAt'>): QuestionRecord {
+    const now = new Date().toISOString();
+    const existing = this.database.prepare('SELECT id, created_at FROM questions WHERE fact_key = ?').get(input.factKey) as
+      | { id: string; created_at: string }
+      | undefined;
+    const id = existing?.id ?? randomUUID();
+    const createdAt = existing?.created_at ?? now;
+    this.database.prepare(`
+      INSERT INTO questions (id, fact_key, prompt, rule_kind, unlock_impact_minor, currency, suggested_value, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(fact_key) DO UPDATE SET
+        prompt = excluded.prompt,
+        rule_kind = excluded.rule_kind,
+        unlock_impact_minor = excluded.unlock_impact_minor,
+        currency = excluded.currency,
+        suggested_value = excluded.suggested_value,
+        updated_at = excluded.updated_at
+    `).run(id, input.factKey, input.prompt, input.ruleKind, input.unlockImpactMinor, input.currency, input.suggestedValue, input.status, createdAt, now);
+    return { ...input, id, createdAt, updatedAt: now };
+  }
+
+  updateQuestionStatus(id: string, status: QuestionRecord['status']): boolean {
+    const result = this.database.prepare(`
+      UPDATE questions SET status = ?, updated_at = ? WHERE id = ?
+    `).run(status, new Date().toISOString(), id);
     return result.changes > 0;
   }
 
@@ -969,6 +1134,8 @@ export class SqliteFinanceRepository implements FinanceRepository {
       { version: 1, up: () => this.applyInitialSchema() },
       { version: 2, up: () => this.applyAgentMemorySchema() },
       { version: 3, up: () => this.applyChatSessionsSchema() },
+      { version: 4, up: () => this.applyRulesEngineReset() },
+      { version: 5, up: () => this.addRuleScheduledDay() },
     ];
 
     // Before mutating an existing user's data, snapshot it. This only runs when
@@ -1202,30 +1369,7 @@ export class SqliteFinanceRepository implements FinanceRepository {
         UNIQUE (content_hash)
       );
 
-      CREATE TABLE IF NOT EXISTS alert_rules (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        source_text TEXT NOT NULL,
-        scope TEXT NOT NULL DEFAULT 'banking',
-        cadence TEXT NOT NULL DEFAULT 'event',
-        channel TEXT NOT NULL DEFAULT 'auto',
-        scheduled_hour INTEGER CHECK (scheduled_hour IS NULL OR (scheduled_hour >= 0 AND scheduled_hour <= 23)),
-        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS alert_rules_enabled_idx
-        ON alert_rules(enabled);
-
-      CREATE TABLE IF NOT EXISTS alert_mutes (
-        id TEXT PRIMARY KEY,
-        kind TEXT,
-        account_id TEXT,
-        label TEXT,
-        expires_at TEXT,
-        created_at TEXT NOT NULL
-      );
+      ${RULES_ENGINE_SCHEMA}
 
       INSERT OR IGNORE INTO app_settings(key, value, updated_at)
       VALUES
@@ -1234,6 +1378,28 @@ export class SqliteFinanceRepository implements FinanceRepository {
         ('LLM_MODEL', 'qwen2.5-3b-instruct', datetime('now')),
         ('LLM_CHAT_MODEL', 'qwen2.5-3b-instruct', datetime('now'));
     `);
+  }
+
+  // Migration v4 resets the rules subsystem to the engine schema. Old rule and
+  // mute rows are intentionally dropped; there is no external contract to
+  // preserve, and the backup-before-migrate step protects everything else. Fresh
+  // installs get the same tables from applyInitialSchema, so this is a no-op there.
+  private applyRulesEngineReset(): void {
+    this.database.exec(`
+      DROP TABLE IF EXISTS alert_rules;
+      DROP TABLE IF EXISTS alert_mutes;
+      ${RULES_ENGINE_SCHEMA}
+    `);
+  }
+
+  // Migration v5 adds the schedule day column for weekly/monthly rules. Guarded
+  // because fresh installs already get the column from the v1/v4 baseline, so the
+  // ALTER only runs on databases that applied v4 before the column existed.
+  private addRuleScheduledDay(): void {
+    const columns = this.database.prepare('PRAGMA table_info(rules)').all() as { name: string }[];
+    if (!columns.some((column) => column.name === 'scheduled_day')) {
+      this.database.exec('ALTER TABLE rules ADD COLUMN scheduled_day INTEGER');
+    }
   }
 
   private applyChatSessionsSchema(): void {
@@ -1668,22 +1834,26 @@ function mapAppSetting(row: AppSettingRow): AppSettingPreview {
   };
 }
 
-function mapAlertRule(row: AlertRuleRow): AlertRuleRecord {
+function mapRule(row: RuleRow): RuleRecord {
   return {
     id: row.id,
     kind: row.kind,
+    domain: row.domain as RuleRecord['domain'],
     sourceText: row.source_text,
+    executionClass: row.execution_class as RuleRecord['executionClass'],
+    actionTier: row.action_tier as RuleRecord['actionTier'],
     scope: row.scope,
     cadence: row.cadence,
     channel: row.channel,
     scheduledHour: typeof row.scheduled_hour === 'number' ? row.scheduled_hour : null,
+    scheduledDay: typeof row.scheduled_day === 'number' ? row.scheduled_day : null,
     enabled: row.enabled === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
-function mapAlertMute(row: AlertMuteRow): AlertMuteRecord {
+function mapFindingMute(row: FindingMuteRow): FindingMuteRecord {
   return {
     id: row.id,
     kind: row.kind,
@@ -1691,6 +1861,32 @@ function mapAlertMute(row: AlertMuteRow): AlertMuteRecord {
     label: row.label,
     expiresAt: row.expires_at,
     createdAt: row.created_at,
+  };
+}
+
+function mapFact(row: FactRow): FactRecord {
+  return {
+    key: row.key,
+    value: row.value,
+    source: row.source as FactRecord['source'],
+    confidence: row.confidence,
+    refreshAfter: row.refresh_after,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapQuestion(row: QuestionRow): QuestionRecord {
+  return {
+    id: row.id,
+    factKey: row.fact_key,
+    prompt: row.prompt,
+    ruleKind: row.rule_kind,
+    unlockImpactMinor: Number(row.unlock_impact_minor),
+    currency: row.currency,
+    suggestedValue: row.suggested_value,
+    status: row.status as QuestionRecord['status'],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 

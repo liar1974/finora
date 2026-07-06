@@ -3,8 +3,6 @@ import type {
   AccountBalance,
   AgentEventRecord,
   AgentEventType,
-  AlertMuteRecord,
-  AlertRuleRecord,
   AppSettingPreview,
   BrokerageHolding,
   BrokerageSummary,
@@ -12,10 +10,14 @@ import type {
   ChatSessionRecord,
   CreditReportRecord,
   DashboardRecord,
+  FactRecord,
+  FindingMuteRecord,
   ImportRecord,
   MoneySummary,
   Page,
   ProviderConnection,
+  QuestionRecord,
+  RuleRecord,
   Transaction,
   TransactionInput,
 } from '../domain/models.js';
@@ -149,13 +151,20 @@ export interface FinanceRepository {
   listAppSettings(keys?: string[]): AppSettingPreview[];
   getAppSetting(key: string): string | null;
   saveAppSettings(entries: Record<string, string>): void;
-  listAlertRules(): AlertRuleRecord[];
-  saveAlertRule(input: Omit<AlertRuleRecord, 'id' | 'createdAt' | 'updatedAt'>): AlertRuleRecord;
-  toggleAlertRule(id: string, enabled: boolean): AlertRuleRecord | null;
-  removeAlertRule(id: string): boolean;
-  listAlertMutes(): AlertMuteRecord[];
-  saveAlertMute(input: Omit<AlertMuteRecord, 'id' | 'createdAt'>): AlertMuteRecord;
-  removeAlertMute(id: string): boolean;
+  listRules(): RuleRecord[];
+  saveRule(input: Omit<RuleRecord, 'id' | 'createdAt' | 'updatedAt'>): RuleRecord;
+  toggleRule(id: string, enabled: boolean): RuleRecord | null;
+  removeRule(id: string): boolean;
+  listFindingMutes(): FindingMuteRecord[];
+  saveFindingMute(input: Omit<FindingMuteRecord, 'id' | 'createdAt'>): FindingMuteRecord;
+  removeFindingMute(id: string): boolean;
+  listFacts(): FactRecord[];
+  getFact(key: string): FactRecord | null;
+  upsertFact(input: Omit<FactRecord, 'updatedAt'>): FactRecord;
+  removeFact(key: string): boolean;
+  listQuestions(status?: QuestionRecord['status']): QuestionRecord[];
+  upsertQuestion(input: Omit<QuestionRecord, 'id' | 'createdAt' | 'updatedAt'>): QuestionRecord;
+  updateQuestionStatus(id: string, status: QuestionRecord['status']): boolean;
   findImport(accountId: string, contentHash: string): ImportRecord | null;
   saveImport(input: SaveImportInput): ImportRecord;
   reconcileProviderTransactions(transactions: ProviderTransactionInput[]): { inserted: number; updated: number; skipped: number };

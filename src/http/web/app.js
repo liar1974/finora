@@ -194,31 +194,47 @@ const bankTabs = [['summary', 'Summary'], ['transactions', 'Transactions'], ['ca
 const brokerageTabs = [['summary', 'Summary'], ['transactions', 'Transactions']];
 const settingsTabs = [['models', 'Models'], ['accounts', 'Bank/Brokerage'], ['delivery', 'Delivery'], ['insights', 'Rules & Insights']];
 const creditTabs = [['latest', 'Latest report overview'], ['reports', 'Reports']];
+// [name, cadence, scope, executionClass, scheduledHour, detail, domain]. The
+// domain follows the rules taxonomy in docs/rules-design.md and drives the
+// grouped Rules UI. Rows backed by a live evaluator carry their real D class;
+// aspirational rows keep their intended L / L+ class until wired.
 const sampleInsightRules = [
-  ['Connection health', 'event', 'all', 'D', null, 'Create an insight when a Plaid connection is not active, a token is missing, or the Plaid cursor is missing.'],
-  ['Idle cash scan', 'weekly', 'banking', 'L', 9, 'Find cash balances above the local threshold and generate a short review note from the account evidence.'],
-  ['Low balance risk', 'daily', 'banking', 'D', 9, 'Flag checking or savings balances that fall below the local safety threshold.'],
-  ['Negative balance', 'event', 'banking', 'D', null, 'Notify immediately when an account balance is negative or an overdraft-like transaction posts.'],
-  ['New large transaction', 'event', 'banking', 'L', null, 'Notify when any posted outflow exceeds $500 or 3x the account median outflow.'],
-  ['Duplicate or unusual charge', 'event', 'banking', 'L+', null, 'Prefilter similar merchant charges, then ask the local model to accept or reject the duplicate signal.'],
-  ['Subscription drift', 'weekly', 'banking', 'L', 9, 'Flag recurring merchants whose amount increased by more than 15% from the prior charge.'],
-  ['Trial conversion watch', 'daily', 'banking', 'L+', 9, 'Detect trial-like merchants and ask the local model whether the charge looks like a conversion.'],
-  ['Discretionary spending review', 'weekly', 'banking', 'L', 9, 'Summarize dining, shopping, entertainment, and travel spend that moved materially from baseline.'],
-  ['Cash runway', 'monthly', 'banking', 'L', 9, 'Estimate months of cash runway from latest cash balance and average monthly outflows.'],
-  ['Expected income late', 'event', 'banking', 'L+', null, 'Prefilter missed income cadence and generate a review item when expected payroll or deposits are absent.'],
-  ['Fee and interest watch', 'event', 'banking', 'D', null, 'Flag bank fees, credit card interest, and cash advance charges as they post.'],
-  ['Credit utilization', 'daily', 'credit', 'D', 9, 'Notify when credit card balance exceeds 30% or 70% of known limit.'],
-  ['Credit report review', 'monthly', 'credit', 'L+', 9, 'Review new bureau report changes, hard inquiries, derogatory lines, and dispute candidates.'],
-  ['Credit payment due', 'weekly', 'credit', 'L', 9, 'Surface card balances and payment timing when due-date evidence is available.'],
-  ['Brokerage cash drag', 'weekly', 'brokerage', 'L', 9, 'Flag brokerage cash above 25% of portfolio value unless muted.'],
-  ['Portfolio concentration', 'weekly', 'brokerage', 'L', 9, 'Flag any single holding above 20% of tracked holdings value.'],
-  ['Single name net-worth exposure', 'weekly', 'all', 'L+', 9, 'Combine holdings and balances to review outsized exposure to one symbol or company.'],
-  ['Allocation drift', 'monthly', 'brokerage', 'L', 9, 'Compare current holdings mix with the saved target allocation when available.'],
-  ['Executed order review', 'event', 'brokerage', 'L', null, 'Summarize buy, sell, dividend reinvestment, and option-like brokerage activity.'],
-  ['Dividend or interest received', 'event', 'brokerage', 'L', null, 'Notify on income-like brokerage transactions with symbol and account context.'],
-  ['Weekly financial health check', 'weekly', 'all', 'L', 9, 'Generate a concise digest of balances, spending, investments, and connection health.'],
-  ['Net worth movement', 'monthly', 'all', 'L', 9, 'Compare latest balances with the prior month and explain the largest movers.'],
-  ['Stale local imports', 'weekly', 'all', 'D', 9, 'Flag accounts that have not received a file import or provider sync recently.'],
+  ['Connection health', 'event', 'all', 'D', null, 'Create an insight when a Plaid connection is not active, a token is missing, or the Plaid cursor is missing.', 'connections'],
+  ['Stale account data', 'weekly', 'all', 'D', 9, 'Flag when the newest balance or transaction is weeks old, so stale data behind other findings is visible.', 'connections'],
+  ['Idle cash scan', 'weekly', 'banking', 'D', 9, 'Price checking/savings cash against a high-yield benchmark and surface the annual yield left on the table.', 'cash-flow'],
+  ['Low balance risk', 'daily', 'banking', 'D', 9, 'Flag checking or savings balances that fall below the local safety threshold.', 'cash-flow'],
+  ['Negative balance', 'event', 'banking', 'D', null, 'Notify immediately when a spending account is overdrawn.', 'cash-flow'],
+  ['Cash runway', 'monthly', 'banking', 'D', 9, 'Estimate months of runway from liquid cash and average monthly spending, and flag when it is short.', 'cash-flow'],
+  ['Expected income late', 'event', 'banking', 'L+', null, 'Prefilter missed income cadence and generate a review item when expected payroll or deposits are absent.', 'cash-flow'],
+  ['Weekly financial health check', 'weekly', 'all', 'L', 9, 'Generate a concise digest of balances, spending, investments, and connection health.', 'cash-flow'],
+  ['Net worth movement', 'monthly', 'all', 'L', 9, 'Compare latest balances with the prior month and explain the largest movers.', 'cash-flow'],
+  ['New large transaction', 'event', 'banking', 'D', null, 'Notify when any posted outflow exceeds $500.', 'spending'],
+  ['Duplicate or unusual charge', 'event', 'banking', 'D', null, 'Flag two matching merchant charges of the same amount within a few days.', 'spending'],
+  ['Fee and interest watch', 'event', 'banking', 'D', null, 'Total the bank fees, card interest, and surcharges paid over the last 90 days, annualized.', 'spending'],
+  ['Subscription price increase', 'weekly', 'banking', 'D', 9, 'Flag a recurring charge whose latest amount rose against its own history.', 'spending'],
+  ['Recurring subscriptions', 'monthly', 'banking', 'D', 9, 'List detected subscriptions and their annualized cost so ghost memberships are visible.', 'spending'],
+  ['New recurring charge', 'event', 'banking', 'D', null, 'Flag a subscription that only started recently — a new sign-up or a free trial that converted to paid.', 'spending'],
+  ['Spending category spike', 'weekly', 'banking', 'D', 9, 'Flag a discretionary category whose last-30-day spend is well above its 3-month average.', 'spending'],
+  ['Trial conversion watch', 'daily', 'banking', 'L+', 9, 'Detect trial-like merchants and ask the local model whether the charge looks like a conversion.', 'spending'],
+  ['Discretionary spending review', 'weekly', 'banking', 'L', 9, 'Summarize dining, shopping, entertainment, and travel spend that moved materially from baseline.', 'spending'],
+  ['Credit utilization', 'daily', 'credit', 'D', 9, 'Notify when credit card balance exceeds 30% or 70% of known limit.', 'credit'],
+  ['Credit report review', 'monthly', 'credit', 'L+', 9, 'Review new bureau report changes, hard inquiries, derogatory lines, and dispute candidates.', 'credit'],
+  ['Credit payment due', 'weekly', 'credit', 'L', 9, 'Surface card balances and payment timing when due-date evidence is available.', 'credit'],
+  ['Brokerage cash drag', 'weekly', 'brokerage', 'D', 9, 'Flag brokerage cash above 30% of portfolio value.', 'investments'],
+  ['Portfolio concentration', 'weekly', 'brokerage', 'D', 9, 'Flag any single holding above 20% of tracked holdings value.', 'investments'],
+  ['Single name net-worth exposure', 'weekly', 'all', 'L+', 9, 'Combine holdings and balances to review outsized exposure to one symbol or company.', 'investments'],
+  ['Allocation drift', 'monthly', 'brokerage', 'L', 9, 'Compare current holdings mix with the saved target allocation when available.', 'investments'],
+  ['Executed order review', 'event', 'brokerage', 'L', null, 'Summarize buy, sell, dividend reinvestment, and option-like brokerage activity.', 'investments'],
+  ['Dividend or interest received', 'event', 'brokerage', 'L', null, 'Notify on income-like brokerage transactions with symbol and account context.', 'investments'],
+];
+// The rules taxonomy from docs/rules-design.md, in display order. Used to group
+// both built-in and saved rules in the settings UI.
+const ruleDomains = [
+  ['cash-flow', 'Cash flow', 'Income timing, bill runway, idle cash, low balance.'],
+  ['spending', 'Spending', 'Large charges, duplicates, subscriptions, fees.'],
+  ['credit', 'Credit', 'Utilization, card interest, report review, payment timing.'],
+  ['investments', 'Investments', 'Cash drag, concentration, allocation, executed orders.'],
+  ['connections', 'Connections', 'Provider status, tokens, cursors, sync freshness.'],
 ];
 const builtInRulesKey = 'finora.builtInRules.v1';
 const notificationChannels = {
@@ -1417,8 +1433,8 @@ async function loadData() {
     api('/v1/settings'),
     api('/v1/llm'),
     api('/v1/rules'),
-    api('/v1/insights'),
-    api('/v1/insight-mutes'),
+    api('/v1/findings'),
+    api('/v1/finding-mutes'),
     api('/v1/credit-reports'),
   ]);
   state.accounts = accounts.items;
@@ -1901,16 +1917,27 @@ function accountCta(title, text, buttonText, onClick) {
 }
 
 function buildFeedItems() {
+  // Findings arrive ranked by score. Lead with the dollar impact when the finding
+  // carries one, since that is the ranking signal; fall back to the raw value.
   return state.insights.map((insight) => ({
     zone: insight.severity === 'high' ? 'attention' : 'insights',
     group: insightGroup(insight),
     icon: insightIcon(insight),
     title: insight.title,
     detail: insight.detail,
-    value: insight.value || insight.severity,
-    amount: 0,
+    value: findingImpactLabel(insight),
+    amount: insight.dollarImpactMinor || 0,
     id: insight.id,
   }));
+}
+
+function findingImpactLabel(finding) {
+  if (finding.dollarImpactMinor) {
+    const amount = money(finding.dollarImpactMinor, finding.currency || 'USD');
+    const confidence = typeof finding.confidence === 'number' ? ` · ${Math.round(finding.confidence * 100)}%` : '';
+    return `${amount}${confidence}`;
+  }
+  return finding.value || finding.severity;
 }
 
 function insightGroup(insight) {
@@ -3014,16 +3041,13 @@ function renderSettingsInsights(view) {
       sourceText: rule.name,
       title: rule.name,
       description: rule.detail,
+      // Built-in rules are fixed logic: they can be paused and rescheduled, but
+      // not deleted, and only cadence/hour are editable (see openBuiltInRuleModal).
       editable: true,
-      removable: true,
+      removable: false,
       toggle: () => {
         saveBuiltInRuleOverride(rule.originalName, { ...rule, enabled: !rule.enabled });
         toast(rule.enabled ? 'Rule disabled.' : 'Rule enabled.');
-        renderSettings();
-      },
-      remove: () => {
-        saveBuiltInRuleOverride(rule.originalName, { ...rule, deleted: true, enabled: false });
-        toast('Rule deleted.');
         renderSettings();
       },
     })),
@@ -3053,7 +3077,21 @@ function renderSettingsInsights(view) {
       },
     })),
   ];
-  for (const rule of rules) box.appendChild(ruleRow(rule));
+  // Group by the rules taxonomy so every rule sits under one domain heading.
+  const domainOf = (rule) => rule.domain || rule.category || 'cash-flow';
+  const grouped = new Map(ruleDomains.map(([key]) => [key, []]));
+  for (const rule of rules) {
+    const key = grouped.has(domainOf(rule)) ? domainOf(rule) : 'cash-flow';
+    grouped.get(key).push(rule);
+  }
+  for (const [key, label, blurb] of ruleDomains) {
+    const group = grouped.get(key);
+    if (!group.length) continue;
+    const header = el('div', 'rulegroup');
+    header.innerHTML = `<div class="rulegrouphdr"><h4>${esc(label)}</h4><span class="pill">${group.length}</span></div><div class="cardsub">${esc(blurb)}</div>`;
+    box.appendChild(header);
+    for (const rule of group) box.appendChild(ruleRow(rule));
+  }
   sec.appendChild(box);
   view.appendChild(sec);
 
@@ -3074,7 +3112,7 @@ function renderSettingsInsights(view) {
 function ruleRow(rule) {
   const row = el('div', `rulerow${rule.enabled ? '' : ' muted'}`);
   const copy = el('div', 'rulecopy');
-  copy.innerHTML = `<div class="nm">${esc(rule.title)}</div>${rule.description ? `<div class="sub">${esc(rule.description)}</div>` : ''}`;
+  copy.innerHTML = `<div class="nm">${esc(rule.title)}</div>${rule.description ? `<div class="sub">${esc(rule.description)}</div>` : ''}${ruleMetaTags(rule)}`;
   const actions = el('div', 'ruleactions');
   actions.appendChild(ruleToggle(rule));
   if (rule.editable) {
@@ -3099,9 +3137,71 @@ function ruleTag(kind, value) {
   return `<span class="ruletag ${esc(kind)}">${esc(value)}</span>`;
 }
 
-function ruleHourLabel(rule) {
-  if (rule.scheduledHour === null || rule.scheduledHour === undefined) return 'no fixed hour';
-  return `${String(rule.scheduledHour).padStart(2, '0')}:00`;
+const weekdayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+// Whole-hour clock label with am/pm, no minutes: 9 -> "9 AM", 0 -> "12 AM", 15 -> "3 PM".
+function formatHour12(hour) {
+  if (hour === null || hour === undefined || hour === '') return '';
+  const h = Number(hour);
+  const period = h < 12 ? 'AM' : 'PM';
+  const display = h % 12 === 0 ? 12 : h % 12;
+  return `${display} ${period}`;
+}
+
+function ordinalDay(day) {
+  const n = Number(day);
+  const rem100 = n % 100;
+  if (rem100 >= 11 && rem100 <= 13) return `${n}th`;
+  return `${n}${['th', 'st', 'nd', 'rd'][n % 10] || 'th'}`;
+}
+
+// Human schedule for a rule row. Event -> "Once triggered"; daily -> hour;
+// weekly/monthly -> day + hour when a day is set.
+function ruleScheduleLabel(rule) {
+  const hour = formatHour12(rule.scheduledHour);
+  const at = hour ? ` · ${hour}` : '';
+  const hasDay = rule.scheduledDay !== null && rule.scheduledDay !== undefined && rule.scheduledDay !== '';
+  switch (rule.cadence) {
+    case 'event': return 'Once triggered';
+    case 'hourly': return 'Hourly';
+    case 'daily': return `Daily${at}`;
+    case 'weekly': return `Weekly${hasDay ? ` · ${weekdayNames[rule.scheduledDay] || ''}` : ''}${at}`;
+    case 'monthly': return `Monthly${hasDay ? ` · ${ordinalDay(rule.scheduledDay)}` : ''}${at}`;
+    default: return rule.cadence || 'Once triggered';
+  }
+}
+
+// Rule-row chips: the human schedule, and a "custom" tag for user-created rules
+// (built-in rules are unlabeled).
+function ruleMetaTags(rule) {
+  const tags = [ruleTag('status', ruleScheduleLabel(rule))];
+  if (!rule.builtIn) tags.push(ruleTag('status', 'custom'));
+  return `<div class="ruletags">${tags.join('')}</div>`;
+}
+
+// Day options for the schedule picker: weekdays for weekly, 1..28 for monthly.
+function ruleDayOptions(cadence, selected) {
+  const sel = (value) => (String(selected ?? '') === String(value) ? ' selected' : '');
+  if (cadence === 'weekly') {
+    return weekdayNames.map((name, i) => `<option value="${i}"${sel(i)}>${name}</option>`).join('');
+  }
+  if (cadence === 'monthly') {
+    let opts = '';
+    for (let d = 1; d <= 28; d += 1) opts += `<option value="${d}"${sel(d)}>${ordinalDay(d)}</option>`;
+    return opts;
+  }
+  return '<option value="">—</option>';
+}
+
+// Rebuild the day field for the current cadence and show it only for weekly/monthly.
+function syncRuleDayField(form, selected) {
+  const field = form.querySelector('.ruleday');
+  const select = form.elements.scheduledDay;
+  if (!field || !select) return;
+  const cadence = form.elements.cadence ? form.elements.cadence.value : '';
+  const show = cadence === 'weekly' || cadence === 'monthly';
+  field.hidden = !show;
+  if (show) select.innerHTML = ruleDayOptions(cadence, selected);
 }
 
 function ruleToggle(rule) {
@@ -3131,6 +3231,7 @@ function saveBuiltInRuleOverride(originalName, patch) {
     scope: patch.scope,
     mode: patch.mode,
     scheduledHour: patch.scheduledHour ?? null,
+    scheduledDay: patch.scheduledDay ?? null,
     detail: patch.detail,
     enabled: patch.enabled,
     deleted: patch.deleted === true,
@@ -3140,7 +3241,7 @@ function saveBuiltInRuleOverride(originalName, patch) {
 
 function builtInRules() {
   const overrides = builtInRuleOverrides();
-  return sampleInsightRules.flatMap(([name, cadence, scope, mode, scheduledHour, detail]) => {
+  return sampleInsightRules.flatMap(([name, cadence, scope, mode, scheduledHour, detail, domain]) => {
     const saved = overrides[name] || {};
     if (saved.deleted === true) return [];
     return {
@@ -3150,13 +3251,48 @@ function builtInRules() {
       scope: saved.scope || scope,
       mode: saved.mode || mode,
       scheduledHour: saved.scheduledHour ?? scheduledHour,
+      // Give weekly/monthly built-ins a sensible default day (Mon / 1st) so their
+      // schedule reads fully until the user picks another.
+      scheduledDay: saved.scheduledDay ?? ((saved.cadence || cadence) === 'weekly' ? 1 : (saved.cadence || cadence) === 'monthly' ? 1 : null),
       detail: saved.detail || detail,
+      domain,
       enabled: saved.enabled !== false,
     };
   });
 }
 
+// Built-in rules have fixed logic and scope; only their schedule is editable.
+function openBuiltInRuleModal(rule) {
+  const panel = el('div');
+  panel.innerHTML = `<div class="sechdr"><h3>Edit rule</h3><button class="ghost" type="button" id="closeModal">Close</button></div>`;
+  const form = el('form', 'formgrid');
+  form.innerHTML = `<div class="rulecopy"><div class="nm">${esc(rule.name)}</div>${rule.detail ? `<div class="sub">${esc(rule.detail)}</div>` : ''}</div>
+    <div class="cardsub">Built-in rule. Its logic and scope are fixed — you can pause it or change when it runs.</div>
+    <div class="split"><label>Cadence<select name="cadence">${['event', 'hourly', 'daily', 'weekly', 'monthly'].map((c) => `<option${rule.cadence === c ? ' selected' : ''}>${c}</option>`).join('')}</select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(rule.cadence, rule.scheduledDay)}</select></label><label>Run hour<select name="scheduledHour">${ruleHourOptions(rule.scheduledHour)}</select></label></div>
+    <div class="row"><button class="primary" type="submit">Save</button><span class="message"></span></div>`;
+  panel.appendChild(form);
+  modal(panel);
+  $('#closeModal').addEventListener('click', closeModal);
+  syncRuleDayField(form, rule.scheduledDay);
+  form.elements.cadence.addEventListener('change', () => syncRuleDayField(form, rule.scheduledDay));
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(form));
+    saveBuiltInRuleOverride(rule.originalName, {
+      ...rule,
+      cadence: data.cadence || rule.cadence,
+      scheduledHour: data.scheduledHour === '' ? null : Number(data.scheduledHour),
+      scheduledDay: data.scheduledDay === '' || data.scheduledDay === undefined ? null : Number(data.scheduledDay),
+      enabled: rule.enabled !== false,
+    });
+    closeModal();
+    toast('Rule saved.');
+    renderSettings();
+  });
+}
+
 function openRuleModal(existingRule = null) {
+  if (existingRule?.builtIn) return openBuiltInRuleModal(existingRule);
   const panel = el('div');
   panel.innerHTML = `<div class="sechdr"><h3>${existingRule ? 'Edit rule' : 'Create rule'}</h3><button class="ghost" type="button" id="closeModal">Close</button></div>`;
   const form = el('form', 'formgrid generaterule');
@@ -3164,11 +3300,13 @@ function openRuleModal(existingRule = null) {
   form.innerHTML = `<label>Rule prompt<textarea name="text" required placeholder="Generate a weekly rule that flags brokerage cash above 25% and explains why it matters.">${esc(existingRule?.sourceText || '')}</textarea></label>
     <div class="row"><button class="ghost" type="button" id="previewRule">Preview</button><span class="message"></span></div>
     <div class="rulepreview" id="rulePreview"${existingRule ? '' : ' hidden'}>${existingRule ? rulePreviewMarkup(existingRule) : ''}</div>
-    <div class="deliverysettings" id="deliverySettings"${hasPreview ? '' : ' hidden'}><div class="nm">Delivery settings</div><div class="split"><label>Scope<select name="scope"><option value="">Generate</option><option${existingRule?.scope === 'banking' ? ' selected' : ''}>banking</option><option${existingRule?.scope === 'brokerage' ? ' selected' : ''}>brokerage</option><option${existingRule?.scope === 'credit' ? ' selected' : ''}>credit</option><option${existingRule?.scope === 'all' ? ' selected' : ''}>all</option></select></label><label>Cadence<select name="cadence"><option value="">Generate</option><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label></div><label>Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div>
+    <div class="deliverysettings" id="deliverySettings"${hasPreview ? '' : ' hidden'}><div class="nm">Delivery settings</div><div class="split"><label>Scope<select name="scope"><option value="">Generate</option><option${existingRule?.scope === 'banking' ? ' selected' : ''}>banking</option><option${existingRule?.scope === 'brokerage' ? ' selected' : ''}>brokerage</option><option${existingRule?.scope === 'credit' ? ' selected' : ''}>credit</option><option${existingRule?.scope === 'all' ? ' selected' : ''}>all</option></select></label><label>Cadence<select name="cadence"><option value="">Generate</option><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(existingRule?.cadence, existingRule?.scheduledDay)}</select></label></div><label>Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div>
     <div class="row"><button class="primary" type="submit" id="saveRule"${hasPreview ? '' : ' hidden disabled'}>Save rule</button></div>`;
   panel.appendChild(form);
   modal(panel);
   $('#closeModal').addEventListener('click', closeModal);
+  syncRuleDayField(form, existingRule?.scheduledDay);
+  form.elements.cadence.addEventListener('change', () => syncRuleDayField(form, existingRule?.scheduledDay));
   form.elements.text.addEventListener('input', () => {
     if (existingRule) return;
     $('#deliverySettings').hidden = true;
@@ -3210,20 +3348,6 @@ function openRuleModal(existingRule = null) {
     const submit = event.submitter;
     submit.disabled = true;
     try {
-      if (existingRule?.builtIn) {
-        saveBuiltInRuleOverride(existingRule.originalName, {
-          ...existingRule,
-          name: data.text,
-          scope: data.scope || existingRule.scope,
-          cadence: data.cadence || existingRule.cadence,
-          scheduledHour: data.scheduledHour,
-          enabled: existingRule.enabled !== false,
-        });
-        closeModal();
-        toast('Rule saved.');
-        renderSettings();
-        return;
-      }
       const savedRule = await api('/v1/rules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3261,6 +3385,7 @@ function ruleFormData(form) {
   for (const key of ['scope', 'cadence']) if (!data[key]) delete data[key];
   data.channel = 'auto';
   data.scheduledHour = data.scheduledHour === '' ? null : Number(data.scheduledHour);
+  data.scheduledDay = data.scheduledDay === '' || data.scheduledDay === undefined ? null : Number(data.scheduledDay);
   return data;
 }
 
@@ -3268,25 +3393,25 @@ function applyRulePreview(form, preview) {
   form.elements.scope.value = preview.scope;
   form.elements.cadence.value = preview.cadence;
   form.elements.scheduledHour.value = preview.scheduledHour === null || preview.scheduledHour === undefined ? '' : String(preview.scheduledHour);
+  syncRuleDayField(form, preview.scheduledDay);
 }
 
 function rulePreviewMarkup(rule) {
   const source = rule.inference?.source === 'llm' ? `LLM: ${rule.inference.model}` : 'Heuristic fallback';
   return `<div class="rulepreviewgrid">
     <div><span>Scope</span><b>${esc(rule.scope)}</b></div>
-    <div><span>Cadence</span><b>${esc(rule.cadence)}</b></div>
-    <div><span>Run hour</span><b>${esc(ruleHourLabel(rule))}</b></div>
+    <div><span>Schedule</span><b>${esc(ruleScheduleLabel(rule))}</b></div>
   </div>
-  <div class="ruletags">${ruleTag('status', rule.mode || 'rule')} ${ruleTag('status', source)}</div>
+  <div class="ruletags">${ruleTag('status', source)}</div>
   ${rule.strategy ? `<div class="sub">${esc(rule.strategy)}</div>` : ''}`;
 }
 
 function ruleHourOptions(selected) {
-  const current = selected === null || selected === undefined ? '' : String(selected);
-  const options = ['<option value="">No fixed hour</option>'];
+  const current = selected === null || selected === undefined || selected === '' ? '9' : String(selected);
+  const options = [];
   for (let hour = 0; hour < 24; hour += 1) {
     const value = String(hour);
-    options.push(`<option value="${value}"${current === value ? ' selected' : ''}>${String(hour).padStart(2, '0')}:00</option>`);
+    options.push(`<option value="${value}"${current === value ? ' selected' : ''}>${formatHour12(hour)}</option>`);
   }
   return options.join('');
 }

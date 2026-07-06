@@ -39,7 +39,9 @@ import {
   normalizeCurrency,
   requireText,
 } from '../domain/invariants.js';
-import type { Account, AccountBalance, AlertRuleRecord, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, ImportRecord, Transaction, TransactionInput } from '../domain/models.js';
+import type { Account, AccountBalance, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, Finding, ImportRecord, QuestionRecord, RuleRecord, Transaction, TransactionInput } from '../domain/models.js';
+import { evaluateRules, executionStrategy, inferRule } from './rules-engine.js';
+import type { EvaluationData, QuestionDraft } from './rules-engine.js';
 import { generateChatReply, LLM_PROVIDERS, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
 import { LocalModelEngine, ModelNotDownloadedError } from '../infrastructure/local-model.js';
 import { TelegramGateway, sendTelegramMessage } from '../infrastructure/telegram-gateway.js';
@@ -78,20 +80,6 @@ export interface ImportStatementInput {
   filename: string;
   content: Uint8Array;
   format?: string;
-}
-
-export interface InsightSignal {
-  id: string;
-  kind: string;
-  scope: string;
-  severity: 'high' | 'medium' | 'low';
-  title: string;
-  detail: string;
-  value: string;
-  source: 'rule';
-  ruleId?: string | null;
-  accountId?: string;
-  createdAt: string;
 }
 
 interface ProviderSyncResult {
@@ -1021,7 +1009,7 @@ export class FinanceService {
       return { count: 0, sent: false, reason: 'telegram-not-configured' };
     }
 
-    const insights = this.activeInsights();
+    const insights = this.activeFindings();
     const current = new Map(insights.map((insight) => [insightIdentity(insight), insight]));
     const previous = parseStringArray(this.repository.getAppSetting('TELEGRAM_ACTIVE_ALERT_KEYS'));
     const fresh = [...current].filter(([key]) => !previous.has(key)).map(([, insight]) => insight);
@@ -1056,73 +1044,108 @@ export class FinanceService {
     }
   }
 
-  listInsights() {
-    return this.activeInsights();
-  }
-
-  listAlertRules() {
-    return this.repository.listAlertRules();
+  listFindings() {
+    return this.activeFindings();
   }
 
   listRules() {
-    return this.listAlertRules();
+    return this.repository.listRules();
   }
 
-  async previewRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
+  async previewRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
     const heuristic = inferRule(text, input.scope, input.cadence);
-    const modelInferred = await this.inferRuleWithModel(text, heuristic);
-    const inferred = {
-      ...modelInferred,
-      scope: normalizeChoice(input.scope || modelInferred.scope, ['banking', 'brokerage', 'credit', 'all'], modelInferred.scope),
-      cadence: normalizeChoice(input.cadence || modelInferred.cadence, ['event', 'hourly', 'daily', 'weekly', 'monthly'], modelInferred.cadence),
-      channel: 'auto',
-    };
+    const refined = await this.inferRuleWithModel(text, heuristic);
+    const inferred = { ...heuristic, scope: refined.scope, cadence: refined.cadence };
     const scheduledHour = input.scheduledHour ?? suggestedRuleHour(inferred.cadence);
     return {
       text,
       ...inferred,
       scheduledHour,
-      mode: ruleExecutionMode(inferred.kind),
-      strategy: ruleExecutionStrategy(inferred.kind),
-      inference: inferred.inference,
+      scheduledDay: input.scheduledDay ?? null,
+      executionClass: inferred.executionClass,
+      strategy: executionStrategy(inferred.executionClass),
+      inference: refined.inference,
     };
   }
 
-  createRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined }) {
+  createRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
     const inferred = inferRule(text, input.scope, input.cadence);
-    return this.repository.saveAlertRule({
+    return this.repository.saveRule({
       kind: inferred.kind,
+      domain: inferred.domain,
       sourceText: text,
+      executionClass: inferred.executionClass,
+      actionTier: inferred.actionTier,
       scope: inferred.scope,
       cadence: inferred.cadence,
       channel: inferred.channel,
       scheduledHour: input.scheduledHour ?? null,
+      scheduledDay: input.scheduledDay ?? null,
       enabled: true,
     });
   }
 
   toggleRule(id: string, enabled: boolean) {
-    const rule = this.repository.toggleAlertRule(id, enabled);
+    const rule = this.repository.toggleRule(id, enabled);
     if (!rule) throw new AppError('not_found', 'Rule not found', { id });
     return rule;
   }
 
   removeRule(id: string) {
-    return { removed: this.repository.removeAlertRule(id) };
+    return { removed: this.repository.removeRule(id) };
   }
 
-  listInsightMutes() {
-    return this.repository.listAlertMutes();
+  // --- Facts and questions --------------------------------------------------
+  // Facts are values the user knows but the account stream does not expose. A
+  // rule blocked on a missing required fact produces a ranked question instead of
+  // failing; answering it unlocks the rule. See docs/rules-design.md.
+
+  listQuestions() {
+    this.refreshQuestions();
+    return this.repository.listQuestions('pending');
   }
 
-  createInsightMute(input: { kind?: string | null | undefined; accountId?: string | null | undefined; label?: string | null | undefined; days?: number | null | undefined }) {
+  listFacts() {
+    return this.repository.listFacts();
+  }
+
+  saveFact(input: { key: string; value: string; source?: 'user' | 'derived' | 'reference' | undefined; refreshAfter?: string | null | undefined }) {
+    const key = requireText(input.key, 'key');
+    const value = requireText(input.value, 'value');
+    const source = input.source ?? 'user';
+    const fact = this.repository.upsertFact({
+      key,
+      value,
+      source,
+      // User-entered facts carry lower confidence than stream-derived ones; that
+      // difference propagates into finding confidence and caps the action tier.
+      confidence: source === 'user' ? 0.7 : source === 'derived' ? 0.9 : 0.95,
+      refreshAfter: input.refreshAfter ?? null,
+    });
+    this.refreshQuestions();
+    return fact;
+  }
+
+  removeFact(key: string) {
+    return { removed: this.repository.removeFact(key) };
+  }
+
+  dismissQuestion(id: string) {
+    return { dismissed: this.repository.updateQuestionStatus(id, 'dismissed') };
+  }
+
+  listFindingMutes() {
+    return this.repository.listFindingMutes();
+  }
+
+  createFindingMute(input: { kind?: string | null | undefined; accountId?: string | null | undefined; label?: string | null | undefined; days?: number | null | undefined }) {
     const days = Number(input.days || 0);
     const expiresAt = Number.isFinite(days) && days > 0
       ? new Date(Date.now() + Math.round(days) * 86_400_000).toISOString()
       : null;
-    return this.repository.saveAlertMute({
+    return this.repository.saveFindingMute({
       kind: input.kind || null,
       accountId: input.accountId || null,
       label: input.label || null,
@@ -1130,8 +1153,8 @@ export class FinanceService {
     });
   }
 
-  removeInsightMute(id: string) {
-    return { removed: this.repository.removeAlertMute(id) };
+  removeFindingMute(id: string) {
+    return { removed: this.repository.removeFindingMute(id) };
   }
 
   // --- Agent memory ---------------------------------------------------------
@@ -1765,7 +1788,7 @@ export class FinanceService {
     const holdings = this.repository.listBrokerageHoldings().slice(0, 20);
     const balances = this.repository.listAccountBalances();
     const latestBalances = latestByAccount(balances);
-    const insights = this.localInsights();
+    const insights = this.activeFindings();
     return {
       section: section || 'unknown',
       accountCounts: {
@@ -1809,274 +1832,61 @@ export class FinanceService {
     };
   }
 
-  private localInsights(): InsightSignal[] {
-    const insights: InsightSignal[] = [];
-    const accounts = this.repository.listAccounts();
-    const connections = this.repository.listProviderConnections();
-    for (const connection of connections) {
-      if (connection.status !== 'active' || !connection.hasAccessToken) {
-        insights.push({
-          id: `connection:${connection.provider}:${connection.externalId}`,
-          kind: 'connection_health',
-          scope: connection.provider,
-          severity: 'high',
-          title: `${connection.institution || connection.provider} connection needs review`,
-          detail: `Status ${connection.status}; token saved: ${connection.hasAccessToken ? 'yes' : 'no'}.`,
-          value: 'Review',
-          source: 'rule',
-          ruleId: null,
-          createdAt: connection.updatedAt,
-        });
-      }
-    }
-    const balances = latestByAccount(this.repository.listAccountBalances());
-    for (const balance of balances) {
-      if (balance.currentMinor > 0 && balance.cashMinor !== null && balance.cashMinor / balance.currentMinor >= 0.3) {
-        const accountName = accounts.find((account) => account.id === balance.accountId)?.name || 'Brokerage';
-        insights.push({
-          id: `brokerage_cash_drag:${balance.accountId}:${balance.asOfDate}`,
-          kind: 'brokerage_cash_drag',
-          scope: 'brokerage',
-          severity: 'low',
-          title: `${accountName} cash drag`,
-          detail: `${formatMinorAmount(balance.cashMinor, balance.currency)} cash on ${formatMinorAmount(balance.currentMinor, balance.currency)} current value.`,
-          value: `${Math.round((balance.cashMinor / balance.currentMinor) * 100)}%`,
-          source: 'rule',
-          ruleId: null,
-          accountId: balance.accountId,
-          createdAt: balance.createdAt,
-        });
-      }
-    }
-    const holdings = this.repository.listBrokerageHoldings();
-    const total = holdings.reduce((sum, holding) => sum + holding.valueMinor, 0);
-    const largest = holdings.slice().sort((a, b) => b.valueMinor - a.valueMinor)[0];
-    if (largest && total > 0 && largest.valueMinor / total >= 0.2) {
-      insights.push({
-        id: `portfolio_concentration:${largest.id}`,
-        kind: 'portfolio_concentration',
-        scope: 'brokerage',
-        severity: 'medium',
-        title: `${largest.symbol || largest.name || 'Top holding'} concentration`,
-        detail: `${formatMinorAmount(largest.valueMinor, largest.currency)} of ${formatMinorAmount(total, largest.currency)} tracked holdings.`,
-        value: `${Math.round((largest.valueMinor / total) * 100)}%`,
-        source: 'rule',
-        ruleId: null,
-        accountId: largest.accountId,
-        createdAt: largest.createdAt,
-      });
-    }
-    insights.push(...this.ruleDrivenInsights(accounts, balances));
-    return insights;
-  }
-
-  private ruleDrivenInsights(accounts: Account[], balances: AccountBalance[]): InsightSignal[] {
-    const insights: InsightSignal[] = [];
-    const rules = this.repository.listAlertRules().filter((rule) => rule.enabled);
-    for (const rule of rules) {
-      if (rule.kind === 'rule_spending_watch') {
-        if (ruleWatchesCreditCardTransactions(rule)) {
-          insights.push(...this.creditCardTransactionInsights(rule, accounts));
-        }
-        if (ruleWatchesBrokerageTransactions(rule)) {
-          insights.push(...this.brokerageTransactionInsights(rule, accounts));
-        }
-        insights.push(...this.largeTransactionInsights(rule, accounts));
-        continue;
-      }
-      if (rule.kind === 'rule_idle_brokerage_cash' || rule.kind === 'rule_idle_cash') {
-        insights.push(...this.idleCashInsights(rule, accounts, balances));
-        continue;
-      }
-      if (rule.kind === 'rule_portfolio_watch') {
-        insights.push(...this.portfolioInsights(rule, accounts));
-        continue;
-      }
-      if (rule.kind === 'rule_credit_utilization') {
-        insights.push(...this.creditUtilizationInsights(rule, accounts, balances));
-        continue;
-      }
-      if (rule.kind === 'rule_connection_health') {
-        insights.push(...this.connectionInsights(rule));
-        continue;
-      }
-      if (rule.kind === 'rule_local_watch') {
-        insights.push(...this.localWatchInsights(rule, accounts, balances));
-      }
-    }
-    return insights;
-  }
-
-  private creditCardTransactionInsights(rule: AlertRuleRecord, accounts: Account[]): InsightSignal[] {
-    const accountById = new Map(accounts.map((account) => [account.id, account]));
-    return this.repository.listTransactions({ limit: 100 }).items
-      .filter((transaction) => transaction.createdAt >= rule.createdAt)
-      .filter((transaction) => isCreditAccount(accountById.get(transaction.accountId)))
-      .slice(0, 20)
-      .map((transaction) => transactionInsight(rule, transaction, accountById.get(transaction.accountId), 'credit card'));
-  }
-
-  private brokerageTransactionInsights(rule: AlertRuleRecord, accounts: Account[]): InsightSignal[] {
-    const accountById = new Map(accounts.map((account) => [account.id, account]));
-    return this.repository.listBrokerageTransactions({ limit: 100 }).items
-      .filter((transaction) => transaction.createdAt >= rule.createdAt)
-      .slice(0, 20)
-      .map((transaction) => transactionInsight(rule, transaction, accountById.get(transaction.accountId), 'brokerage'));
-  }
-
-  private largeTransactionInsights(rule: AlertRuleRecord, accounts: Account[]): InsightSignal[] {
-    const accountById = new Map(accounts.map((account) => [account.id, account]));
-    return this.repository.listTransactions({ limit: 100 }).items
-      .filter((transaction) => transaction.createdAt >= rule.createdAt)
-      .filter((transaction) => transaction.amountMinor < 0 && Math.abs(transaction.amountMinor) >= 50000)
-      .slice(0, 20)
-      .map((transaction) => transactionInsight(rule, transaction, accountById.get(transaction.accountId), 'large'));
-  }
-
-  private idleCashInsights(rule: AlertRuleRecord, accounts: Account[], balances: AccountBalance[]): InsightSignal[] {
-    const latest = latestByAccount(balances);
-    const threshold = rule.kind === 'rule_idle_brokerage_cash' ? 0.25 : 0.3;
-    return latest
-      .filter((balance) => {
-        const acct = accounts.find((account) => account.id === balance.accountId);
-        const isBrokerage = acct?.domain === 'brokerage';
-        const cashMinor = isBrokerage ? balance.cashMinor : balance.availableMinor ?? balance.currentMinor;
-        if (cashMinor === null || cashMinor === undefined || balance.currentMinor <= 0) return false;
-        if (rule.kind === 'rule_idle_brokerage_cash' && !isBrokerage) return false;
-        if (rule.kind === 'rule_idle_cash' && isBrokerage) return false;
-        return cashMinor / balance.currentMinor >= threshold;
-      })
-      .map((balance) => {
-        const acct = accounts.find((account) => account.id === balance.accountId);
-        const cashMinor = acct?.domain === 'brokerage' ? balance.cashMinor ?? 0 : balance.availableMinor ?? balance.currentMinor;
-        return {
-          id: `${rule.kind}:${rule.id}:${balance.accountId}:${balance.asOfDate}`,
-          kind: `${rule.kind}:${rule.id}:${balance.accountId}`,
-          scope: rule.scope,
-          severity: 'low' as const,
-          title: `${acct?.name || 'Account'} has idle cash`,
-          detail: `${formatMinorAmount(cashMinor, balance.currency)} available against ${formatMinorAmount(balance.currentMinor, balance.currency)} current balance.`,
-          value: `${Math.round((cashMinor / balance.currentMinor) * 100)}%`,
-          source: 'rule' as const,
-          ruleId: rule.id,
-          accountId: balance.accountId,
-          createdAt: balance.createdAt,
-        };
-      });
-  }
-
-  private portfolioInsights(rule: AlertRuleRecord, accounts: Account[]): InsightSignal[] {
-    const holdings = this.repository.listBrokerageHoldings();
-    const total = holdings.reduce((sum, holding) => sum + holding.valueMinor, 0);
-    const largest = holdings.slice().sort((a, b) => b.valueMinor - a.valueMinor)[0];
-    if (!largest || total <= 0 || largest.valueMinor / total < 0.2) return [];
-    const accountName = accounts.find((account) => account.id === largest.accountId)?.name || 'Brokerage';
-    return [{
-      id: `${rule.kind}:${rule.id}:${largest.id}`,
-      kind: `${rule.kind}:${rule.id}:${largest.id}`,
-      scope: rule.scope,
-      severity: 'medium',
-      title: `${largest.symbol || largest.name || 'Top holding'} concentration`,
-      detail: `${accountName} holds ${formatMinorAmount(largest.valueMinor, largest.currency)} of ${formatMinorAmount(total, largest.currency)} tracked holdings.`,
-      value: `${Math.round((largest.valueMinor / total) * 100)}%`,
-      source: 'rule',
-      ruleId: rule.id,
-      accountId: largest.accountId,
-      createdAt: largest.createdAt,
-    }];
-  }
-
-  private creditUtilizationInsights(rule: AlertRuleRecord, accounts: Account[], balances: AccountBalance[]): InsightSignal[] {
-    const accountById = new Map(accounts.map((account) => [account.id, account]));
-    return latestByAccount(balances)
-      .filter((balance) => isCreditAccount(accountById.get(balance.accountId)) && Boolean(balance.limitMinor) && balance.currentMinor > 0)
-      .filter((balance) => balance.limitMinor !== null && balance.currentMinor / balance.limitMinor >= 0.3)
-      .map((balance) => {
-        const acct = accountById.get(balance.accountId);
-        const ratio = balance.limitMinor ? balance.currentMinor / balance.limitMinor : 0;
-        return {
-          id: `${rule.kind}:${rule.id}:${balance.accountId}:${balance.asOfDate}`,
-          kind: `${rule.kind}:${rule.id}:${balance.accountId}`,
-          scope: rule.scope,
-          severity: ratio >= 0.7 ? 'high' as const : 'medium' as const,
-          title: `${acct?.name || 'Credit account'} utilization is elevated`,
-          detail: `${formatMinorAmount(balance.currentMinor, balance.currency)} balance on ${formatMinorAmount(balance.limitMinor || 0, balance.currency)} limit.`,
-          value: `${Math.round(ratio * 100)}%`,
-          source: 'rule' as const,
-          ruleId: rule.id,
-          accountId: balance.accountId,
-          createdAt: balance.createdAt,
-        };
-      });
-  }
-
-  private connectionInsights(rule: AlertRuleRecord): InsightSignal[] {
-    return this.repository.listProviderConnections()
-      .filter((connection) => connection.status !== 'active' || !connection.hasAccessToken || (connection.provider === 'plaid' && !connection.hasCursor))
-      .map((connection) => ({
-        id: `${rule.kind}:${rule.id}:${connection.provider}:${connection.externalId}`,
-        kind: `${rule.kind}:${rule.id}:${connection.provider}:${connection.externalId}`,
-        scope: rule.scope,
-        severity: 'high' as const,
-        title: `${connection.institution || connection.provider} connection needs review`,
-        detail: `Status ${connection.status}; token saved: ${connection.hasAccessToken ? 'yes' : 'no'}; cursor saved: ${connection.hasCursor ? 'yes' : 'no'}.`,
-        value: 'Review',
-        source: 'rule' as const,
-        ruleId: rule.id,
-        createdAt: connection.updatedAt,
-      }));
-  }
-
-  private localWatchInsights(rule: AlertRuleRecord, accounts: Account[], balances: AccountBalance[]): InsightSignal[] {
-    return [
-      ...this.idleCashInsights(rule, accounts, balances),
-      ...this.connectionInsights(rule),
-      ...this.portfolioInsights(rule, accounts),
-    ].slice(0, 20);
-  }
-
-  private activeInsights(): InsightSignal[] {
+  // Assemble the data the engine reads, evaluate rules, apply mutes, and return
+  // findings already ranked by score. The engine is the only place rule logic
+  // lives; see docs/rules-design.md.
+  private activeFindings(): Finding[] {
+    const { findings } = evaluateRules(this.repository.listRules(), this.buildEvaluationData());
     const now = Date.now();
-    const mutes = this.repository.listAlertMutes().filter((mute) => {
+    const mutes = this.repository.listFindingMutes().filter((mute) => {
       if (!mute.expiresAt) return true;
       const expires = new Date(mute.expiresAt).getTime();
       return Number.isFinite(expires) && expires > now;
     });
-    return this.localInsights().filter((insight) => !mutes.some((mute) =>
-      (!mute.kind || mute.kind === insight.kind) &&
-      (!mute.accountId || mute.accountId === insight.accountId)
+    return findings.filter((finding) => !mutes.some((mute) =>
+      (!mute.kind || mute.kind === finding.kind) &&
+      (!mute.accountId || mute.accountId === finding.accountId)
     ));
   }
 
-}
+  private buildEvaluationData(): EvaluationData {
+    return {
+      accounts: this.repository.listAccounts(),
+      balances: latestByAccount(this.repository.listAccountBalances()),
+      transactions: this.repository.listTransactions({ limit: 200 }).items,
+      brokerageTransactions: this.repository.listBrokerageTransactions({ limit: 100 }).items,
+      holdings: this.repository.listBrokerageHoldings(),
+      connections: this.repository.listProviderConnections(),
+      facts: new Map(this.repository.listFacts().map((fact) => [fact.key, fact])),
+      nowMs: Date.now(),
+    };
+  }
 
-function inferRule(text: string, scope?: string, cadence?: string) {
-  const lower = text.toLowerCase();
-  const inferredScope = scope || (
-    /brokerage|portfolio|holding|stock|etf|dividend|cash drag|order|trade|allocation|投资|持仓/.test(lower) ? 'brokerage'
-      : /credit|card|utilization|score|信用|卡/.test(lower) ? 'credit'
-        : /net[ -]?worth|balance sheet|asset|liability/.test(lower) ? 'all'
-          : 'banking'
-  );
-  const inferredCadence = cadence || (
-    /monthly|month|每月/.test(lower) ? 'monthly'
-      : /weekly|week|每周/.test(lower) ? 'weekly'
-        : /daily|day|每天|每日/.test(lower) ? 'daily'
-          : /hourly|hour|每小时/.test(lower) ? 'hourly'
-          : 'event'
-  );
-  let kind = 'rule_local_watch';
-  if (/cash|现金|idle/.test(lower)) kind = inferredScope === 'brokerage' ? 'rule_idle_brokerage_cash' : 'rule_idle_cash';
-  else if (/duplicate|unusual|merchant|spend|charge|transaction|消费|支出/.test(lower)) kind = 'rule_spending_watch';
-  else if (/portfolio|concentration|holding|持仓|集中/.test(lower)) kind = 'rule_portfolio_watch';
-  else if (/credit|card|utilization|score|信用|卡/.test(lower)) kind = 'rule_credit_utilization';
-  else if (/connection|sync|token|cursor|plaid|snaptrade/.test(lower)) kind = 'rule_connection_health';
-  return {
-    kind,
-    scope: normalizeChoice(inferredScope, ['banking', 'brokerage', 'credit', 'all'], 'banking'),
-    cadence: normalizeChoice(inferredCadence, ['event', 'hourly', 'daily', 'weekly', 'monthly'], 'event'),
-    channel: 'auto',
-  };
+  // Re-derive pending questions from current rules and facts and persist them,
+  // keyed by fact so re-evaluation refreshes impact in place. A pending question
+  // whose fact is now known is marked answered.
+  private refreshQuestions(): QuestionDraft[] {
+    const { questions } = evaluateRules(this.repository.listRules(), this.buildEvaluationData());
+    const openKeys = new Set(questions.map((question) => question.factKey));
+    for (const question of questions) {
+      this.repository.upsertQuestion({
+        factKey: question.factKey,
+        prompt: question.prompt,
+        ruleKind: question.ruleKind,
+        unlockImpactMinor: question.unlockImpactMinor,
+        currency: question.currency,
+        suggestedValue: question.suggestedValue,
+        status: 'pending',
+      });
+    }
+    for (const existing of this.repository.listQuestions('pending')) {
+      if (!openKeys.has(existing.factKey) && this.repository.getFact(existing.factKey)) {
+        this.repository.updateQuestionStatus(existing.id, 'answered');
+      }
+    }
+    return questions;
+  }
+
 }
 
 function parseRuleInference(reply: string): Partial<{ scope: string; cadence: string }> {
@@ -2090,45 +1900,6 @@ function parseRuleInference(reply: string): Partial<{ scope: string; cadence: st
   }
 }
 
-function ruleWatchesCreditCardTransactions(rule: AlertRuleRecord): boolean {
-  const text = `${rule.scope} ${rule.sourceText}`.toLowerCase();
-  return rule.scope === 'credit' || (/transaction|charge|spend|消费|支出/.test(text) && /credit|card|信用卡/.test(text));
-}
-
-function ruleWatchesBrokerageTransactions(rule: AlertRuleRecord): boolean {
-  const text = `${rule.scope} ${rule.sourceText}`.toLowerCase();
-  return rule.scope === 'brokerage' || (/transaction|activity|trade|order/.test(text) && /brokerage|portfolio|stock|etf|trade|order/.test(text));
-}
-
-function isCreditAccount(account: Account | undefined): boolean {
-  if (!account) return false;
-  return /credit|card/i.test(`${account.type || ''} ${account.name || ''}`);
-}
-
-function transactionInsight(
-  rule: AlertRuleRecord,
-  transaction: Transaction | BrokerageTransaction,
-  account: Account | undefined,
-  label: 'credit card' | 'brokerage' | 'large',
-): InsightSignal {
-  const accountName = account?.name || 'Unknown account';
-  const amount = formatMinorAmount(transaction.amountMinor, transaction.currency);
-  const titleLabel = label === 'large' ? 'large transaction' : `${label} transaction`;
-  return {
-    id: `${rule.kind}:${rule.id}:${transaction.id}`,
-    kind: `${rule.kind}:${rule.id}:${transaction.id}`,
-    scope: rule.scope,
-    severity: 'medium',
-    title: `New ${titleLabel}: ${transaction.description}`,
-    detail: `${accountName} · ${transaction.date} · ${amount}`,
-    value: amount,
-    source: 'rule',
-    ruleId: rule.id,
-    accountId: transaction.accountId,
-    createdAt: transaction.createdAt,
-  };
-}
-
 function formatMinorAmount(amountMinor: number, currency = 'USD'): string {
   const amount = amountMinor / 100;
   try {
@@ -2140,19 +1911,6 @@ function formatMinorAmount(amountMinor: number, currency = 'USD'): string {
 
 function suggestedRuleHour(cadence: string) {
   return cadence === 'event' || cadence === 'hourly' ? null : 9;
-}
-
-function ruleExecutionMode(kind: string) {
-  if (/credit_utilization|connection_health/.test(kind)) return 'D';
-  if (/spending_watch|local_watch/.test(kind)) return 'L+';
-  return 'L';
-}
-
-function ruleExecutionStrategy(kind: string) {
-  const mode = ruleExecutionMode(kind);
-  if (mode === 'D') return 'Deterministic query and local copy; no model is needed at run time.';
-  if (mode === 'L') return 'Deterministic trigger with model-generated explanation from local facts.';
-  return 'Deterministic prefilter, then model accept/reject with deterministic fallback.';
 }
 
 function plaidAccountDomain(account: { type?: string | null; subtype?: string | null }): string {
@@ -2266,16 +2024,42 @@ function parseStringArray(value: string | null): Set<string> {
   }
 }
 
-function insightIdentity(insight: InsightSignal): string {
+function insightIdentity(finding: Finding): string {
   return createHash('sha256')
-    .update([insight.kind, insight.scope, insight.accountId || '', insight.title].join('|'))
+    .update([finding.kind, finding.scope, finding.accountId || '', finding.title].join('|'))
     .digest('hex');
 }
 
-function formatImInsights(insights: InsightSignal[]): string {
+const IM_DOMAIN_LABELS: Record<string, string> = {
+  'cash-flow': 'Cash flow',
+  spending: 'Spending',
+  credit: 'Credit',
+  investments: 'Investments',
+  connections: 'Connections',
+};
+const IM_DOMAIN_ORDER = ['cash-flow', 'spending', 'credit', 'investments', 'connections'];
+
+// Group the delivered findings under their rule-taxonomy category so the message
+// reads by domain (Cash flow, Spending, Credit, Investments, Connections).
+function formatImInsights(findings: Finding[]): string {
   const icon = { high: '🔴', medium: '🟠', low: '🟡' } as const;
-  const lines = insights.map((insight) => `${icon[insight.severity]} ${insight.title}\n${insight.detail}`);
-  return `Finora — ${insights.length} new insight${insights.length === 1 ? '' : 's'}\n\n${lines.join('\n\n')}`;
+  const byDomain = new Map<string, Finding[]>();
+  for (const finding of findings) {
+    const domain = finding.domain || 'cash-flow';
+    const bucket = byDomain.get(domain);
+    if (bucket) bucket.push(finding);
+    else byDomain.set(domain, [finding]);
+  }
+  const orderedDomains = [...IM_DOMAIN_ORDER, ...[...byDomain.keys()].filter((d) => !IM_DOMAIN_ORDER.includes(d))];
+  const sections = orderedDomains
+    .map((domain) => {
+      const items = byDomain.get(domain);
+      if (!items || items.length === 0) return '';
+      const lines = items.map((finding) => `${icon[finding.severity]} ${finding.title}\n${finding.detail}`);
+      return `${(IM_DOMAIN_LABELS[domain] || domain).toUpperCase()}\n${lines.join('\n\n')}`;
+    })
+    .filter(Boolean);
+  return `Finora — ${findings.length} new finding${findings.length === 1 ? '' : 's'}\n\n${sections.join('\n\n')}`;
 }
 
 async function extractCreditReport(content: Uint8Array, filename: string): Promise<CreditExtraction> {

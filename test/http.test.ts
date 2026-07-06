@@ -202,11 +202,12 @@ Date: 05/01/2026
     const previewBody = await preview.json();
     expect(previewBody).toMatchObject({
       text: 'Generate a weekly rule for large brokerage cash drag before a digest.',
-      kind: 'rule_idle_brokerage_cash',
+      kind: 'idle-brokerage-cash',
+      domain: 'investments',
       scope: 'brokerage',
       cadence: 'weekly',
       scheduledHour: 9,
-      mode: 'L',
+      executionClass: 'D',
     });
     expect(previewBody.channel).toBe('auto');
 
@@ -223,7 +224,10 @@ Date: 05/01/2026
     });
     expect(saved.status).toBe(201);
     expect(await saved.json()).toMatchObject({
-      kind: 'rule_credit_utilization',
+      kind: 'credit-utilization',
+      domain: 'credit',
+      executionClass: 'D',
+      actionTier: 'advisor',
       sourceText: 'Generate a daily rule that flags high credit utilization.',
       scope: 'credit',
       cadence: 'daily',
@@ -233,7 +237,7 @@ Date: 05/01/2026
     });
   });
 
-  it('lists active rule-triggered insights', async () => {
+  it('lists active findings ranked with dollar impact and confidence', async () => {
     const { base } = await httpFixture();
     const account = await createAccount(base, {
       name: 'Rewards Credit Card',
@@ -243,7 +247,7 @@ Date: 05/01/2026
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        text: 'any new credit card transactions',
+        text: 'flag large transactions',
         scope: 'banking',
         cadence: 'event',
       }),
@@ -255,22 +259,60 @@ Date: 05/01/2026
       body: JSON.stringify({
         accountId: account.id,
         filename: 'card.csv',
-        contentBase64: Buffer.from('Date,Description,Amount\n2026-07-01,Coffee Shop,-5.25\n').toString('base64'),
+        contentBase64: Buffer.from('Date,Description,Amount\n2026-07-01,Coffee Shop,-600.00\n').toString('base64'),
       }),
     });
     expect(imported.status).toBe(200);
 
-    const insights = await fetch(`${base}/v1/insights`);
-    expect(insights.status).toBe(200);
-    expect(await insights.json()).toMatchObject({
+    const findings = await fetch(`${base}/v1/findings`);
+    expect(findings.status).toBe(200);
+    expect(await findings.json()).toMatchObject({
       items: [
         expect.objectContaining({
-          title: 'New credit card transaction: Coffee Shop',
-          source: 'rule',
-          value: '-$5.25',
+          title: 'Large transaction: Coffee Shop',
+          value: '-$600.00',
+          dollarImpactMinor: 60000,
+          confidence: 0.5,
         }),
       ],
     });
+  });
+
+  it('persists a weekly rule schedule day and hour', async () => {
+    const { base } = await httpFixture();
+    const saved = await fetch(`${base}/v1/rules`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'weekly idle cash review', scope: 'banking', cadence: 'weekly', scheduledHour: 9, scheduledDay: 1 }),
+    });
+    expect(saved.status).toBe(201);
+    expect(await saved.json()).toMatchObject({ cadence: 'weekly', scheduledHour: 9, scheduledDay: 1 });
+    const listed = await (await fetch(`${base}/v1/rules`)).json() as { items: Array<{ scheduledDay: number | null }> };
+    expect(listed.items[0]).toMatchObject({ scheduledDay: 1 });
+  });
+
+  it('turns a fact-dependent rule into a question, then unlocks it once the fact is saved', async () => {
+    const { base } = await httpFixture();
+    await fetch(`${base}/v1/rules`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'check my 401k employer match', scope: 'all', cadence: 'monthly' }),
+    });
+    const pending = await (await fetch(`${base}/v1/questions`)).json() as { items: Array<{ factKey: string }> };
+    expect(pending.items.map((q) => q.factKey)).toContain('employer_match_pct');
+
+    for (const [key, value] of [['annual_income', '120000'], ['retirement_contribution_pct', '3'], ['employer_match_pct', '6']]) {
+      const res = await fetch(`${base}/v1/facts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, value }),
+      });
+      expect(res.status).toBe(201);
+    }
+    const cleared = await (await fetch(`${base}/v1/questions`)).json() as { items: unknown[] };
+    expect(cleared.items).toHaveLength(0);
+    const findings = await (await fetch(`${base}/v1/findings`)).json() as { items: Array<{ kind: string; dollarImpactMinor: number }> };
+    expect(findings.items.find((f) => f.kind === 'employer-match')).toMatchObject({ dollarImpactMinor: 360000 });
   });
 
   it('protects desktop data routes with the session token', async () => {

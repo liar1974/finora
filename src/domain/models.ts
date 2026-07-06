@@ -179,20 +179,110 @@ export interface CreditReportRecord {
   createdAt: string;
 }
 
-export interface AlertRuleRecord {
+// ── Rules engine ─────────────────────────────────────────────────────────────
+// The full design lives in docs/rules-design.md. Rules are stored as normalized
+// metadata and interpreted by a detector registry; every evaluator, regardless of
+// execution class, emits the same Finding contract.
+
+// The capability a rule's condition requires, decided by one question: can the
+// truth of this rule be expressed as exact logic over structured data we already
+// hold? Yes -> D. No, it needs meaning or judgment -> L / L+. Where a rule
+// physically runs (local model, remote model, query engine) is a separate routing
+// concern and does not appear here.
+export type RuleExecutionClass = 'D' | 'L' | 'L+';
+
+// How far a rule may act on a finding, subject to the user's grant. Detection is
+// always read-only; anything past Observer is opt-in and revocable, and a rule's
+// tier is additionally capped by finding confidence at run time.
+export type RuleActionTier = 'observer' | 'advisor' | 'guardian' | 'navigator';
+
+export type RuleDomain = 'cash-flow' | 'spending' | 'credit' | 'investments' | 'connections';
+
+export interface RuleRecord {
   id: string;
-  kind: string;
+  kind: string; // evaluator key in the detector registry
+  domain: RuleDomain;
   sourceText: string;
+  executionClass: RuleExecutionClass;
+  actionTier: RuleActionTier;
   scope: string;
   cadence: string;
   channel: string;
   scheduledHour: number | null;
+  // Which day the rule's schedule targets: weekday 0=Sunday..6 for weekly, day of
+  // month 1..28 for monthly, null otherwise. Descriptive schedule metadata.
+  scheduledDay: number | null;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
 
-export interface AlertMuteRecord {
+// A single actionable finding, uniform across every evaluator. dollarImpactMinor
+// is signed integer minor units normalized to a twelve-month horizon so findings
+// are comparable; confidence is 0..1; score is the computed ranking value.
+export interface Finding {
+  id: string;
+  ruleId: string | null;
+  kind: string;
+  domain: RuleDomain;
+  scope: string;
+  title: string;
+  detail: string;
+  value: string;
+  dollarImpactMinor: number;
+  currency: string;
+  confidence: number;
+  urgency: number; // >= 1 multiplier; 1 means no deadline pressure
+  effort: number; // >= 1 divisor; 1 means one tap
+  score: number; // |dollarImpactMinor| * confidence * urgency / effort
+  severity: 'high' | 'medium' | 'low'; // derived from score, kept for display
+  actionTier: RuleActionTier;
+  action: FindingAction | null;
+  evidence: FindingEvidence;
+  accountId?: string;
+  createdAt: string;
+}
+
+export interface FindingAction {
+  tier: RuleActionTier; // the tier this action would run at, after confidence capping
+  label: string;
+  artifact: string | null; // generated text for the Advisor tier; null until produced
+}
+
+export interface FindingEvidence {
+  summary: string; // deterministic explanation of why the finding fired
+  records: string[]; // ids of the records that produced it
+}
+
+// A value the user knows but the account stream does not expose. A required fact
+// with no value turns into a Question rather than failing the rule. User-entered
+// facts carry lower confidence than stream-derived ones, and that difference
+// propagates into finding confidence.
+export interface FactRecord {
+  key: string;
+  value: string;
+  source: 'user' | 'derived' | 'reference';
+  confidence: number;
+  refreshAfter: string | null; // ISO date; prompt to re-verify past this point
+  updatedAt: string;
+}
+
+// A pending question whose answer unlocks one or more rules, ranked by the dollar
+// impact it would unlock. suggestedValue supports derive-then-confirm.
+export interface QuestionRecord {
+  id: string;
+  factKey: string;
+  prompt: string;
+  ruleKind: string;
+  unlockImpactMinor: number;
+  currency: string;
+  suggestedValue: string | null;
+  status: 'pending' | 'answered' | 'dismissed';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FindingMuteRecord {
   id: string;
   kind: string | null;
   accountId: string | null;

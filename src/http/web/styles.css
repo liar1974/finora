@@ -376,6 +376,11 @@ td.r, th.r { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo
 .requirement, .principle { min-width: 0; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); padding: 11px 12px; }
 .requirement { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
 .rulelist { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.rulegroup { padding: 14px 12px 6px; border-top: 1px solid var(--line); background: var(--bg); }
+.rulegroup:first-child { border-top: 0; }
+.rulegroup .cardsub { margin: 0; }
+.rulegrouphdr { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+.rulegrouphdr h4 { margin: 0; font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--fg); }
 .rulerow { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 12px; border-top: 1px solid var(--line); background: var(--card); }
 .rulerow:first-child { border-top: 0; }
 .rulerow.muted .rulecopy { opacity: .64; }

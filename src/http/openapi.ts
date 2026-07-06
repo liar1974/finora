@@ -164,8 +164,8 @@ export const openApiDocument = {
     '/v1/telegram/connect': {
       post: { summary: 'Bind the configured Telegram bot to a chat', responses: { '200': { description: 'Bound chat' }, '422': { description: 'Missing token or chat' } } },
     },
-    '/v1/insights': {
-      get: { summary: 'List active rule-triggered insights', responses: { '200': { description: 'Insight collection' } } },
+    '/v1/findings': {
+      get: { summary: 'List active findings ranked by dollar impact and confidence', responses: { '200': { description: 'Finding collection' } } },
     },
     '/v1/rules': {
       get: { summary: 'List rules', responses: { '200': { description: 'Rule collection' } } },
@@ -180,12 +180,25 @@ export const openApiDocument = {
     '/v1/rules/remove': {
       post: { summary: 'Remove a rule', responses: { '200': { description: 'Removal result' } } },
     },
-    '/v1/insight-mutes': {
-      get: { summary: 'List insight mutes', responses: { '200': { description: 'Insight mute collection' } } },
-      post: { summary: 'Create an insight mute', responses: { '201': { description: 'Insight mute created' }, '422': { description: 'Validation failed' } } },
+    '/v1/questions': {
+      get: { summary: 'List pending questions ranked by unlockable dollar impact', responses: { '200': { description: 'Question collection' } } },
     },
-    '/v1/insight-mutes/remove': {
-      post: { summary: 'Remove an insight mute', responses: { '200': { description: 'Removal result' } } },
+    '/v1/questions/dismiss': {
+      post: { summary: 'Dismiss a pending question', responses: { '200': { description: 'Dismissal result' } } },
+    },
+    '/v1/facts': {
+      get: { summary: 'List stored user facts', responses: { '200': { description: 'Fact collection' } } },
+      post: { summary: 'Save or update a user fact', responses: { '201': { description: 'Fact saved' }, '422': { description: 'Validation failed' } } },
+    },
+    '/v1/facts/remove': {
+      post: { summary: 'Remove a user fact', responses: { '200': { description: 'Removal result' } } },
+    },
+    '/v1/finding-mutes': {
+      get: { summary: 'List finding mutes', responses: { '200': { description: 'Finding mute collection' } } },
+      post: { summary: 'Create a finding mute', responses: { '201': { description: 'Finding mute created' }, '422': { description: 'Validation failed' } } },
+    },
+    '/v1/finding-mutes/remove': {
+      post: { summary: 'Remove a finding mute', responses: { '200': { description: 'Removal result' } } },
     },
     '/v1/memory': {
       get: { summary: 'Recall the durable user memory profile', responses: { '200': { description: 'Memory profile markdown' } } },

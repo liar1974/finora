@@ -212,37 +212,13 @@ available.
 
 ## Rules and insights
 
-Rules are read-only, deterministic at the trigger boundary, explainable, and
-quiet unless there is something worth acting on. Built-in and custom generated
-rules share the same high-level taxonomy:
-
-- Cash flow: income timing, bill runway, idle cash, recurring spend.
-- Spending: large charges, duplicates, subscriptions, fees, categorization
-  cleanup.
-- Credit: utilization, card interest, late or fee signals.
-- Investments: cash drag, concentration, portfolio movement, executed orders.
-- Connections: provider status, missing tokens, stale cursors, sync health.
-
-Detection levels:
-
-- `D`: deterministic compute. Trigger, dedupe key, severity, and copy are local.
-- `L`: deterministic trigger plus generated copy from local facts.
-- `L+`: deterministic prefilter plus LLM admit/reject, with deterministic
-  fallback.
-
-Custom rules are stored as normalized rule metadata, not as separate query
-programs per detection level. The preview flow may use the configured chat model
-to infer delivery fields, then falls back to local inference. The saved rule
-keeps scope, cadence, channel, and scheduled hour; evaluators decide whether the
-rule runs as `D`, `L`, or `L+` from the rule kind.
-
-Built-in evaluators should cover connection health, idle cash, low or negative
-balance risk, large transactions, duplicate or unusual charges, subscription
-drift, trial conversions, discretionary spending, cash runway, expected income,
-fees and interest, credit utilization, credit report review, credit payment
-timing, brokerage cash drag, portfolio concentration, allocation drift, executed
-orders, dividends or interest, weekly financial health, net-worth movement, and
-stale imports.
+Rules are read-only at the trigger boundary, deterministic where correctness
+allows, explainable, and quiet unless there is something worth acting on. The
+full design — the rule-metadata-plus-evaluator-registry model, the `D` / `L` /
+`L+` execution classes, the facts-and-questions layer, the finding contract with
+dollar impact and confidence, the ranking function, and the action trust ladder —
+lives in
+[`rules-design.md`](./rules-design.md).
 
 The rule creation UI should live with the page-level controls rather than
 inside the rules list. A new rule is saved only after the preview flow has
