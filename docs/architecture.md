@@ -185,9 +185,13 @@ path-versioned under `/v1`. Additive changes remain in `v1`; breaking changes
 require a new path version.
 
 The desktop application launches the same API on a random loopback port and
-requires a per-process session token for every data route. The token is passed
-only to the Tauri webview. Health checks remain unauthenticated. Packaged builds
-carry a platform-native Node runtime so users do not need Node.js installed.
+requires a per-process session token (sent as the `x-finora-desktop-token`
+header) for every data route. The token is passed only to the Tauri webview.
+Health checks remain unauthenticated. Packaged builds carry a platform-native
+Node runtime so users do not need Node.js installed. The backend ships as a
+single esbuild bundle in ESM format; because bundled CommonJS dependencies still
+call `require()` for Node built-ins at runtime, the bundle is built with a
+`createRequire` banner — without it the packaged backend fails to start.
 
 The desktop app updates itself through the Tauri updater: it polls
 `releases/latest/download/latest.json` and installs an update only after

@@ -130,6 +130,23 @@ integration. Its behavior:
   follow-up surface asks the highest-value question first; it does not dump a
   form on the user.
 
+**Fact key naming.** Facts live in one flat, global key space so that one answer
+serves every rule that references the key — this sharing is the point, and it is why
+keys are namespaced by the **subject of the fact** (the area of the user's life),
+never by the rule domain that happens to consume it. A rule borrows facts from other
+subjects freely; e.g. the employer-match rule reads `income.gross_annual`, which is
+an `income` fact, not a `retirement` one. Conventions:
+
+- Lowercase, dot-separated, one namespace level: `area.thing` (a second level only
+  for a real keyed sub-entity, e.g. `insurance.auto.renewal_date`).
+- The unit is carried by a suffix that pairs with the fact's `expects` hint:
+  `_pct` (percent), `_minor` (integer minor units), `_date` (ISO), `_months`,
+  `_frequency`.
+- Current top-level namespaces: `income`, `retirement`, `tax`, `housing`, `debt`,
+  `insurance`, `goals` (with `household` reserved for demographics). Notification
+  thresholds, channels, and risk-tolerance-as-preference are app **settings**, not
+  facts — keep the two stores distinct.
+
 ## The finding contract
 
 Every firing produces a `Finding`:
@@ -233,9 +250,17 @@ seeded into `rule_specs` on startup:
   admit/reject/summarize with a deterministic fallback — is not implemented.
   Pure-LLM summaries (weekly digest, spending narrative, suspicious-charge
   judgment) wait on it.
-- **Over-the-air delivery.** The repository can upsert specs, but the job that
-  polls a versioned rule-definition file and downloads changed specs into
-  `rule_specs` is not built; today built-ins are seeded from code on startup.
+- **Over-the-air delivery.** Manual sync is built end to end: `FinanceService.syncRuleFeed()`
+  fetches a configured `RULES_FEED_URL` through the injectable `RuleFeedClient` port,
+  validates the `{ version, specs[] }` document, and upserts each spec as a `downloaded`
+  rule when the feed version is newer than the last applied one (stored in
+  `RULES_FEED_VERSION`). A downloaded rule that declares user facts flows straight into
+  the needs-input surface, and the read-only query runner sandboxes its SQL. The feed
+  URL is editable under **Settings → Rules & Facts**, and a **Check for updates** button
+  there triggers a sync (`POST /v1/rules/sync`). What is **not** built yet is
+  **automatic polling**: nothing calls `syncRuleFeed()` on a timer, so the app never
+  pulls newer rules on its own — the user has to press the button. Built-ins are still
+  seeded from code on startup as the floor.
 - **Deeper data products.** Rules needing Plaid **Liabilities** (card APR and
   interest projection, payment-due, student-loan and mortgage tracking) — the
   account is entitled, but Liabilities is not yet ingested. **Income** rules need a

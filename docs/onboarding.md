@@ -180,7 +180,7 @@ you see everything together. Until then, this is where you start a connection.
 
 Add your Plaid keys and manage connected accounts under **Bank/Brokerage**,
 choose the language model under **Models**, decide how you'd like to be notified
-under **Delivery**, and create alert rules under **Rules & Insights**.
+under **Delivery**, and create alert rules under **Rules & Facts**.
 
 ![Settings](media/screenshots/settings.png)
 
@@ -241,7 +241,7 @@ numbered setup right on the screen.
    it shows **Ready**, delivery is on.
 
 Once a channel shows **Ready**, insights from your enabled rules (set up under
-**Settings → Rules & Insights**) are delivered there. You can switch the active
+**Settings → Rules & Facts**) are delivered there. You can switch the active
 channel or pause delivery any time — turning delivery off never changes or
 deletes the local Insights feed.
 

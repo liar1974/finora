@@ -17,6 +17,7 @@ import type {
   ProviderBrokerageTransactionInput,
   ProviderHoldingInput,
   ProviderTransactionInput,
+  RuleFeedClient,
   StatementParser,
   SummaryQuery,
   TransactionQuery,
@@ -39,7 +40,7 @@ import {
   normalizeCurrency,
   requireText,
 } from '../domain/invariants.js';
-import type { Account, AccountBalance, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, Finding, ImportRecord, QuestionRecord, RuleRecord, Transaction, TransactionInput } from '../domain/models.js';
+import type { Account, AccountBalance, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, FactExpectation, Finding, ImportRecord, QuestionRecord, RuleFactNeed, RuleRecord, RuleSpec, Transaction, TransactionInput } from '../domain/models.js';
 import { builtinRuleSpecs, evaluateRules, executionStrategy, inferRule } from './rules-engine.js';
 import type { EvaluationData, QuestionDraft } from './rules-engine.js';
 import { generateChatReply, LLM_PROVIDERS, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
@@ -149,6 +150,7 @@ export class FinanceService {
     private readonly repository: FinanceRepository,
     private readonly parsers: readonly StatementParser[],
     private readonly localModel: LocalModelEngine,
+    private readonly ruleFeed?: RuleFeedClient,
   ) {
     this.telegramGateway = new TelegramGateway({
       getToken: () => this.telegramToken(),
@@ -1073,12 +1075,12 @@ export class FinanceService {
     };
   }
 
-  createRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
+  createRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined; domain?: RuleRecord['domain'] | undefined }) {
     const text = requireText(input.text, 'text');
     const inferred = inferRule(this.repository.listRuleSpecs(), text, input.scope, input.cadence);
     return this.repository.saveRule({
       kind: inferred.kind,
-      domain: inferred.domain,
+      domain: input.domain ?? inferred.domain,
       sourceText: text,
       executionClass: inferred.executionClass,
       actionTier: inferred.actionTier,
@@ -1136,8 +1138,105 @@ export class FinanceService {
     return { removed: this.repository.removeFact(key) };
   }
 
+  // The user facts each rule declares, with satisfaction, plus the deduped set of
+  // still-unanswered facts. Computed from rule_specs.facts ∪ the facts table so a
+  // rule's needs show regardless of whether it is enabled — the UI uses byKind to
+  // gate a rule and pending to prompt for the answers. Facts stay decoupled: a rule
+  // references keys, and one answered key satisfies every rule that needs it.
+  factNeeds() {
+    const known = new Set(this.repository.listFacts().map((fact) => fact.key));
+    const byKind: Record<string, { kind: string; title: string; domain: string; facts: Array<{ key: string; prompt: string; expects: FactExpectation; satisfied: boolean }> }> = {};
+    const pending = new Map<string, { key: string; prompt: string; expects: FactExpectation }>();
+    for (const spec of this.repository.listRuleSpecs()) {
+      if (!spec.enabled || spec.facts.length === 0) continue;
+      const facts = spec.facts.map((need) => {
+        const expects = need.expects ?? 'text';
+        const satisfied = known.has(need.key);
+        if (!satisfied && !pending.has(need.key)) pending.set(need.key, { key: need.key, prompt: need.prompt, expects });
+        return { key: need.key, prompt: need.prompt, expects, satisfied };
+      });
+      byKind[spec.kind] = { kind: spec.kind, title: factRuleTitle(spec.kind), domain: spec.domain, facts };
+    }
+    return { byKind, pending: [...pending.values()] };
+  }
+
+  // Answer a fact question: normalize/validate the raw input, then store it. A
+  // configured remote model refines free text ("about 6 %" -> "6"); offline or with
+  // the built-in model it falls back to a deterministic parse keyed on `expects`.
+  // Stored as a `user` fact, so its low confidence caps any resulting action tier.
+  async answerFact(input: { key: string; value: string }) {
+    const key = requireText(input.key, 'key');
+    const raw = requireText(input.value, 'value');
+    const need = this.findFactNeed(key);
+    const expects = need?.expects ?? 'text';
+    const normalized = await this.normalizeFactValue(raw, expects, need?.prompt ?? key);
+    return this.saveFact({ key, value: normalized, source: 'user' });
+  }
+
+  private findFactNeed(key: string): RuleFactNeed | undefined {
+    for (const spec of this.repository.listRuleSpecs()) {
+      const need = spec.facts.find((fact) => fact.key === key);
+      if (need) return need;
+    }
+    return undefined;
+  }
+
+  private async normalizeFactValue(raw: string, expects: FactExpectation, prompt: string): Promise<string> {
+    let candidate = raw;
+    const llm = this.llmConfig();
+    // Skip the built-in local model: normalization must stay fast and deterministic
+    // offline, so only a configured, key-bearing remote model refines the input.
+    if (llm.provider !== 'builtin' && llm.keySet) {
+      try {
+        const reply = await this.llmReply(llm, {
+          system: [
+            'Normalize one user-provided value for a personal-finance fact.',
+            `Question asked: "${prompt}"`,
+            `Expected type: ${expects}.`,
+            'Return only compact JSON: {"value":"<normalized>"}.',
+            'currency: whole dollars, digits only (e.g. 120000). percent: the number only, no % sign (e.g. 6 or 6.5).',
+            'date: ISO YYYY-MM-DD. number: digits only. text: a short clean string.',
+            'If the input has no usable value, return {"value":""}.',
+          ].join('\n'),
+          messages: [{ role: 'user', content: raw }],
+          timeoutMs: 1_500,
+          maxTokens: 60,
+        });
+        const parsed = parseRuleInference(reply) as { value?: unknown };
+        if (parsed && typeof parsed.value === 'string' && parsed.value.trim()) candidate = parsed.value;
+      } catch {
+        candidate = raw;
+      }
+    }
+    const normalized = normalizeFactScalar(candidate, expects);
+    if (!normalized) throw new AppError('invalid_input', `Could not read a ${expects} value from "${raw}".`);
+    return normalized;
+  }
+
   dismissQuestion(id: string) {
     return { dismissed: this.repository.updateQuestionStatus(id, 'dismissed') };
+  }
+
+  // Over-the-air rule delivery. Fetches the configured feed URL, validates it, and
+  // upserts each spec as a `downloaded` rule when the feed's version is newer than
+  // the last applied one. Rules are pure data, so this needs no redeploy; a
+  // downloaded rule that declares user facts flows straight into the needs-input
+  // surface (factNeeds/questions read every spec regardless of source). The read-only
+  // query runner sandboxes downloaded SQL — it can never write. See docs/rules-design.md.
+  async syncRuleFeed(): Promise<{ applied: number; skipped: boolean; version: number | null; reason?: string }> {
+    const url = (this.repository.getAppSetting('RULES_FEED_URL') || '').trim();
+    if (!url) return { applied: 0, skipped: true, version: null, reason: 'no-feed-url' };
+    if (!this.ruleFeed) return { applied: 0, skipped: true, version: null, reason: 'no-client' };
+
+    const feed = parseRuleFeed(await this.ruleFeed.fetchFeed(url));
+    const appliedVersion = Number(this.repository.getAppSetting('RULES_FEED_VERSION') || 0);
+    if (feed.version <= appliedVersion) return { applied: 0, skipped: true, version: feed.version, reason: 'not-newer' };
+
+    for (const spec of feed.specs) this.repository.upsertRuleSpec({ ...spec, source: 'downloaded' });
+    this.repository.saveAppSettings({ RULES_FEED_VERSION: String(feed.version) });
+    // Surface any user input the new rules need right away.
+    this.refreshQuestions();
+    return { applied: feed.specs.length, skipped: false, version: feed.version };
   }
 
   listFindingMutes() {
@@ -1896,6 +1995,112 @@ function parseRuleInference(reply: string): Partial<{ scope: string; cadence: st
   } catch {
     return {};
   }
+}
+
+// Parse and validate a rule-feed document into specs, throwing AppError on a
+// malformed feed. Each spec is coerced with safe defaults so the feed format can
+// grow additively; the caller stamps source = 'downloaded'. Deliberately hand-rolled
+// (not zod) to match the application layer's dependency-free style.
+function parseRuleFeed(body: string): { version: number; specs: RuleSpec[] } {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(body);
+  } catch {
+    throw new AppError('invalid_input', 'Rule feed is not valid JSON.');
+  }
+  if (!doc || typeof doc !== 'object') throw new AppError('invalid_input', 'Rule feed must be an object.');
+  const record = doc as Record<string, unknown>;
+  const version = Number(record.version);
+  if (!Number.isFinite(version)) throw new AppError('invalid_input', 'Rule feed is missing a numeric version.');
+  if (!Array.isArray(record.specs)) throw new AppError('invalid_input', 'Rule feed is missing a specs array.');
+  return { version, specs: record.specs.map((raw, index) => coerceRuleSpec(raw, index)) };
+}
+
+const RULE_FEED_DOMAINS = ['cash-flow', 'spending', 'credit', 'investments', 'connections'];
+const RULE_FEED_CLASSES = ['D', 'L', 'L+'];
+const RULE_FEED_TIERS = ['observer', 'advisor', 'guardian', 'navigator'];
+
+function coerceRuleSpec(raw: unknown, index: number): RuleSpec {
+  if (!raw || typeof raw !== 'object') throw new AppError('invalid_input', `Rule feed spec #${index} is not an object.`);
+  const r = raw as Record<string, unknown>;
+  const kind = typeof r.kind === 'string' ? r.kind.trim() : '';
+  if (!kind) throw new AppError('invalid_input', `Rule feed spec #${index} is missing a kind.`);
+  const pick = (value: unknown, allowed: string[], fallback: string) =>
+    (typeof value === 'string' && allowed.includes(value) ? value : fallback);
+  const str = (value: unknown, fallback = '') => (typeof value === 'string' ? value : fallback);
+  const strOrNull = (value: unknown) => (typeof value === 'string' ? value : null);
+  return {
+    kind,
+    domain: pick(r.domain, RULE_FEED_DOMAINS, 'cash-flow') as RuleSpec['domain'],
+    executionClass: pick(r.executionClass, RULE_FEED_CLASSES, 'D') as RuleSpec['executionClass'],
+    actionTier: pick(r.actionTier, RULE_FEED_TIERS, 'observer') as RuleSpec['actionTier'],
+    scope: str(r.scope, 'all'),
+    cadence: str(r.cadence, 'event'),
+    alwaysOn: r.alwaysOn === true,
+    keywords: str(r.keywords, ''),
+    sql: strOrNull(r.sql),
+    prompt: strOrNull(r.prompt),
+    facts: coerceFactNeeds(r.facts),
+    enabled: r.enabled !== false,
+    source: 'downloaded',
+    version: Number.isFinite(Number(r.version)) ? Number(r.version) : 1,
+  };
+}
+
+function coerceFactNeeds(raw: unknown): RuleFactNeed[] {
+  if (!Array.isArray(raw)) return [];
+  const needs: RuleFactNeed[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const r = item as Record<string, unknown>;
+    const key = typeof r.key === 'string' ? r.key.trim() : '';
+    const prompt = typeof r.prompt === 'string' ? r.prompt.trim() : '';
+    if (!key || !prompt) continue;
+    const need: RuleFactNeed = {
+      key,
+      prompt,
+      unlockImpactMinor: Number.isFinite(Number(r.unlockImpactMinor)) ? Number(r.unlockImpactMinor) : 0,
+    };
+    if (typeof r.currency === 'string') need.currency = r.currency;
+    if (typeof r.expects === 'string' && ['currency', 'percent', 'number', 'date', 'text'].includes(r.expects)) {
+      need.expects = r.expects as FactExpectation;
+    }
+    needs.push(need);
+  }
+  return needs;
+}
+
+// A human title for a fact-gated rule kind, for the needs-input surface. Known
+// kinds get a hand-written label; anything else is titleized from the kind slug.
+const FACT_RULE_TITLES: Record<string, string> = {
+  'employer-match': 'Employer 401(k) match',
+};
+function factRuleTitle(kind: string): string {
+  return FACT_RULE_TITLES[kind] ?? kind.replace(/-/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
+}
+
+// Deterministic normalization/validation of a fact value by expected shape. Returns
+// '' when no usable value is present, which the caller treats as a rejected answer.
+function normalizeFactScalar(raw: string, expects: FactExpectation): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (expects === 'text') return trimmed.replace(/\s+/g, ' ');
+  if (expects === 'date') {
+    const parsed = new Date(trimmed);
+    return Number.isNaN(parsed.getTime()) ? '' : parsed.toISOString().slice(0, 10);
+  }
+  const match = trimmed.replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+  if (!match) return '';
+  let n = Number(match[0]);
+  if (!Number.isFinite(n)) return '';
+  if (expects === 'currency') {
+    const suffix = trimmed.toLowerCase().match(/\d\s*([km])/)?.[1];
+    if (suffix === 'k') n *= 1_000;
+    else if (suffix === 'm') n *= 1_000_000;
+    return n < 0 ? '' : String(Math.round(n));
+  }
+  if (expects === 'percent') return n < 0 || n > 100 ? '' : String(n);
+  return String(n); // number
 }
 
 function formatMinorAmount(amountMinor: number, currency = 'USD'): string {

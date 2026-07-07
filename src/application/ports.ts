@@ -197,3 +197,11 @@ export interface StatementParser {
   supports(filename: string, content: Uint8Array): boolean;
   parse(content: Uint8Array, context: ParseContext): TransactionInput[];
 }
+
+// Fetches the raw rule-feed document from a configured URL (long-term a GitHub raw
+// URL). Kept behind a port so the network call is injectable — tests supply a stub
+// feed, dev points it at a local static server, prod at GitHub. The service parses,
+// validates, and upserts; the client only transports bytes.
+export interface RuleFeedClient {
+  fetchFeed(url: string): Promise<string>;
+}

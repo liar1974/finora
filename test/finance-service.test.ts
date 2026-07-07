@@ -10,6 +10,12 @@ import { SqliteFinanceRepository } from '../src/infrastructure/sqlite-repository
 
 afterEach(() => vi.unstubAllGlobals());
 
+// Recency-window rules (large-transaction, executed-trades, duplicate-charge, …)
+// filter on the transaction date against the real clock, so fixtures must be dated
+// relative to now — a hardcoded date would silently fall out of the window and rot
+// the test weeks later.
+const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+
 // A models dir that will never contain weights, so the built-in engine reports
 // the model as absent without touching the native runtime.
 function localModel() {
@@ -75,7 +81,7 @@ describe('FinanceService', () => {
     service.importStatement({
       accountId: account.id,
       filename: 'card.csv',
-      content: Buffer.from('Date,Description,Amount\n2026-07-01,Coffee Shop,-600.00\n'),
+      content: Buffer.from(`Date,Description,Amount\n${daysAgo(3)},Coffee Shop,-600.00\n`),
     });
     const sent: Record<string, unknown>[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -96,6 +102,32 @@ describe('FinanceService', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]?.text).toContain('Large transaction: Coffee Shop');
     expect(sent[0]?.text).toContain('Rewards Credit Card');
+    service.close();
+  });
+
+  it('surfaces a recently executed brokerage order even when its row predates the rule', () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
+    const account = service.createAccount({ institution: 'Robinhood', name: 'Brokerage', type: 'brokerage', currency: 'USD' });
+    // Ingest the order BEFORE the rule exists, so its row is older than the rule —
+    // exactly the copied-data case a created_at gate wrongly excluded. The rule keys
+    // off the trade date, so a recent order still surfaces.
+    repository.saveProviderBrokerageTransactions([{
+      accountId: account.id,
+      sourceId: 'trade-1',
+      date: daysAgo(2),
+      description: 'AAPL buy',
+      amountMinor: -300000,
+      currency: 'USD',
+      symbol: 'AAPL',
+      investmentType: 'buy',
+      fingerprint: 'trade:aapl',
+    }]);
+    service.createRule({ text: 'any new brokerage executed order', scope: 'brokerage', cadence: 'event' });
+
+    const finding = service.listFindings().find((f) => f.kind === 'executed-trades');
+    expect(finding?.title).toBe('Bought AAPL');
+    expect(finding?.value).toBe('$3,000.00');
     service.close();
   });
 
@@ -124,7 +156,7 @@ describe('FinanceService', () => {
     repository.reconcileProviderTransactions([{
       accountId: account.id,
       sourceId: 'plaid-pending',
-      date: '2026-07-03',
+      date: daysAgo(3),
       description: '99 Ranch Market',
       amountMinor: -60000,
       currency: 'USD',
@@ -137,7 +169,7 @@ describe('FinanceService', () => {
     const reconciled = repository.reconcileProviderTransactions([{
       accountId: account.id,
       sourceId: 'plaid-posted',
-      date: '2026-07-02',
+      date: daysAgo(4),
       description: '99 Ranch Market',
       amountMinor: -60000,
       currency: 'USD',
@@ -153,7 +185,7 @@ describe('FinanceService', () => {
     // The ledger keeps a single, posted entry — no duplicate row.
     const rows = service.listTransactions({ accountId: account.id }).items;
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ date: '2026-07-02', pending: false, sourceId: 'plaid-posted' });
+    expect(rows[0]).toMatchObject({ date: daysAgo(4), pending: false, sourceId: 'plaid-posted' });
     service.close();
   });
 
@@ -292,17 +324,85 @@ describe('FinanceService', () => {
     // Blocked on missing facts: no finding, but questions ranked by unlockable impact.
     expect(service.listFindings().some((f) => f.kind === 'employer-match')).toBe(false);
     const questions = service.listQuestions();
-    expect(questions.map((q) => q.factKey).sort()).toEqual(['annual_income', 'employer_match_pct', 'retirement_contribution_pct']);
+    expect(questions.map((q) => q.factKey).sort()).toEqual(['income.gross_annual', 'retirement.contribution_pct', 'retirement.employer_match_pct']);
     expect(questions.every((q) => q.unlockImpactMinor > 0)).toBe(true);
 
-    service.saveFact({ key: 'annual_income', value: '120000' });
-    service.saveFact({ key: 'retirement_contribution_pct', value: '3' });
-    service.saveFact({ key: 'employer_match_pct', value: '6' });
+    service.saveFact({ key: 'income.gross_annual', value: '120000' });
+    service.saveFact({ key: 'retirement.contribution_pct', value: '3' });
+    service.saveFact({ key: 'retirement.employer_match_pct', value: '6' });
 
     expect(service.listQuestions()).toHaveLength(0);
     const finding = service.listFindings().find((f) => f.kind === 'employer-match');
     // 6% match minus 3% contribution on $120k = $3,600/yr; user-entered facts cap the tier at advisor.
     expect(finding).toMatchObject({ dollarImpactMinor: 360000, confidence: 0.7, actionTier: 'advisor' });
+    service.close();
+  });
+
+  it('downloads rules from a versioned feed and surfaces any user input they need', async () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    repository.saveAppSettings({ RULES_FEED_URL: 'http://feed.test/rules.json' });
+    const feedV1 = {
+      version: 1,
+      specs: [{
+        kind: 'commute-cost',
+        domain: 'spending',
+        executionClass: 'D',
+        actionTier: 'advisor',
+        scope: 'banking',
+        cadence: 'monthly',
+        alwaysOn: true,
+        keywords: 'commute',
+        sql: "SELECT 'commute' AS key, 'x' AS title, 'x' AS detail, 'x' AS value, 0.5 AS confidence, '' AS evidence_summary, '' AS evidence_records, :now_iso AS created_at WHERE 0",
+        prompt: null,
+        facts: [{ key: 'commute.monthly_cost_minor', prompt: 'What do you spend on commuting per month?', unlockImpactMinor: 50000, expects: 'currency' }],
+        enabled: true,
+        version: 1,
+      }],
+    };
+    let feedBody = JSON.stringify(feedV1);
+    const service = new FinanceService(
+      repository,
+      [new OfxStatementParser(), new CsvStatementParser()],
+      localModel(),
+      { fetchFeed: async () => feedBody },
+    );
+
+    // A newer feed version applies its specs as `downloaded` rules — no code, no redeploy.
+    expect(await service.syncRuleFeed()).toMatchObject({ applied: 1, skipped: false, version: 1 });
+    expect(repository.listRuleSpecs().find((s) => s.kind === 'commute-cost')).toMatchObject({ source: 'downloaded', domain: 'spending' });
+
+    // The downloaded rule declares a fact, so it flows straight into the needs-input surface.
+    const needs = service.factNeeds();
+    expect(needs.byKind['commute-cost']).toBeTruthy();
+    expect(needs.pending.map((p) => p.key)).toContain('commute.monthly_cost_minor');
+    expect(service.listQuestions().map((q) => q.factKey)).toContain('commute.monthly_cost_minor');
+
+    // Re-syncing the same version is a no-op.
+    expect(await service.syncRuleFeed()).toMatchObject({ applied: 0, skipped: true, version: 1 });
+
+    // A newer version re-applies the changed spec in place.
+    feedBody = JSON.stringify({ ...feedV1, version: 2, specs: [{ ...feedV1.specs[0], keywords: 'commute|transit' }] });
+    expect(await service.syncRuleFeed()).toMatchObject({ applied: 1, skipped: false, version: 2 });
+    expect(repository.listRuleSpecs().find((s) => s.kind === 'commute-cost')?.keywords).toBe('commute|transit');
+
+    service.close();
+  });
+
+  it('skips feed sync without a configured URL and rejects a malformed feed', async () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    const feedBody = 'not json at all';
+    const service = new FinanceService(
+      repository,
+      [new OfxStatementParser(), new CsvStatementParser()],
+      localModel(),
+      { fetchFeed: async () => feedBody },
+    );
+
+    expect(await service.syncRuleFeed()).toMatchObject({ skipped: true, reason: 'no-feed-url' });
+
+    repository.saveAppSettings({ RULES_FEED_URL: 'http://feed.test/rules.json' });
+    await expect(service.syncRuleFeed()).rejects.toThrow();
+
     service.close();
   });
 

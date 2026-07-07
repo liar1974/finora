@@ -13,6 +13,10 @@ import { SqliteFinanceRepository } from '../src/infrastructure/sqlite-repository
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => Promise.all(cleanups.splice(0).map((cleanup) => cleanup())));
 
+// Recency-window rules match on the transaction date against the real clock, so
+// fixtures for them are dated relative to now rather than hardcoded (which would rot).
+const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+
 async function httpFixture(options: { desktopToken?: string; onDesktopShutdown?: () => void } = {}) {
   const service = new FinanceService(
     new SqliteFinanceRepository(':memory:'),
@@ -237,6 +241,18 @@ Date: 05/01/2026
     });
   });
 
+  it('honors a category override when saving a custom rule', async () => {
+    const { base } = await httpFixture();
+    const saved = await fetch(`${base}/v1/rules`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'flag large transactions', scope: 'banking', cadence: 'event', domain: 'credit' }),
+    });
+    expect(saved.status).toBe(201);
+    // Kind is inferred from the text, but the user-chosen category wins over the inferred one.
+    expect(await saved.json()).toMatchObject({ kind: 'large-transaction', domain: 'credit' });
+  });
+
   it('lists active findings ranked with dollar impact and confidence', async () => {
     const { base } = await httpFixture();
     const account = await createAccount(base, {
@@ -259,7 +275,7 @@ Date: 05/01/2026
       body: JSON.stringify({
         accountId: account.id,
         filename: 'card.csv',
-        contentBase64: Buffer.from('Date,Description,Amount\n2026-07-01,Coffee Shop,-600.00\n').toString('base64'),
+        contentBase64: Buffer.from(`Date,Description,Amount\n${daysAgo(3)},Coffee Shop,-600.00\n`).toString('base64'),
       }),
     });
     expect(imported.status).toBe(200);
@@ -299,9 +315,9 @@ Date: 05/01/2026
       body: JSON.stringify({ text: 'check my 401k employer match', scope: 'all', cadence: 'monthly' }),
     });
     const pending = await (await fetch(`${base}/v1/questions`)).json() as { items: Array<{ factKey: string }> };
-    expect(pending.items.map((q) => q.factKey)).toContain('employer_match_pct');
+    expect(pending.items.map((q) => q.factKey)).toContain('retirement.employer_match_pct');
 
-    for (const [key, value] of [['annual_income', '120000'], ['retirement_contribution_pct', '3'], ['employer_match_pct', '6']]) {
+    for (const [key, value] of [['income.gross_annual', '120000'], ['retirement.contribution_pct', '3'], ['retirement.employer_match_pct', '6']]) {
       const res = await fetch(`${base}/v1/facts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -313,6 +329,55 @@ Date: 05/01/2026
     expect(cleared.items).toHaveLength(0);
     const findings = await (await fetch(`${base}/v1/findings`)).json() as { items: Array<{ kind: string; dollarImpactMinor: number }> };
     expect(findings.items.find((f) => f.kind === 'employer-match')).toMatchObject({ dollarImpactMinor: 360000 });
+  });
+
+  it('reports fact-gated rules and their unanswered facts via /v1/facts/needs', async () => {
+    const { base } = await httpFixture();
+    // employer-match is alwaysOn, so its needs surface without creating any rule.
+    const needs = await (await fetch(`${base}/v1/facts/needs`)).json() as {
+      byKind: Record<string, { facts: Array<{ key: string; satisfied: boolean; expects: string }> }>;
+      pending: Array<{ key: string; expects: string }>;
+    };
+    const match = needs.byKind['employer-match'];
+    expect(match).toBeTruthy();
+    expect(match?.facts.every((f) => !f.satisfied)).toBe(true);
+    expect(needs.pending.map((p) => p.key)).toContain('retirement.employer_match_pct');
+    expect(needs.pending.find((p) => p.key === 'retirement.employer_match_pct')?.expects).toBe('percent');
+  });
+
+  it('normalizes messy fact answers and marks the need satisfied', async () => {
+    const { base } = await httpFixture();
+    const answer = (key: string, value: string) => fetch(`${base}/v1/facts/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, value }),
+    });
+    // The built-in model is the default in tests, so the deterministic parser runs.
+    expect(await (await answer('retirement.employer_match_pct', 'about 6 %')).json()).toMatchObject({ value: '6', source: 'user' });
+    expect(await (await answer('income.gross_annual', '$120,000')).json()).toMatchObject({ value: '120000' });
+
+    const needs = await (await fetch(`${base}/v1/facts/needs`)).json() as {
+      byKind: Record<string, { facts: Array<{ key: string; satisfied: boolean }> }>;
+      pending: Array<{ key: string }>;
+    };
+    const facts = needs.byKind['employer-match']?.facts ?? [];
+    expect(facts.find((f) => f.key === 'retirement.employer_match_pct')?.satisfied).toBe(true);
+    expect(facts.find((f) => f.key === 'income.gross_annual')?.satisfied).toBe(true);
+    const pendingKeys = needs.pending.map((p) => p.key);
+    expect(pendingKeys).toContain('retirement.contribution_pct');
+    expect(pendingKeys).not.toContain('retirement.employer_match_pct');
+  });
+
+  it('exposes a rule-feed sync route that reports when no feed is configured', async () => {
+    const { base } = await httpFixture();
+    const res = await fetch(`${base}/v1/rules/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    // No RULES_FEED_URL set, so the sync is a reported no-op rather than an error.
+    expect(await res.json()).toMatchObject({ skipped: true, reason: 'no-feed-url' });
   });
 
   it('protects desktop data routes with the session token', async () => {

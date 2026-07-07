@@ -218,11 +218,16 @@ export interface RuleRecord {
 }
 
 // A user fact a rule depends on; a missing one becomes a ranked question.
+// `expects` hints the value shape so input can be normalized and validated (by the
+// model when available, deterministically otherwise) before it is stored as a fact.
+export type FactExpectation = 'currency' | 'percent' | 'number' | 'date' | 'text';
+
 export interface RuleFactNeed {
   key: string;
   prompt: string;
   unlockImpactMinor: number;
   currency?: string | undefined;
+  expects?: FactExpectation | undefined;
 }
 
 // A rule definition as DATA (see docs/rules-design.md). Built-in specs ship as a

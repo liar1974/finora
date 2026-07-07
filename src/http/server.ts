@@ -79,6 +79,7 @@ const ruleCreateSchema = z.object({
   channel: z.string().trim().max(40).optional(),
   scheduledHour: z.number().int().min(0).max(23).nullable().optional(),
   scheduledDay: z.number().int().min(0).max(31).nullable().optional(),
+  domain: z.enum(['cash-flow', 'spending', 'credit', 'investments', 'connections']).optional(),
 }).strict();
 
 const ruleToggleSchema = z.object({
@@ -112,6 +113,11 @@ const factSaveSchema = z.object({
 
 const factRemoveSchema = z.object({
   key: z.string().trim().min(1).max(120),
+}).strict();
+
+const factAnswerSchema = z.object({
+  key: z.string().trim().min(1).max(120),
+  value: z.string().trim().min(1).max(500),
 }).strict();
 
 export interface ServerOptions {
@@ -353,6 +359,9 @@ async function route(
     const input = parseSchema(ruleRemoveSchema, await readJson(request));
     return sendJson(response, 200, service.removeRule(input.id));
   }
+  if (url.pathname === '/v1/rules/sync' && method === 'POST') {
+    return sendJson(response, 200, await service.syncRuleFeed());
+  }
   if (url.pathname === '/v1/questions' && method === 'GET') {
     return sendJson(response, 200, { items: service.listQuestions() });
   }
@@ -363,9 +372,16 @@ async function route(
   if (url.pathname === '/v1/facts' && method === 'GET') {
     return sendJson(response, 200, { items: service.listFacts() });
   }
+  if (url.pathname === '/v1/facts/needs' && method === 'GET') {
+    return sendJson(response, 200, service.factNeeds());
+  }
   if (url.pathname === '/v1/facts' && method === 'POST') {
     const input = parseSchema(factSaveSchema, await readJson(request));
     return sendJson(response, 201, service.saveFact(input));
+  }
+  if (url.pathname === '/v1/facts/answer' && method === 'POST') {
+    const input = parseSchema(factAnswerSchema, await readJson(request));
+    return sendJson(response, 201, await service.answerFact(input));
   }
   if (url.pathname === '/v1/facts/remove' && method === 'POST') {
     const input = parseSchema(factRemoveSchema, await readJson(request));

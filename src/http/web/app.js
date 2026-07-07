@@ -166,6 +166,7 @@ const state = {
   settings: [],
   llm: null,
   rules: [],
+  factNeeds: { byKind: {}, pending: [] },
   insights: [],
   insightMutes: [],
   credit: { reports: [], accounts: [], inquiries: [], suggestions: [], latest: null },
@@ -192,7 +193,7 @@ const defaultPageSize = 10;
 const pageSizeOptions = [10, 25, 50, 100];
 const bankTabs = [['summary', 'Summary'], ['transactions', 'Transactions'], ['cashflow', 'Cash flow'], ['recurring', 'Recurring']];
 const brokerageTabs = [['summary', 'Summary'], ['transactions', 'Transactions']];
-const settingsTabs = [['models', 'Models'], ['accounts', 'Bank/Brokerage'], ['delivery', 'Delivery'], ['insights', 'Rules & Insights']];
+const settingsTabs = [['models', 'Models'], ['accounts', 'Bank/Brokerage'], ['delivery', 'Delivery'], ['insights', 'Rules & Facts']];
 const creditTabs = [['latest', 'Latest report overview'], ['reports', 'Reports']];
 // [name, cadence, scope, executionClass, scheduledHour, detail, domain]. The
 // domain follows the rules taxonomy in docs/rules-design.md and drives the
@@ -210,6 +211,7 @@ const sampleInsightRules = [
   ['Net worth movement', 'monthly', 'all', 'D', 9, 'Flag a material month-over-month drop in net worth from balance history.', 'cash-flow'],
   ['Cash flow negative', 'monthly', 'banking', 'D', 9, 'Flag when 30-day spending outran income and drew down savings.', 'cash-flow'],
   ['Upcoming bills / overdraft', 'daily', 'banking', 'D', 9, 'Sum recurring bills due before the next deposit and warn if they exceed available cash.', 'cash-flow'],
+  ['Employer 401(k) match', 'monthly', 'all', 'D', 9, 'Flag forgone employer 401(k) match when your contribution is below the match — free money left on the table. Needs your salary and match details.', 'cash-flow', 'employer-match'],
   ['New large transaction', 'event', 'banking', 'D', null, 'Notify when any posted outflow exceeds $500.', 'spending'],
   ['Duplicate or unusual charge', 'event', 'banking', 'D', null, 'Flag two matching merchant charges of the same amount within a few days.', 'spending'],
   ['Fee and interest watch', 'event', 'banking', 'D', null, 'Total the bank fees, card interest, and surcharges paid over the last 90 days, annualized.', 'spending'],
@@ -1424,6 +1426,7 @@ async function loadData() {
     settings,
     llm,
     rules,
+    factNeeds,
     insights,
     insightMutes,
     credit,
@@ -1440,6 +1443,7 @@ async function loadData() {
     api('/v1/settings'),
     api('/v1/llm'),
     api('/v1/rules'),
+    api('/v1/facts/needs'),
     api('/v1/findings'),
     api('/v1/finding-mutes'),
     api('/v1/credit-reports'),
@@ -1458,6 +1462,7 @@ async function loadData() {
   state.llm = llm;
   state.notificationChannel = settingValue('NOTIFICATION_CHANNEL', state.notificationChannel);
   state.rules = rules.items;
+  state.factNeeds = { byKind: factNeeds.byKind || {}, pending: factNeeds.pending || [] };
   state.insights = insights.items;
   state.insightMutes = insightMutes.items;
   state.credit = credit;
@@ -3037,7 +3042,58 @@ function renderSettingsDelivery(view) {
   view.appendChild(sec);
 }
 
+// The answer surface: every still-unanswered user fact across all rules, so a
+// single answer can unlock any rule that references that fact. Questions are treated
+// as equally important — no ranking. Hidden entirely when nothing is outstanding.
+function renderNeedsInput(view) {
+  const pending = state.factNeeds.pending || [];
+  if (!pending.length) return;
+  const sec = el('div', 'sec');
+  sec.innerHTML = `<div class="sechdr"><h3>Needs your input</h3><span class="pill">${pending.length}</span></div>`
+    + '<div class="cardsub">Some rules need details only you know. Answer these to turn them on.</div>';
+  const box = el('div', 'needslist');
+  for (const need of pending) box.appendChild(needInputRow(need));
+  sec.appendChild(box);
+  view.appendChild(sec);
+}
+
+function needInputRow(need) {
+  const row = el('div', 'needrow');
+  const numeric = need.expects === 'currency' || need.expects === 'percent' || need.expects === 'number';
+  const type = need.expects === 'date' ? 'date' : 'text';
+  const placeholder = need.expects === 'currency' ? 'e.g. 120000' : need.expects === 'percent' ? 'e.g. 6' : '';
+  const form = el('form', 'needform');
+  form.innerHTML = `<div class="needprompt">${esc(need.prompt)}</div>`
+    + `<div class="needentry"><input name="value" type="${type}"${numeric ? ' inputmode="decimal"' : ''} placeholder="${esc(placeholder)}" autocomplete="off" required />`
+    + '<button class="primary" type="submit">Save</button></div><span class="message"></span>';
+  const message = form.querySelector('.message');
+  const button = form.querySelector('button');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const value = form.elements.value.value.trim();
+    if (!value) return;
+    button.disabled = true;
+    message.textContent = '';
+    try {
+      await api('/v1/facts/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: need.key, value }),
+      });
+      toast('Saved.');
+      await loadData();
+      renderSettings();
+    } catch (error) {
+      message.textContent = (error && error.message) || 'Could not save that value.';
+      button.disabled = false;
+    }
+  });
+  row.appendChild(form);
+  return row;
+}
+
 function renderSettingsInsights(view) {
+  renderNeedsInput(view);
   const sec = el('div', 'sec');
   sec.innerHTML = '<div class="sechdr"><h3>Rules</h3></div><div class="cardsub">Rules can run on events or on a schedule. Use the switch to pause delivery without changing the rule.</div>';
   const box = el('div', 'rulelist');
@@ -3102,6 +3158,8 @@ function renderSettingsInsights(view) {
   sec.appendChild(box);
   view.appendChild(sec);
 
+  renderRuleFeed(view);
+
   const muted = el('div', 'sec');
   muted.innerHTML = '<div class="sechdr"><h3>Muted insights</h3><span class="pill">' + state.insightMutes.length + '</span></div>';
   muted.appendChild(state.insightMutes.length ? transactionLikeTable(
@@ -3114,6 +3172,57 @@ function renderSettingsInsights(view) {
     { pageKey: 'settings-muted' },
   ) : empty('Nothing muted.'));
   view.appendChild(muted);
+}
+
+// Over-the-air rule updates: point Finora at a rules feed URL (a JSON file, e.g. a
+// GitHub raw URL, or a local static server in dev) and pull any newer rule versions.
+// Downloaded rules that need details only the user knows appear under "Needs your
+// input" above, exactly like built-in fact-gated rules.
+function renderRuleFeed(view) {
+  const sec = el('div', 'sec');
+  sec.innerHTML = '<div class="sechdr"><h3>Rule updates</h3></div>'
+    + '<div class="cardsub">Point Finora at a rules feed URL (a JSON file). Checking downloads any newer rule versions; rules that need details you know show up under “Needs your input”.</div>';
+  const form = el('form', 'formgrid settingsform');
+  form.innerHTML = settingRow('RULES_FEED_URL', 'Rules feed URL', 'url')
+    + '<div class="row"><button class="primary" type="submit">Save URL</button>'
+    + '<button class="ghost" type="button" id="syncRules">Check for updates</button>'
+    + '<span class="message"></span></div>';
+  const message = form.querySelector('.message');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      await saveSettings(Object.fromEntries(new FormData(form)), 'Feed URL saved.');
+      renderSettings();
+    } catch (error) {
+      message.textContent = error.message;
+    }
+  });
+  form.querySelector('#syncRules').addEventListener('click', async (event) => {
+    event.target.disabled = true;
+    message.textContent = 'Checking…';
+    try {
+      const result = await api('/v1/rules/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      toast(ruleSyncMessage(result));
+      await loadData();
+      renderSettings();
+    } catch (error) {
+      message.textContent = error.message;
+      event.target.disabled = false;
+    }
+  });
+  sec.appendChild(form);
+  view.appendChild(sec);
+}
+
+function ruleSyncMessage(result) {
+  if (!result.skipped) return `Downloaded ${result.applied} rule${result.applied === 1 ? '' : 's'} (v${result.version}).`;
+  if (result.reason === 'no-feed-url') return 'Set and save a feed URL first.';
+  if (result.reason === 'not-newer') return 'Rules are already up to date.';
+  return 'No rule feed is available.';
 }
 
 function ruleRow(rule) {
@@ -3180,9 +3289,18 @@ function ruleScheduleLabel(rule) {
 
 // Rule-row chips: the human schedule, and a "custom" tag for user-created rules
 // (built-in rules are unlabeled).
+// A rule "needs input" when it declares user facts (by kind) that are still
+// unanswered. The facts layer is decoupled: the rule references keys, and the
+// answer state comes from /v1/facts/needs rather than from the rule itself.
+function ruleNeedsInput(rule) {
+  const entry = rule.kind ? state.factNeeds.byKind[rule.kind] : null;
+  return Boolean(entry && entry.facts.some((fact) => !fact.satisfied));
+}
+
 function ruleMetaTags(rule) {
   const tags = [ruleTag('status', ruleScheduleLabel(rule))];
   if (!rule.builtIn) tags.push(ruleTag('status', 'custom'));
+  if (ruleNeedsInput(rule)) tags.push(ruleTag('needsinput', 'Needs input'));
   return `<div class="ruletags">${tags.join('')}</div>`;
 }
 
@@ -3202,16 +3320,32 @@ function ruleDayOptions(cadence, selected) {
 
 // Rebuild the day field for the current cadence and show it only for weekly/monthly.
 function syncRuleDayField(form, selected) {
-  const field = form.querySelector('.ruleday');
-  const select = form.elements.scheduledDay;
-  if (!field || !select) return;
   const cadence = form.elements.cadence ? form.elements.cadence.value : '';
-  const show = cadence === 'weekly' || cadence === 'monthly';
-  field.hidden = !show;
-  if (show) select.innerHTML = ruleDayOptions(cadence, selected);
+  const dayField = form.querySelector('.ruleday');
+  const daySelect = form.elements.scheduledDay;
+  if (dayField && daySelect) {
+    const show = cadence === 'weekly' || cadence === 'monthly';
+    dayField.hidden = !show;
+    if (show) daySelect.innerHTML = ruleDayOptions(cadence, selected);
+  }
+  // Event- and hourly-triggered rules run when they fire, not at a set hour, so a
+  // run hour does not apply.
+  const hourField = form.querySelector('.rulehour');
+  if (hourField) hourField.hidden = cadence === 'event' || cadence === 'hourly';
 }
 
 function ruleToggle(rule) {
+  // A rule that still needs user input cannot be enabled: the switch is disabled
+  // until the required facts are answered in the "Needs your input" card above.
+  if (ruleNeedsInput(rule)) {
+    const blocked = el('button', 'switchbtn');
+    blocked.type = 'button';
+    blocked.disabled = true;
+    blocked.title = 'Answer the question in "Needs your input" above to enable this rule.';
+    blocked.setAttribute('aria-label', `${rule.title} needs input before it can be enabled`);
+    blocked.innerHTML = '<span></span><b>Off</b>';
+    return blocked;
+  }
   const button = el('button', `switchbtn${rule.enabled ? ' on' : ''}`);
   button.type = 'button';
   button.setAttribute('aria-pressed', String(Boolean(rule.enabled)));
@@ -3248,12 +3382,15 @@ function saveBuiltInRuleOverride(originalName, patch) {
 
 function builtInRules() {
   const overrides = builtInRuleOverrides();
-  return sampleInsightRules.flatMap(([name, cadence, scope, mode, scheduledHour, detail, domain]) => {
+  return sampleInsightRules.flatMap(([name, cadence, scope, mode, scheduledHour, detail, domain, kind]) => {
     const saved = overrides[name] || {};
     if (saved.deleted === true) return [];
     return {
       originalName: name,
       name: saved.name || name,
+      // Fact-gated built-ins carry the backend spec kind so their needs-input state
+      // (from /v1/facts/needs, keyed by kind) can gate the row.
+      ...(kind ? { kind } : {}),
       cadence: saved.cadence || cadence,
       scope: saved.scope || scope,
       mode: saved.mode || mode,
@@ -3275,7 +3412,7 @@ function openBuiltInRuleModal(rule) {
   const form = el('form', 'formgrid');
   form.innerHTML = `<div class="rulecopy"><div class="nm">${esc(rule.name)}</div>${rule.detail ? `<div class="sub">${esc(rule.detail)}</div>` : ''}</div>
     <div class="cardsub">Built-in rule. Its logic and scope are fixed — you can pause it or change when it runs.</div>
-    <div class="split"><label>Cadence<select name="cadence">${['event', 'hourly', 'daily', 'weekly', 'monthly'].map((c) => `<option${rule.cadence === c ? ' selected' : ''}>${c}</option>`).join('')}</select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(rule.cadence, rule.scheduledDay)}</select></label><label>Run hour<select name="scheduledHour">${ruleHourOptions(rule.scheduledHour)}</select></label></div>
+    <div class="split"><label>Cadence<select name="cadence">${['event', 'hourly', 'daily', 'weekly', 'monthly'].map((c) => `<option${rule.cadence === c ? ' selected' : ''}>${c}</option>`).join('')}</select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(rule.cadence, rule.scheduledDay)}</select></label><label class="rulehour">Run hour<select name="scheduledHour">${ruleHourOptions(rule.scheduledHour)}</select></label></div>
     <div class="row"><button class="primary" type="submit">Save</button><span class="message"></span></div>`;
   panel.appendChild(form);
   modal(panel);
@@ -3285,10 +3422,12 @@ function openBuiltInRuleModal(rule) {
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(form));
+    const cadence = data.cadence || rule.cadence;
+    const triggered = cadence === 'event' || cadence === 'hourly';
     saveBuiltInRuleOverride(rule.originalName, {
       ...rule,
-      cadence: data.cadence || rule.cadence,
-      scheduledHour: data.scheduledHour === '' ? null : Number(data.scheduledHour),
+      cadence,
+      scheduledHour: triggered || data.scheduledHour === '' ? null : Number(data.scheduledHour),
       scheduledDay: data.scheduledDay === '' || data.scheduledDay === undefined ? null : Number(data.scheduledDay),
       enabled: rule.enabled !== false,
     });
@@ -3307,7 +3446,7 @@ function openRuleModal(existingRule = null) {
   form.innerHTML = `<label>Rule prompt<textarea name="text" required placeholder="Generate a weekly rule that flags brokerage cash above 25% and explains why it matters.">${esc(existingRule?.sourceText || '')}</textarea></label>
     <div class="row"><button class="ghost" type="button" id="previewRule">Preview</button><span class="message"></span></div>
     <div class="rulepreview" id="rulePreview"${existingRule ? '' : ' hidden'}>${existingRule ? rulePreviewMarkup(existingRule) : ''}</div>
-    <div class="deliverysettings" id="deliverySettings"${hasPreview ? '' : ' hidden'}><div class="nm">Delivery settings</div><div class="split"><label>Scope<select name="scope"><option value="">Generate</option><option${existingRule?.scope === 'banking' ? ' selected' : ''}>banking</option><option${existingRule?.scope === 'brokerage' ? ' selected' : ''}>brokerage</option><option${existingRule?.scope === 'credit' ? ' selected' : ''}>credit</option><option${existingRule?.scope === 'all' ? ' selected' : ''}>all</option></select></label><label>Cadence<select name="cadence"><option value="">Generate</option><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(existingRule?.cadence, existingRule?.scheduledDay)}</select></label></div><label>Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div>
+    <div class="deliverysettings" id="deliverySettings"${hasPreview ? '' : ' hidden'}><div class="nm">Delivery settings</div><div class="split"><label>Category<select name="domain">${ruleDomains.map(([key, label]) => `<option value="${key}"${existingRule?.domain === key ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select></label><label>Scope<select name="scope"><option value="">Generate</option><option${existingRule?.scope === 'banking' ? ' selected' : ''}>banking</option><option${existingRule?.scope === 'brokerage' ? ' selected' : ''}>brokerage</option><option${existingRule?.scope === 'credit' ? ' selected' : ''}>credit</option><option${existingRule?.scope === 'all' ? ' selected' : ''}>all</option></select></label><label>Cadence<select name="cadence"><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(existingRule?.cadence, existingRule?.scheduledDay)}</select></label></div><label class="rulehour">Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div>
     <div class="row"><button class="primary" type="submit" id="saveRule"${hasPreview ? '' : ' hidden disabled'}>Save rule</button></div>`;
   panel.appendChild(form);
   modal(panel);
@@ -3391,12 +3530,15 @@ function ruleFormData(form) {
   const data = Object.fromEntries(new FormData(form));
   for (const key of ['scope', 'cadence']) if (!data[key]) delete data[key];
   data.channel = 'auto';
-  data.scheduledHour = data.scheduledHour === '' ? null : Number(data.scheduledHour);
+  // Event/hourly rules are triggered, not scheduled, so they have no run hour.
+  const triggered = data.cadence === 'event' || data.cadence === 'hourly';
+  data.scheduledHour = triggered || data.scheduledHour === '' ? null : Number(data.scheduledHour);
   data.scheduledDay = data.scheduledDay === '' || data.scheduledDay === undefined ? null : Number(data.scheduledDay);
   return data;
 }
 
 function applyRulePreview(form, preview) {
+  if (form.elements.domain && preview.domain) form.elements.domain.value = preview.domain;
   form.elements.scope.value = preview.scope;
   form.elements.cadence.value = preview.cadence;
   form.elements.scheduledHour.value = preview.scheduledHour === null || preview.scheduledHour === undefined ? '' : String(preview.scheduledHour);

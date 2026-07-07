@@ -93,6 +93,7 @@ interface FactNeed {
   prompt: string;
   unlockImpactMinor: number; // estimated dollars the answer would unlock, for ranking questions
   currency?: string;
+  expects?: 'currency' | 'percent' | 'number' | 'date' | 'text'; // value shape, for input normalization
 }
 
 // The built-in rule definitions, authored in code and seeded into rule_specs as
@@ -260,7 +261,7 @@ const largeTransaction: Evaluator = {
       t.account_id AS account_id,
       t.created_at AS created_at
     FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id
-    WHERE t.created_at >= :rule_created_at AND t.amount_minor < 0 AND ABS(t.amount_minor) >= 50000
+    WHERE julianday(:now_iso) - julianday(t.date) <= 30 AND t.amount_minor < 0 AND ABS(t.amount_minor) >= 50000
     ORDER BY ABS(t.amount_minor) DESC
     LIMIT 20
   `,
@@ -281,7 +282,7 @@ const duplicateCharge: Evaluator = {
         ON t1.account_id = t2.account_id AND t1.amount_minor = t2.amount_minor
         AND normalize_merchant(t1.description) = normalize_merchant(t2.description)
         AND t1.id < t2.id
-      WHERE t1.amount_minor < 0 AND t1.created_at >= :rule_created_at AND t2.created_at >= :rule_created_at
+      WHERE t1.amount_minor < 0 AND julianday(:now_iso) - julianday(t1.date) <= 30
         AND ABS(julianday(t1.date) - julianday(t2.date)) <= 3
     )
     SELECT
@@ -342,7 +343,7 @@ const creditUtilization: Evaluator = {
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'credit',
-  keywords: /utilization|credit|card|score|信用|利用率/,
+  keywords: /utilization|credit limit|信用利用率|利用率/,
   sql: `
     WITH latest AS (
       SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn
@@ -405,19 +406,23 @@ const employerMatch: Evaluator = {
   defaultTier: 'advisor',
   scope: 'all',
   keywords: /401k|401\(k\)|employer match|retirement match|matching|雇主匹配/,
+  alwaysOn: true,
+  // Fact keys are namespaced by subject (income.* / retirement.*), not by rule
+  // domain, so one answer serves every rule that references the key and downloaded
+  // rules can't collide. income.gross_annual is an income fact this rule borrows.
   facts: [
-    { key: 'annual_income', prompt: 'What is your gross annual salary?', unlockImpactMinor: 240_000 },
-    { key: 'retirement_contribution_pct', prompt: 'What percent of salary do you contribute to your 401(k)?', unlockImpactMinor: 240_000 },
-    { key: 'employer_match_pct', prompt: 'Up to what percent of salary does your employer match?', unlockImpactMinor: 240_000 },
+    { key: 'income.gross_annual', prompt: 'What is your gross annual salary?', unlockImpactMinor: 240_000, expects: 'currency' },
+    { key: 'retirement.contribution_pct', prompt: 'What percent of salary do you contribute to your 401(k)?', unlockImpactMinor: 240_000, expects: 'percent' },
+    { key: 'retirement.employer_match_pct', prompt: 'Up to what percent of salary does your employer match?', unlockImpactMinor: 240_000, expects: 'percent' },
   ],
   sql: `
     WITH f AS (
       SELECT
-        MAX(CASE WHEN key = 'annual_income' THEN CAST(REPLACE(REPLACE(value, '$', ''), ',', '') AS REAL) END) AS income,
-        MAX(CASE WHEN key = 'retirement_contribution_pct' THEN CAST(value AS REAL) END) AS contrib_raw,
-        MAX(CASE WHEN key = 'employer_match_pct' THEN CAST(value AS REAL) END) AS match_raw,
+        MAX(CASE WHEN key = 'income.gross_annual' THEN CAST(REPLACE(REPLACE(value, '$', ''), ',', '') AS REAL) END) AS income,
+        MAX(CASE WHEN key = 'retirement.contribution_pct' THEN CAST(value AS REAL) END) AS contrib_raw,
+        MAX(CASE WHEN key = 'retirement.employer_match_pct' THEN CAST(value AS REAL) END) AS match_raw,
         MIN(confidence) AS conf
-      FROM facts WHERE key IN ('annual_income', 'retirement_contribution_pct', 'employer_match_pct')
+      FROM facts WHERE key IN ('income.gross_annual', 'retirement.contribution_pct', 'retirement.employer_match_pct')
     ),
     n AS (
       SELECT income, conf,
@@ -434,7 +439,7 @@ const employerMatch: Evaluator = {
       COALESCE(conf, 0.7) AS confidence,
       3 AS effort,
       'Match ' || printf('%.1f', matchp * 100) || '% minus contribution ' || printf('%.1f', contrib * 100) || '% on ' || money(CAST(income * 100 AS INT)) || ' income.' AS evidence_summary,
-      'fact:employer_match_pct,fact:retirement_contribution_pct,fact:annual_income' AS evidence_records,
+      'fact:retirement.employer_match_pct,fact:retirement.contribution_pct,fact:income.gross_annual' AS evidence_records,
       'Raise contribution to at least the full match' AS action_label,
       :now_iso AS created_at
     FROM n
@@ -998,7 +1003,7 @@ const executedTrades: Evaluator = {
       t.account_id AS account_id,
       t.created_at AS created_at
     FROM brokerage_transactions t LEFT JOIN accounts a ON a.id = t.account_id
-    WHERE t.created_at >= :rule_created_at AND (lower(t.investment_type) LIKE '%buy%' OR lower(t.investment_type) LIKE '%sell%')
+    WHERE julianday(:now_iso) - julianday(t.date) <= 30 AND (lower(t.investment_type) LIKE '%buy%' OR lower(t.investment_type) LIKE '%sell%')
     LIMIT 20
   `,
 };
@@ -1211,6 +1216,7 @@ export function builtinRuleSpecs(): RuleSpec[] {
       prompt: f.prompt,
       unlockImpactMinor: f.unlockImpactMinor,
       ...(f.currency ? { currency: f.currency } : {}),
+      ...(f.expects ? { expects: f.expects } : {}),
     })),
     enabled: true,
     source: 'builtin',

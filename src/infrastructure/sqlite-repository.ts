@@ -1270,6 +1270,7 @@ export class SqliteFinanceRepository implements FinanceRepository {
       { version: 5, up: () => this.addRuleScheduledDay() },
       { version: 6, up: () => this.applyRecurringSeriesView() },
       { version: 7, up: () => this.database.exec(RULE_SPECS_SCHEMA) },
+      { version: 8, up: () => this.renameNamespacedFactKeys() },
     ];
 
     // Before mutating an existing user's data, snapshot it. This only runs when
@@ -1570,6 +1571,22 @@ export class SqliteFinanceRepository implements FinanceRepository {
     const columns = this.database.prepare('PRAGMA table_info(rules)').all() as { name: string }[];
     if (!columns.some((column) => column.name === 'scheduled_day')) {
       this.database.exec('ALTER TABLE rules ADD COLUMN scheduled_day INTEGER');
+    }
+  }
+
+  // Adopt namespaced fact keys (income.* / retirement.*) so rules share facts by a
+  // stable, collision-safe key. Renames the pre-namespace employer-match facts in
+  // place; stale questions keyed by the old names are cleared, since refreshQuestions
+  // re-derives them from the updated specs on the next read.
+  private renameNamespacedFactKeys(): void {
+    const renames: [string, string][] = [
+      ['annual_income', 'income.gross_annual'],
+      ['retirement_contribution_pct', 'retirement.contribution_pct'],
+      ['employer_match_pct', 'retirement.employer_match_pct'],
+    ];
+    for (const [oldKey, newKey] of renames) {
+      this.database.prepare('UPDATE facts SET key = ? WHERE key = ?').run(newKey, oldKey);
+      this.database.prepare('DELETE FROM questions WHERE fact_key = ?').run(oldKey);
     }
   }
 
