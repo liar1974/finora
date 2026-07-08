@@ -79,16 +79,30 @@ const ruleCreateSchema = z.object({
   channel: z.string().trim().max(40).optional(),
   scheduledHour: z.number().int().min(0).max(23).nullable().optional(),
   scheduledDay: z.number().int().min(0).max(31).nullable().optional(),
-  domain: z.enum(['cash-flow', 'spending', 'credit', 'investments', 'connections']).optional(),
 }).strict();
 
+// Rules are keyed by kind in the single rules table, so toggle/remove address a
+// rule by its kind (a slug), not a UUID.
 const ruleToggleSchema = z.object({
-  id: z.string().uuid(),
+  kind: z.string().min(1),
   enabled: z.boolean(),
+}).strict();
+
+const ruleScheduleSchema = z.object({
+  kind: z.string().min(1),
+  cadence: z.string().trim().max(40).optional(),
+  scheduledHour: z.number().int().min(0).max(23).nullable().optional(),
+  scheduledDay: z.number().int().min(0).max(31).nullable().optional(),
 }).strict();
 
 const ruleRemoveSchema = z.object({
   id: z.string().uuid(),
+}).strict();
+
+// A finding id is a composite string (kind:ruleId:key), not a UUID, so it needs
+// its own permissive schema rather than reusing ruleRemoveSchema.
+const findingArtifactSchema = z.object({
+  id: z.string().min(1),
 }).strict();
 
 const memoryRememberSchema = z.object({
@@ -343,6 +357,10 @@ async function route(
   if (url.pathname === '/v1/findings' && method === 'GET') {
     return sendJson(response, 200, { items: service.listFindings() });
   }
+  if (url.pathname === '/v1/findings/artifact' && method === 'POST') {
+    const input = parseSchema(findingArtifactSchema, await readJson(request));
+    return sendJson(response, 200, await service.generateFindingArtifact(input.id));
+  }
   if (url.pathname === '/v1/rules' && method === 'GET') {
     return sendJson(response, 200, { items: service.listRules() });
   }
@@ -356,11 +374,11 @@ async function route(
   }
   if (url.pathname === '/v1/rules/toggle' && method === 'POST') {
     const input = parseSchema(ruleToggleSchema, await readJson(request));
-    return sendJson(response, 200, service.toggleRule(input.id, input.enabled));
+    return sendJson(response, 200, service.toggleRule(input.kind, input.enabled));
   }
-  if (url.pathname === '/v1/rules/remove' && method === 'POST') {
-    const input = parseSchema(ruleRemoveSchema, await readJson(request));
-    return sendJson(response, 200, service.removeRule(input.id));
+  if (url.pathname === '/v1/rules/schedule' && method === 'POST') {
+    const input = parseSchema(ruleScheduleSchema, await readJson(request));
+    return sendJson(response, 200, service.updateRuleSchedule(input));
   }
   if (url.pathname === '/v1/rules/sync' && method === 'POST') {
     return sendJson(response, 200, await service.syncRuleFeed());

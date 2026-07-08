@@ -121,8 +121,10 @@ data only**. Each clip loops automatically — click it to open the full video.
   your data kept on Finora's servers — because there are none.
 - **It never moves money.** Finora is read-only when it comes to your finances.
   It shows you information; it can't transfer funds.
-- **It never gives advice.** Finora presents your own numbers clearly and leaves
-  the decisions to you.
+- **It never gives advice or acts for you.** Finora presents your own numbers
+  clearly and leaves the decisions to you. It can *draft* a document from your own
+  data — a dispute letter for a duplicate charge, a cancellation or negotiation
+  script — but only for you to review and send yourself; it never sends anything.
 - **Connections are optional.** If you connect a bank or brokerage, those
   credentials are saved only on your computer and used only to talk to that
   provider.

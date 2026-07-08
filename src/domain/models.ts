@@ -198,21 +198,34 @@ export type RuleActionTier = 'observer' | 'advisor' | 'guardian' | 'navigator';
 
 export type RuleDomain = 'cash-flow' | 'spending' | 'credit' | 'investments' | 'connections';
 
+// One rule = one row in the single `rules` table (see docs/rules-design.md). The
+// row carries BOTH the definition (code/feed-owned: sql, keywords, facts…, kept
+// in sync by the startup seed / OTA feed) and the user's on/off + schedule
+// (user-owned: active, channel, schedule — never touched by the seed). `kind` is
+// the identity. The engine runs a row when enabled && active.
 export interface RuleRecord {
-  id: string;
-  kind: string; // evaluator key in the detector registry
+  kind: string; // identity + evaluator key
   domain: RuleDomain;
-  sourceText: string;
   executionClass: RuleExecutionClass;
   actionTier: RuleActionTier;
   scope: string;
   cadence: string;
+  // Definition (code/feed owned)
+  keywords: string;
+  sql: string | null;
+  prompt: string | null;
+  facts: RuleFactNeed[];
+  enabled: boolean; // definition available (a feed can ship enabled=0 to retire a rule)
+  version: number;
+  source: string; // builtin | downloaded | user
+  // User owned (preserved across re-seeding)
+  active: boolean; // on/off switch; every rule ships active by default
+  sourceText: string;
   channel: string;
   scheduledHour: number | null;
   // Which day the rule's schedule targets: weekday 0=Sunday..6 for weekly, day of
   // month 1..28 for monthly, null otherwise. Descriptive schedule metadata.
   scheduledDay: number | null;
-  enabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -230,10 +243,10 @@ export interface RuleFactNeed {
   expects?: FactExpectation | undefined;
 }
 
-// A rule definition as DATA (see docs/rules-design.md). Built-in specs ship as a
-// seed and download-delivered specs are upserted into the rule_specs table; the
-// engine interprets both uniformly. A spec carries EITHER sql (deterministic) or
-// prompt (LLM). keywords is a regex source string for natural-language inference.
+// A rule definition as DATA (see docs/rules-design.md): the code/feed-owned view
+// of a rule, upserted into the single `rules` table by the built-in seed and the
+// OTA feed. A spec carries EITHER sql (deterministic) or prompt (LLM). keywords is
+// a regex source string for natural-language inference.
 export interface RuleSpec {
   kind: string;
   domain: RuleDomain;
@@ -241,7 +254,6 @@ export interface RuleSpec {
   actionTier: RuleActionTier;
   scope: string;
   cadence: string;
-  alwaysOn: boolean;
   keywords: string;
   sql: string | null;
   prompt: string | null;
@@ -291,6 +303,32 @@ export interface RecurringClassification {
   updatedAt: string;
 }
 
+// ── Merchant identity (F1) ────────────────────────────────────────────────────
+// The same real vendor bills under many raw descriptions that normalize to
+// different merchant keys ("APPLE.COM/BILL", "ITUNES", "APPLE SERVICES"). An LLM
+// resolves each normalized merchant to a shared canonical identity, cached here
+// so deterministic rules can group by vendor rather than by raw string (e.g. a
+// subscription billed on two cards under two descriptions). Mirrors the recurring
+// classification pipeline: deterministic candidates -> model -> cached verdict.
+export interface MerchantCandidate {
+  merchant: string; // normalized key: normalize_merchant(description)
+  label: string; // most representative raw description
+  category: string | null;
+  count: number; // number of transactions under this normalized merchant
+}
+
+// The stored identity for one normalized merchant. canonicalSlug is the lowercased
+// join key shared by every merchant that maps to the same vendor; canonicalName is
+// the display form. signature carries the prompt version so a bump re-runs all.
+export interface MerchantIdentity {
+  merchant: string;
+  canonicalName: string;
+  canonicalSlug: string;
+  confidence: number;
+  signature: string;
+  updatedAt: string;
+}
+
 // A single actionable finding, uniform across every evaluator. dollarImpactMinor
 // is signed integer minor units normalized to a twelve-month horizon so findings
 // are comparable; confidence is 0..1; score is the computed ranking value.
@@ -321,6 +359,11 @@ export interface FindingAction {
   tier: RuleActionTier; // the tier this action would run at, after confidence capping
   label: string;
   artifact: string | null; // generated text for the Advisor tier; null until produced
+  // The kind of document Finora can draft for this finding (a dispute letter, a
+  // fee-waiver request, a cancellation script…), or absent when no drafter
+  // exists for the rule. Advertised so the UI can offer "draft it for me"; the
+  // draft itself is produced on demand by FinanceService.generateFindingArtifact.
+  artifactType?: string | null;
 }
 
 export interface FindingEvidence {

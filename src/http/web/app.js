@@ -201,43 +201,45 @@ const creditTabs = [['latest', 'Latest report overview'], ['reports', 'Reports']
 // domain follows the rules taxonomy in docs/rules-design.md and drives the
 // grouped Rules UI. Rows backed by a live evaluator carry their real D class;
 // aspirational rows keep their intended L / L+ class until wired.
-const sampleInsightRules = [
-  ['Connection health', 'event', 'all', 'D', null, 'Create an insight when a Plaid connection is not active, a token is missing, or the Plaid cursor is missing.', 'connections'],
-  ['Stale account data', 'weekly', 'all', 'D', 9, 'Flag when the newest balance or transaction is weeks old, so stale data behind other findings is visible.', 'connections'],
-  ['Idle cash scan', 'weekly', 'banking', 'D', 9, 'Price checking/savings cash against a high-yield benchmark and surface the annual yield left on the table.', 'cash-flow'],
-  ['Low balance risk', 'daily', 'banking', 'D', 9, 'Flag checking or savings balances that fall below the local safety threshold.', 'cash-flow'],
-  ['Negative balance', 'event', 'banking', 'D', null, 'Notify immediately when a spending account is overdrawn.', 'cash-flow'],
-  ['Cash runway', 'monthly', 'banking', 'D', 9, 'Estimate months of runway from liquid cash and average monthly spending, and flag when it is short.', 'cash-flow'],
-  ['Expected income late', 'event', 'banking', 'L+', null, 'Prefilter missed income cadence and generate a review item when expected payroll or deposits are absent.', 'cash-flow'],
-  ['Weekly financial health check', 'weekly', 'all', 'L', 9, 'Generate a concise digest of balances, spending, investments, and connection health.', 'cash-flow'],
-  ['Net worth movement', 'monthly', 'all', 'D', 9, 'Flag a material month-over-month drop in net worth from balance history.', 'cash-flow'],
-  ['Cash flow negative', 'monthly', 'banking', 'D', 9, 'Flag when 30-day spending outran income and drew down savings.', 'cash-flow'],
-  ['Upcoming bills / overdraft', 'daily', 'banking', 'D', 9, 'Sum recurring bills due before the next deposit and warn if they exceed available cash.', 'cash-flow'],
-  ['Employer 401(k) match', 'monthly', 'all', 'D', 9, 'Flag forgone employer 401(k) match when your contribution is below the match — free money left on the table. Needs your salary and match details.', 'cash-flow', 'employer-match'],
-  ['New large transaction', 'event', 'banking', 'D', null, 'Notify when any posted outflow exceeds $500.', 'spending'],
-  ['Duplicate or unusual charge', 'event', 'banking', 'D', null, 'Flag two matching merchant charges of the same amount within a few days.', 'spending'],
-  ['Fee and interest watch', 'event', 'banking', 'D', null, 'Total the bank fees, card interest, and surcharges paid over the last 90 days, annualized.', 'spending'],
-  ['Subscription price increase', 'weekly', 'banking', 'D', 9, 'Flag a recurring charge whose latest amount rose against its own history.', 'spending'],
-  ['Recurring subscriptions', 'monthly', 'banking', 'D', 9, 'List detected subscriptions and their annualized cost so ghost memberships are visible.', 'spending'],
-  ['New recurring charge', 'event', 'banking', 'D', null, 'Flag a subscription that only started recently — a new sign-up or a free trial that converted to paid.', 'spending'],
-  ['Spending category spike', 'weekly', 'banking', 'D', 9, 'Flag a discretionary category whose last-30-day spend is well above its 3-month average.', 'spending'],
-  ['Duplicate subscription across cards', 'weekly', 'banking', 'D', 9, 'Flag the same subscription billed on more than one account — paying twice.', 'spending'],
-  ['Unfamiliar merchant charge', 'event', 'banking', 'D', null, 'Flag a large charge at a merchant with no prior history.', 'spending'],
-  ['Trial conversion watch', 'daily', 'banking', 'L+', 9, 'Detect trial-like merchants and ask the local model whether the charge looks like a conversion.', 'spending'],
-  ['Discretionary spending review', 'weekly', 'banking', 'L', 9, 'Summarize dining, shopping, entertainment, and travel spend that moved materially from baseline.', 'spending'],
-  ['Credit utilization', 'daily', 'credit', 'D', 9, 'Notify when credit card balance exceeds 30% or 70% of known limit.', 'credit'],
-  ['Card interest', 'event', 'credit', 'D', null, 'Flag interest charged on a card — the cost of carrying a balance.', 'credit'],
-  ['Credit report review', 'monthly', 'credit', 'L+', 9, 'Review new bureau report changes, hard inquiries, derogatory lines, and dispute candidates.', 'credit'],
-  ['Credit payment due', 'weekly', 'credit', 'L', 9, 'Surface card balances and payment timing when due-date evidence is available.', 'credit'],
-  ['Brokerage cash drag', 'weekly', 'brokerage', 'D', 9, 'Flag brokerage cash above 30% of portfolio value.', 'investments'],
-  ['Portfolio concentration', 'weekly', 'brokerage', 'D', 9, 'Flag any single holding above 20% of tracked holdings value.', 'investments'],
-  ['Single name net-worth exposure', 'weekly', 'all', 'D', 9, 'Flag one position that is an outsized share of total net worth.', 'investments'],
-  ['Holding value swing', 'weekly', 'brokerage', 'D', 9, 'Flag a holding whose value moved sharply since the prior snapshot.', 'investments'],
-  ['Wash sale review', 'weekly', 'brokerage', 'D', 9, 'Flag a symbol sold and repurchased within 30 days to review before filing.', 'investments'],
-  ['Allocation drift', 'monthly', 'brokerage', 'L', 9, 'Compare current holdings mix with the saved target allocation when available.', 'investments'],
-  ['Executed order review', 'event', 'brokerage', 'D', null, 'Notify on recent executed buy and sell orders.', 'investments'],
-  ['Dividend or interest received', 'event', 'brokerage', 'D', null, 'Total dividends and interest received over the last 90 days for tax time.', 'investments'],
-];
+// Display labels for the backend rules, keyed by kind (the backend is the single
+// source of truth for which rules exist and their on/off state; this only makes
+// their names/descriptions read nicely). A kind with no entry falls back to a
+// prettified version of its slug, so new rules show up without edits here.
+const RULE_META = {
+  'connection-health': { title: 'Connection health', detail: 'Flag when a connection is not active, a token is missing, or the sync cursor is missing.' },
+  'stale-data': { title: 'Stale account data', detail: 'Flag when the newest balance or transaction is weeks old.' },
+  'idle-cash': { title: 'Idle cash', detail: 'Price checking/savings cash against a high-yield benchmark and surface the yield left on the table.' },
+  'low-balance': { title: 'Low / negative balance', detail: 'Flag a spending balance that falls below a safety threshold or goes overdrawn.' },
+  'cash-runway': { title: 'Cash runway', detail: 'Estimate months of runway from liquid cash and average spending, and flag when it is short.' },
+  'net-worth-movement': { title: 'Net worth movement', detail: 'Flag a material month-over-month drop in net worth.' },
+  'cash-flow-negative': { title: 'Cash flow negative', detail: 'Flag when 30-day spending outran income and drew down savings.' },
+  'upcoming-bills': { title: 'Upcoming bills / overdraft', detail: 'Warn when recurring bills due before the next deposit exceed available cash.' },
+  'employer-match': { title: 'Employer 401(k) match', detail: 'Flag forgone employer match — free money left on the table. Needs your salary and match details.' },
+  'large-transaction': { title: 'Large transaction', detail: 'Notify when a posted outflow exceeds $500.' },
+  'duplicate-charge': { title: 'Duplicate charge', detail: 'Flag two matching merchant charges of the same amount within a few days.' },
+  'cross-account-duplicate': { title: 'Duplicate payment across accounts', detail: 'Flag the same vendor and amount paid from two different accounts.' },
+  'card-testing': { title: 'Card testing / probe', detail: 'Flag a tiny charge at a brand-new merchant followed by larger charges — a card-testing pattern.' },
+  'fees-and-interest': { title: 'Fees & interest', detail: 'Total the bank fees, card interest, and surcharges paid over the last 90 days.' },
+  'subscription-price-increase': { title: 'Subscription price increase', detail: 'Flag a recurring charge whose latest amount rose against its own history.' },
+  'recurring-subscriptions': { title: 'Recurring subscriptions', detail: 'List detected subscriptions and their annualized cost so ghost memberships are visible.' },
+  'new-recurring-charge': { title: 'New recurring charge', detail: 'Flag a recently started subscription or a free trial that converted to paid.' },
+  'spending-category-spike': { title: 'Spending category spike', detail: 'Flag a discretionary category whose last-30-day spend is well above its 3-month average.' },
+  'cross-card-subscription': { title: 'Duplicate subscription across cards', detail: 'Flag the same subscription billed on more than one account — paying twice.' },
+  'unfamiliar-merchant-charge': { title: 'Unfamiliar merchant charge', detail: 'Flag a large charge at a merchant with no prior history.' },
+  'credit-utilization': { title: 'Credit utilization', detail: 'Notify when a card balance exceeds 30% or 70% of its known limit.' },
+  'card-interest': { title: 'Card interest', detail: 'Flag interest charged on a card — the cost of carrying a balance.' },
+  'idle-brokerage-cash': { title: 'Brokerage cash drag', detail: 'Flag brokerage cash above 30% of portfolio value.' },
+  'portfolio-concentration': { title: 'Portfolio concentration', detail: 'Flag any single holding above 20% of tracked holdings value.' },
+  'single-name-exposure': { title: 'Single-name exposure', detail: 'Flag one position that is an outsized share of total net worth.' },
+  'holding-swing': { title: 'Holding value swing', detail: 'Flag a holding whose value moved sharply since the prior snapshot.' },
+  'wash-sale-risk': { title: 'Wash sale review', detail: 'Flag a symbol sold and repurchased within 30 days to review before filing.' },
+  'executed-trades': { title: 'Executed trades', detail: 'Notify on recent executed buy and sell orders.' },
+  'dividends-received': { title: 'Dividends & interest', detail: 'Total dividends and interest received over the last 90 days for tax time.' },
+};
+
+function prettyKind(kind) {
+  return String(kind || '').replace(/-/g, ' ').replace(/^./, (c) => c.toUpperCase());
+}
 // The rules taxonomy from docs/rules-design.md, in display order. Used to group
 // both built-in and saved rules in the settings UI.
 const ruleDomains = [
@@ -247,7 +249,6 @@ const ruleDomains = [
   ['investments', 'Investments', 'Cash drag, concentration, allocation, executed orders.'],
   ['connections', 'Connections', 'Provider status, tokens, cursors, sync freshness.'],
 ];
-const builtInRulesKey = 'finora.builtInRules.v1';
 const notificationChannels = {
   telegram: {
     title: 'Telegram',
@@ -2038,7 +2039,20 @@ function buildFeedItems() {
     value: findingImpactLabel(insight),
     amount: insight.dollarImpactMinor || 0,
     id: insight.id,
+    artifactType: insight.action?.artifactType || null,
   }));
+}
+
+// Short label for the "draft this for me" button, by artifact type.
+function artifactLabel(type) {
+  return ({
+    'dispute-letter': 'Draft dispute letter',
+    'fee-waiver-request': 'Draft waiver request',
+    'apr-reduction-request': 'Draft APR script',
+    'retention-script': 'Draft negotiation script',
+    'cancellation-request': 'Draft cancellation',
+    'trial-cancellation': 'Draft cancel & refund',
+  })[type] || 'Draft document';
 }
 
 function findingImpactLabel(finding) {
@@ -2081,8 +2095,12 @@ function renderFeedZone(panel, title, zone, items) {
     block.innerHTML = `<div class="feedgroup-title">${esc(group)} <span class="count">${rows.length}</span></div>`;
     for (const item of rows) {
       const row = el('div', 'feedrow');
-      row.innerHTML = `<div class="feedico ${esc(zone)}">${esc(item.icon)}</div><div class="feedcopy"><div class="t">${esc(item.title)}</div><div class="d">${esc(item.detail)}</div></div><div class="feedactions"><span class="valuechip ${item.amount < 0 ? 'neg' : item.amount > 0 ? 'pos' : ''}">${esc(item.value)}</span><button type="button" class="dismissbtn" title="Dismiss" aria-label="Dismiss insight">×</button></div>`;
+      const draftBtn = item.artifactType
+        ? `<button type="button" class="draftbtn" title="Draft a document you can review and send yourself">✎ ${esc(artifactLabel(item.artifactType))}</button>`
+        : '';
+      row.innerHTML = `<div class="feedico ${esc(zone)}">${esc(item.icon)}</div><div class="feedcopy"><div class="t">${esc(item.title)}</div><div class="d">${esc(item.detail)}</div></div><div class="feedactions"><span class="valuechip ${item.amount < 0 ? 'neg' : item.amount > 0 ? 'pos' : ''}">${esc(item.value)}</span>${draftBtn}<button type="button" class="dismissbtn" title="Dismiss" aria-label="Dismiss insight">×</button></div>`;
       row.querySelector('.dismissbtn').addEventListener('click', () => dismissInsightRow(row, item));
+      if (item.artifactType) row.querySelector('.draftbtn').addEventListener('click', (event) => generateArtifact(event.currentTarget, row, item));
       block.appendChild(row);
     }
     wrap.appendChild(block);
@@ -2104,6 +2122,72 @@ function renderFeed() {
     renderFeedZone(panel, '', 'insights', regular);
   }
   view.appendChild(panel);
+}
+
+// Ask the backend to draft the Advisor document for a finding, then reveal it
+// inline beneath the row. Grounding and money math happen server-side; this only
+// requests and displays. Finora drafts for review — it never sends anything.
+async function generateArtifact(btn, row, item) {
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Drafting…';
+  try {
+    const res = await api('/v1/findings/artifact', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: item.id }),
+    });
+    if (res.status === 'ok') {
+      showArtifact(row, res.title, res.artifact, true);
+    } else if (res.status === 'model_required') {
+      const how = res.needsDownload ? 'download the built-in model' : 'add a provider API key';
+      showArtifact(row, null, `A language model is required to draft this. Open Settings → Models to ${how}.`, false);
+    } else {
+      showArtifact(row, null, 'This insight can no longer be drafted.', false);
+    }
+  } catch (error) {
+    showArtifact(row, null, error.message || 'Could not draft this document.', false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+// Insert or replace the drafted-document box directly after a finding row. When
+// a real draft is shown, offer a Copy button; messages (model required, errors)
+// render as a plain note.
+function showArtifact(row, title, text, copyable) {
+  let box = row.nextElementSibling;
+  if (!box || !box.classList.contains('artifactbox')) {
+    box = el('div', 'artifactbox');
+    row.after(box);
+  }
+  box.replaceChildren();
+  if (title) {
+    const head = el('div', 'artifacttitle');
+    head.textContent = title;
+    box.appendChild(head);
+  }
+  const body = el('pre', 'artifacttext');
+  body.textContent = text;
+  box.appendChild(body);
+  const foot = el('div', 'artifactfoot');
+  const note = el('span', 'artifactnote');
+  note.textContent = copyable ? 'Draft for your review — Finora does not send this for you.' : '';
+  foot.appendChild(note);
+  if (copyable && navigator.clipboard) {
+    const copy = el('button', 'copybtn');
+    copy.type = 'button';
+    copy.textContent = 'Copy';
+    copy.addEventListener('click', () => {
+      navigator.clipboard.writeText(text).then(() => {
+        copy.textContent = 'Copied';
+        setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
+      }).catch(() => {});
+    });
+    foot.appendChild(copy);
+  }
+  box.appendChild(foot);
 }
 
 function selectedBrokerageTransactions() {
@@ -3195,6 +3279,8 @@ function renderSettingsDelivery(view) {
 // single answer can unlock any rule that references that fact. Questions are treated
 // as equally important — no ranking. Hidden entirely when nothing is outstanding.
 function renderNeedsInput(view) {
+  // Temporarily hidden from the UI (backend/questions machinery is untouched).
+  return;
   const pending = state.factNeeds.pending || [];
   if (!pending.length) return;
   const sec = el('div', 'sec');
@@ -3246,49 +3332,28 @@ function renderSettingsInsights(view) {
   const sec = el('div', 'sec');
   sec.innerHTML = '<div class="sechdr"><h3>Rules</h3></div><div class="cardsub">Rules can run on events or on a schedule. Use the switch to pause delivery without changing the rule.</div>';
   const box = el('div', 'rulelist');
-  const rules = [
-    ...builtInRules().map((rule) => ({
+  // Every rule is a built-in definition from the backend; show them all with a
+  // real (server-persisted) on/off switch, keyed by kind. `active` is the switch.
+  const rules = state.rules.map((rule) => {
+    const meta = RULE_META[rule.kind] || {};
+    return {
       ...rule,
       builtIn: true,
-      sourceText: rule.name,
-      title: rule.name,
-      description: rule.detail,
-      // Built-in rules are fixed logic: they can be paused and rescheduled, but
-      // not deleted, and only cadence/hour are editable (see openBuiltInRuleModal).
+      title: meta.title || prettyKind(rule.kind),
+      description: rule.sourceText || meta.detail || '',
+      enabled: rule.active,
       editable: true,
-      removable: false,
-      toggle: () => {
-        saveBuiltInRuleOverride(rule.originalName, { ...rule, enabled: !rule.enabled });
-        toast(rule.enabled ? 'Rule disabled.' : 'Rule enabled.');
-        renderSettings();
-      },
-    })),
-    ...state.rules.map((rule) => ({
-      ...rule,
-      title: rule.sourceText,
-      description: '',
-      editable: true,
-      removable: true,
       toggle: async () => {
         await api('/v1/rules/toggle', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: rule.id, enabled: !rule.enabled }),
+          body: JSON.stringify({ kind: rule.kind, enabled: !rule.active }),
         });
         await loadData();
         renderSettings();
       },
-      remove: async () => {
-        await api('/v1/rules/remove', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: rule.id }),
-        });
-        await loadData();
-        renderSettings();
-      },
-    })),
-  ];
+    };
+  });
   // Group by the rules taxonomy so every rule sits under one domain heading.
   const domainOf = (rule) => rule.domain || rule.category || 'cash-flow';
   const grouped = new Map(ruleDomains.map(([key]) => [key, []]));
@@ -3324,13 +3389,12 @@ function renderSettingsInsights(view) {
 }
 
 // Over-the-air rule updates: point Finora at a rules feed URL (a JSON file, e.g. a
-// GitHub raw URL, or a local static server in dev) and pull any newer rule versions.
-// Downloaded rules that need details only the user knows appear under "Needs your
-// input" above, exactly like built-in fact-gated rules.
+// GitHub raw URL, or a local static server in dev). Checking adds any built-in
+// rules this version doesn't have yet; rules already present are left untouched.
 function renderRuleFeed(view) {
   const sec = el('div', 'sec');
   sec.innerHTML = '<div class="sechdr"><h3>Rule updates</h3></div>'
-    + '<div class="cardsub">Point Finora at a rules feed URL (a JSON file). Checking downloads any newer rule versions; rules that need details you know show up under “Needs your input”.</div>';
+    + '<div class="cardsub">Point Finora at a rules feed URL — a JSON file (for example a GitHub raw link). Checking adds any new built-in rules; rules you already have are left as they are.</div>';
   const form = el('form', 'formgrid settingsform');
   form.innerHTML = settingRow('RULES_FEED_URL', 'Rules feed URL', 'url')
     + '<div class="row"><button class="primary" type="submit">Save URL</button>'
@@ -3368,9 +3432,13 @@ function renderRuleFeed(view) {
 }
 
 function ruleSyncMessage(result) {
-  if (!result.skipped) return `Downloaded ${result.applied} rule${result.applied === 1 ? '' : 's'} (v${result.version}).`;
+  if (!result.skipped) {
+    return result.applied === 0
+      ? `Already up to date (feed v${result.version}).`
+      : `Added ${result.applied} new rule${result.applied === 1 ? '' : 's'} (feed v${result.version}).`;
+  }
   if (result.reason === 'no-feed-url') return 'Set and save a feed URL first.';
-  if (result.reason === 'not-newer') return 'Rules are already up to date.';
+  if (result.reason === 'fetch-failed') return "Couldn't reach the feed URL — check it and try again.";
   return 'No rule feed is available.';
 }
 
@@ -3386,13 +3454,6 @@ function ruleRow(rule) {
     edit.textContent = 'Edit';
     edit.addEventListener('click', () => openRuleModal(rule));
     actions.appendChild(edit);
-  }
-  if (rule.removable) {
-    const remove = el('button', 'ghost danger');
-    remove.type = 'button';
-    remove.textContent = 'Delete';
-    remove.addEventListener('click', rule.remove);
-    actions.appendChild(remove);
   }
   row.append(copy, actions);
   return row;
@@ -3504,63 +3565,14 @@ function ruleToggle(rule) {
   return button;
 }
 
-function builtInRuleOverrides() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(builtInRulesKey) || '{}');
-    return raw && typeof raw === 'object' ? raw : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveBuiltInRuleOverride(originalName, patch) {
-  const overrides = builtInRuleOverrides();
-  overrides[originalName] = {
-    name: patch.name,
-    cadence: patch.cadence,
-    scope: patch.scope,
-    mode: patch.mode,
-    scheduledHour: patch.scheduledHour ?? null,
-    scheduledDay: patch.scheduledDay ?? null,
-    detail: patch.detail,
-    enabled: patch.enabled,
-    deleted: patch.deleted === true,
-  };
-  localStorage.setItem(builtInRulesKey, JSON.stringify(overrides));
-}
-
-function builtInRules() {
-  const overrides = builtInRuleOverrides();
-  return sampleInsightRules.flatMap(([name, cadence, scope, mode, scheduledHour, detail, domain, kind]) => {
-    const saved = overrides[name] || {};
-    if (saved.deleted === true) return [];
-    return {
-      originalName: name,
-      name: saved.name || name,
-      // Fact-gated built-ins carry the backend spec kind so their needs-input state
-      // (from /v1/facts/needs, keyed by kind) can gate the row.
-      ...(kind ? { kind } : {}),
-      cadence: saved.cadence || cadence,
-      scope: saved.scope || scope,
-      mode: saved.mode || mode,
-      scheduledHour: saved.scheduledHour ?? scheduledHour,
-      // Give weekly/monthly built-ins a sensible default day (Mon / 1st) so their
-      // schedule reads fully until the user picks another.
-      scheduledDay: saved.scheduledDay ?? ((saved.cadence || cadence) === 'weekly' ? 1 : (saved.cadence || cadence) === 'monthly' ? 1 : null),
-      detail: saved.detail || detail,
-      domain,
-      enabled: saved.enabled !== false,
-    };
-  });
-}
-
-// Built-in rules have fixed logic and scope; only their schedule is editable.
+// Every rule's logic is fixed; only its delivery schedule is editable. Persisted
+// to the backend by kind (no client-side override store).
 function openBuiltInRuleModal(rule) {
   const panel = el('div');
   panel.innerHTML = `<div class="sechdr"><h3>Edit rule</h3><button class="ghost" type="button" id="closeModal">Close</button></div>`;
   const form = el('form', 'formgrid');
-  form.innerHTML = `<div class="rulecopy"><div class="nm">${esc(rule.name)}</div>${rule.detail ? `<div class="sub">${esc(rule.detail)}</div>` : ''}</div>
-    <div class="cardsub">Built-in rule. Its logic and scope are fixed — you can pause it or change when it runs.</div>
+  form.innerHTML = `<div class="rulecopy"><div class="nm">${esc(rule.title)}</div>${rule.description ? `<div class="sub">${esc(rule.description)}</div>` : ''}</div>
+    <div class="cardsub">Built-in rule. Its logic is fixed — you can turn it on or off and change when it runs.</div>
     <div class="split"><label>Cadence<select name="cadence">${['event', 'hourly', 'daily', 'weekly', 'monthly'].map((c) => `<option${rule.cadence === c ? ' selected' : ''}>${c}</option>`).join('')}</select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(rule.cadence, rule.scheduledDay)}</select></label><label class="rulehour">Run hour<select name="scheduledHour">${ruleHourOptions(rule.scheduledHour)}</select></label></div>
     <div class="row"><button class="primary" type="submit">Save</button><span class="message"></span></div>`;
   panel.appendChild(form);
@@ -3568,21 +3580,30 @@ function openBuiltInRuleModal(rule) {
   $('#closeModal').addEventListener('click', closeModal);
   syncRuleDayField(form, rule.scheduledDay);
   form.elements.cadence.addEventListener('change', () => syncRuleDayField(form, rule.scheduledDay));
-  form.addEventListener('submit', (event) => {
+  form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(form));
     const cadence = data.cadence || rule.cadence;
     const triggered = cadence === 'event' || cadence === 'hourly';
-    saveBuiltInRuleOverride(rule.originalName, {
-      ...rule,
-      cadence,
-      scheduledHour: triggered || data.scheduledHour === '' ? null : Number(data.scheduledHour),
-      scheduledDay: data.scheduledDay === '' || data.scheduledDay === undefined ? null : Number(data.scheduledDay),
-      enabled: rule.enabled !== false,
-    });
-    closeModal();
-    toast('Rule saved.');
-    renderSettings();
+    const message = form.querySelector('.message');
+    try {
+      await api('/v1/rules/schedule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          kind: rule.kind,
+          cadence,
+          scheduledHour: triggered || data.scheduledHour === '' ? null : Number(data.scheduledHour),
+          scheduledDay: data.scheduledDay === '' || data.scheduledDay === undefined ? null : Number(data.scheduledDay),
+        }),
+      });
+      closeModal();
+      toast('Rule saved.');
+      await loadData();
+      renderSettings();
+    } catch (error) {
+      message.textContent = (error && error.message) || 'Could not save the schedule.';
+    }
   });
 }
 
@@ -3643,28 +3664,17 @@ function openRuleModal(existingRule = null) {
     const submit = event.submitter;
     submit.disabled = true;
     try {
-      const savedRule = await api('/v1/rules', {
+      // Turning a rule on from natural language: /v1/rules matches a kind and
+      // activates it. Editing an existing rule's schedule goes through the
+      // schedule modal (openBuiltInRuleModal), not here.
+      await api('/v1/rules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       });
-      if (existingRule && existingRule.enabled === false) {
-        await api('/v1/rules/toggle', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: savedRule.id, enabled: false }),
-        });
-      }
-      if (existingRule) {
-        await api('/v1/rules/remove', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: existingRule.id }),
-        });
-      }
       await loadData();
       closeModal();
-      toast(existingRule ? 'Generated rule saved.' : 'Generated rule created.');
+      toast('Rule turned on.');
       renderSettings();
     } catch (error) {
       form.querySelector('.message').textContent = error.message;

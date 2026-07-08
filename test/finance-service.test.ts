@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FinanceService, enrichCreditExtractionWithLlm } from '../src/application/finance-service.js';
-import type { RecurringClassifier } from '../src/application/ports.js';
+import type { MerchantIdentifier, RecurringClassifier } from '../src/application/ports.js';
 import { LocalModelEngine } from '../src/infrastructure/local-model.js';
 import { CsvStatementParser } from '../src/infrastructure/parsers/csv-parser.js';
 import { OfxStatementParser } from '../src/infrastructure/parsers/ofx-parser.js';
@@ -27,7 +27,7 @@ function localModel() {
 // known recurring payees by name and rejects everything else (Uber, duty-free,
 // one-off shops). Injecting it also marks the model as "available", so recurring
 // rules and the table run without a real model.
-const recurringNames = /netflix|spotify|acme|payroll|clipper|visible|hulu|gym|verizon|kikoff/;
+const recurringNames = /netflix|spotify|acme|payroll|clipper|visible|hulu|gym|verizon|kikoff|apple|itunes/;
 const fakeRecurringClassifier: RecurringClassifier = async (candidates) =>
   candidates.map((candidate) => {
     const name = candidate.label.toLowerCase();
@@ -55,13 +55,24 @@ const fakeRecurringClassifier: RecurringClassifier = async (candidates) =>
     };
   });
 
-function application(classifier?: RecurringClassifier) {
+// A deterministic stand-in for the LLM merchant identifier: maps Apple's various
+// billing descriptors to one canonical vendor, and leaves everything else as its
+// own identity. Injecting it marks the identity model as "available".
+const fakeMerchantIdentifier: MerchantIdentifier = async (candidates) =>
+  candidates.map((candidate) => {
+    const name = candidate.label.toLowerCase();
+    const canonicalName = /apple|itunes/.test(name) ? 'Apple' : candidate.label;
+    return { merchant: candidate.merchant, canonicalName, canonicalSlug: canonicalName.toLowerCase(), confidence: 0.9 };
+  });
+
+function application(classifier?: RecurringClassifier, identifier?: MerchantIdentifier) {
   return new FinanceService(
     new SqliteFinanceRepository(':memory:'),
     [new OfxStatementParser(), new CsvStatementParser()],
     localModel(),
     undefined,
     classifier,
+    identifier,
   );
 }
 
@@ -116,7 +127,10 @@ describe('FinanceService', () => {
     service.importStatement({
       accountId: account.id,
       filename: 'card.csv',
-      content: Buffer.from(`Date,Description,Amount\n${daysAgo(3)},Coffee Shop,-600.00\n`),
+      // A prior charge at the same merchant makes it familiar, so the (now
+      // enabled-by-default) unfamiliar-merchant rule stays quiet and this test
+      // isolates the large-transaction finding.
+      content: Buffer.from(`Date,Description,Amount\n${daysAgo(70)},Coffee Shop,-20.00\n${daysAgo(3)},Coffee Shop,-600.00\n`),
     });
     const sent: Record<string, unknown>[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -124,14 +138,9 @@ describe('FinanceService', () => {
       return Response.json({ ok: true, result: {} });
     }));
 
-    expect(service.listFindings()).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        title: 'Large transaction: Coffee Shop',
-        value: '-$600.00',
-        dollarImpactMinor: 60000,
-        confidence: 0.5,
-      }),
-    ]));
+    // The finding's shape is asserted in http.test.ts; here we only need it to
+    // exist so the delivery path has something to send.
+    expect(service.listFindings().some((f) => f.kind === 'large-transaction')).toBe(true);
     await expect(service.deliverInsightsToIm()).resolves.toMatchObject({ count: 1, sent: true });
     await expect(service.deliverInsightsToIm()).resolves.toMatchObject({ count: 0, sent: false, reason: 'no-new-insights' });
     expect(sent).toHaveLength(1);
@@ -186,6 +195,22 @@ describe('FinanceService', () => {
       sent.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       return Response.json({ ok: true, result: {} });
     }));
+
+    // A prior charge at the same merchant on ANOTHER account keeps the
+    // enabled-by-default unfamiliar-merchant rule quiet (merchant familiarity is
+    // global), isolating the large-transaction finding without adding a row to the
+    // account under test.
+    const other = service.createAccount({ institution: 'Example Bank', name: 'Everyday Checking', type: 'checking', currency: 'USD' });
+    repository.reconcileProviderTransactions([{
+      accountId: other.id,
+      sourceId: 'plaid-old',
+      date: daysAgo(70),
+      description: '99 Ranch Market',
+      amountMinor: -2000,
+      currency: 'USD',
+      pending: false,
+      fingerprint: 'plaid:old',
+    }]);
 
     // Pending charge arrives and is notified once.
     repository.reconcileProviderTransactions([{
@@ -402,7 +427,7 @@ describe('FinanceService', () => {
       { fetchFeed: async () => feedBody },
     );
 
-    // A newer feed version applies its specs as `downloaded` rules — no code, no redeploy.
+    // A newer feed version inserts rules this install doesn't have yet, as `downloaded`.
     expect(await service.syncRuleFeed()).toMatchObject({ applied: 1, skipped: false, version: 1 });
     expect(repository.listRuleSpecs().find((s) => s.kind === 'commute-cost')).toMatchObject({ source: 'downloaded', domain: 'spending' });
 
@@ -412,14 +437,42 @@ describe('FinanceService', () => {
     expect(needs.pending.map((p) => p.key)).toContain('commute.monthly_cost_minor');
     expect(service.listQuestions().map((q) => q.factKey)).toContain('commute.monthly_cost_minor');
 
-    // Re-syncing the same version is a no-op.
-    expect(await service.syncRuleFeed()).toMatchObject({ applied: 0, skipped: true, version: 1 });
+    // Re-syncing the same feed is a dedup no-op — nothing fresh, but not skipped.
+    expect(await service.syncRuleFeed()).toMatchObject({ applied: 0, skipped: false, version: 1 });
 
-    // A newer version re-applies the changed spec in place.
-    feedBody = JSON.stringify({ ...feedV1, version: 2, specs: [{ ...feedV1.specs[0], keywords: 'commute|transit' }] });
-    expect(await service.syncRuleFeed()).toMatchObject({ applied: 1, skipped: false, version: 2 });
-    expect(repository.listRuleSpecs().find((s) => s.kind === 'commute-cost')?.keywords).toBe('commute|transit');
+    // Additive by kind, with NO version gate: even without bumping `version`, a
+    // brand-new kind is inserted, while an existing rule is left untouched (its
+    // changed keywords are ignored).
+    feedBody = JSON.stringify({
+      version: 1,
+      specs: [
+        { ...feedV1.specs[0], keywords: 'commute|transit' },
+        { ...feedV1.specs[0], kind: 'parking-cost', keywords: 'parking', facts: [] },
+      ],
+    });
+    expect(await service.syncRuleFeed()).toMatchObject({ applied: 1, skipped: false, version: 1 });
+    expect(repository.listRuleSpecs().find((s) => s.kind === 'commute-cost')?.keywords).toBe('commute'); // not re-synced
+    expect(repository.listRuleSpecs().find((s) => s.kind === 'parking-cost')).toMatchObject({ source: 'downloaded' }); // inserted
 
+    service.close();
+  });
+
+  it('accepts the shipped example rules feed and runs the delivered rule', async () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    repository.saveAppSettings({ RULES_FEED_URL: 'http://feed.test/rules.json' });
+    const feedBody = await readFile(new URL('../rules-feed.example.json', import.meta.url), 'utf8');
+    const service = new FinanceService(
+      repository,
+      [new OfxStatementParser(), new CsvStatementParser()],
+      localModel(),
+      { fetchFeed: async () => feedBody },
+    );
+    const result = await service.syncRuleFeed();
+    expect(result.skipped).toBe(false);
+    expect(result.applied).toBeGreaterThanOrEqual(1);
+    expect(repository.listRuleSpecs().find((s) => s.kind === 'large-cash-withdrawal')).toMatchObject({ source: 'downloaded' });
+    // The delivered rule is active by default and its SQL must be valid — evaluating must not throw.
+    expect(() => service.listFindings()).not.toThrow();
     service.close();
   });
 
@@ -438,6 +491,21 @@ describe('FinanceService', () => {
     repository.saveAppSettings({ RULES_FEED_URL: 'http://feed.test/rules.json' });
     await expect(service.syncRuleFeed()).rejects.toThrow();
 
+    service.close();
+  });
+
+  it('degrades gracefully when the feed URL is unreachable (no 500)', async () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    repository.saveAppSettings({ RULES_FEED_URL: 'http://127.0.0.1:9/rules.json' });
+    const service = new FinanceService(
+      repository,
+      [new OfxStatementParser(), new CsvStatementParser()],
+      localModel(),
+      { fetchFeed: async () => { throw new Error('fetch failed'); } },
+    );
+    // A network failure is reported as a skip, not thrown — the manual button
+    // must not surface a 500.
+    expect(await service.syncRuleFeed()).toMatchObject({ skipped: true, reason: 'fetch-failed' });
     service.close();
   });
 
@@ -460,6 +528,39 @@ describe('FinanceService', () => {
     service.close();
   });
 
+  it('offers an Advisor dispute-letter draft for a duplicate charge and gates it on a model', async () => {
+    const service = application(fakeRecurringClassifier);
+    // duplicate-charge and large-transaction are opt-in (not always-on), so both
+    // need a rule instance to fire.
+    service.createRule({ text: 'flag duplicate charges', scope: 'banking' });
+    service.createRule({ text: 'alert on large transactions', scope: 'banking' });
+    const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    service.importStatement({
+      accountId: account.id,
+      filename: 'dupe.csv',
+      content: Buffer.from(`Date,Description,Amount\n${daysAgo(3)},ACME STORE,-600.00\n${daysAgo(2)},ACME STORE,-600.00\n`),
+    });
+
+    // The duplicate-charge finding advertises the document Finora can draft.
+    const dupe = service.listFindings().find((f) => f.kind === 'duplicate-charge');
+    expect(dupe?.action?.artifactType).toBe('dispute-letter');
+
+    // No real model is configured in tests (the injected recurring classifier does
+    // not count for the LLM drafter), so the draft is gated — never fabricated.
+    const gated = await service.generateFindingArtifact(dupe!.id);
+    expect(gated.status).toBe('model_required');
+
+    // A finding with no drafter (large-transaction) is unsupported, and that check
+    // returns before any model gating.
+    const large = service.listFindings().find((f) => f.kind === 'large-transaction');
+    expect(large).toBeTruthy();
+    expect((await service.generateFindingArtifact(large!.id)).status).toBe('unsupported');
+
+    // An unknown id resolves to not_found.
+    expect((await service.generateFindingArtifact('missing:builtin:x')).status).toBe('not_found');
+    service.close();
+  });
+
   it('flags the same subscription billed across two accounts', async () => {
     const service = application(fakeRecurringClassifier);
     const monthly = (name: string) =>
@@ -472,6 +573,85 @@ describe('FinanceService', () => {
     const finding = service.listFindings().find((f) => f.kind === 'cross-card-subscription');
     expect(finding?.title).toContain('SPOTIFY');
     expect(finding && finding.dollarImpactMinor > 0).toBe(true);
+    service.close();
+  });
+
+  it('resolves merchants that normalize differently to one canonical vendor (F1)', async () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    const service = new FinanceService(
+      repository,
+      [new OfxStatementParser(), new CsvStatementParser()],
+      localModel(),
+      undefined,
+      fakeRecurringClassifier,
+      fakeMerchantIdentifier,
+    );
+    const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    // Two Apple billing descriptors that normalize to different merchant keys.
+    service.importStatement({
+      accountId: account.id,
+      filename: 'apple.csv',
+      content: Buffer.from('Date,Description,Amount\n2026-05-01,APPLE.COM BILL,-9.99\n2026-05-02,ITUNES,-4.99\n'),
+    });
+    const { identified, skipped } = await service.refreshMerchantIdentities();
+    expect(skipped).toBe(false);
+    expect(identified).toBeGreaterThanOrEqual(2);
+
+    const identities = repository.listMerchantIdentities();
+    // Both distinct normalized merchants collapse to the same canonical vendor.
+    const appleSlugs = identities.filter((row) => row.canonicalSlug === 'apple');
+    expect(appleSlugs.length).toBe(2);
+    expect(new Set(appleSlugs.map((row) => row.merchant)).size).toBe(2);
+    service.close();
+  });
+
+  it('merges a subscription billed across cards under different descriptions via identity (F1)', async () => {
+    const service = application(fakeRecurringClassifier, fakeMerchantIdentifier);
+    const monthly = (name: string) =>
+      `Date,Description,Amount\n2026-03-08,${name},-9.99\n2026-04-08,${name},-9.99\n2026-05-08,${name},-9.99\n2026-06-08,${name},-9.99\n`;
+    const a = service.createAccount({ institution: 'Example Bank', name: 'Card A', type: 'credit', currency: 'USD' });
+    service.importStatement({ accountId: a.id, filename: 'a.csv', content: Buffer.from(monthly('APPLE.COM BILL')) });
+    const b = service.createAccount({ institution: 'Example Bank', name: 'Card B', type: 'credit', currency: 'USD' });
+    service.importStatement({ accountId: b.id, filename: 'b.csv', content: Buffer.from(monthly('APPLE SERVICES')) });
+    await service.refreshRecurringClassifications();
+    await service.refreshMerchantIdentities();
+
+    // Raw merchants differ ("apple com bill" vs "apple services"); only the shared
+    // canonical identity lets cross-card-subscription see one vendor on two cards.
+    const finding = service.listFindings().find((f) => f.kind === 'cross-card-subscription');
+    expect(finding?.title).toContain('Apple');
+    expect(finding && finding.dollarImpactMinor > 0).toBe(true);
+    service.close();
+  });
+
+  it('flags a possible double payment of the same vendor across two accounts (#16)', async () => {
+    const service = application();
+    const checking = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    const card = service.createAccount({ institution: 'Example Bank', name: 'Card', type: 'credit', currency: 'USD' });
+    service.importStatement({ accountId: checking.id, filename: 'c.csv', content: Buffer.from(`Date,Description,Amount\n${daysAgo(4)},CITY WATER BILL,-450.00\n`) });
+    service.importStatement({ accountId: card.id, filename: 'k.csv', content: Buffer.from(`Date,Description,Amount\n${daysAgo(3)},CITY WATER BILL,-450.00\n`) });
+
+    const finding = service.listFindings().find((f) => f.kind === 'cross-account-duplicate');
+    expect(finding).toBeTruthy();
+    expect(finding!.dollarImpactMinor).toBe(45000);
+    // The duplicate hooks into the Fight layer's dispute-letter drafter.
+    expect(finding!.action?.artifactType).toBe('dispute-letter');
+    service.close();
+  });
+
+  it('flags a possible card-testing pattern: a tiny new-merchant charge before larger charges (#13)', async () => {
+    const service = application();
+    const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    service.importStatement({
+      accountId: account.id,
+      filename: 'probe.csv',
+      content: Buffer.from(`Date,Description,Amount\n${daysAgo(6)},TINYTEST DIGITAL,-1.50\n${daysAgo(5)},BIG ELECTRONICS,-320.00\n`),
+    });
+
+    // Risk-based finding: no dollar value, explicit high severity so it surfaces.
+    const finding = service.listFindings().find((f) => f.kind === 'card-testing');
+    expect(finding).toBeTruthy();
+    expect(finding!.severity).toBe('high');
     service.close();
   });
 
@@ -961,6 +1141,33 @@ Soft
     expect(overview.inquiries).toEqual([{ company: 'Example Auto Finance', inquiryDate: '2026-05-01', type: 'hard' }]);
     expect(overview.latest?.inquiries).toBe(1);
     expect(overview.reports[0]?.raw.inquiries).toEqual(overview.inquiries);
+    service.close();
+  });
+
+  it('picks the latest report by report date and falls back to the next one on delete', () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    const saveReport = (contentHash: string, reportDate: string | null) =>
+      repository.saveCreditReport({
+        filename: `${contentHash}.pdf`, contentHash, bureau: 'equifax', reportDate,
+        score: null, scoreModel: null, utilizationPercent: null, totalBalanceMinor: null,
+        totalLimitMinor: null, accounts: 0, openAccounts: 0, delinquentAccounts: 0,
+        collections: 0, inquiries: 0, publicRecords: 0, raw: { accounts: [], inquiries: [] }, bytes: 1024,
+      });
+    // Uploaded newest-first, but the freshest report date belongs to the first upload.
+    const june = saveReport('june', '2026-06-15');
+    saveReport('april', '2026-04-15');
+    const newestUpload = saveReport('march', '2026-03-15');
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
+
+    // Latest tracks report date, not upload time (which would pick the March upload).
+    expect(service.getCreditOverview().latest?.reportDate).toBe('2026-06-15');
+
+    // Deleting the current latest falls back to the next-newest report date.
+    const afterDelete = service.removeCreditReport(june.id);
+    expect(afterDelete.latest?.reportDate).toBe('2026-04-15');
+
+    service.removeCreditReport(newestUpload.id);
+    expect(service.getCreditOverview().latest?.reportDate).toBe('2026-04-15');
     service.close();
   });
 });

@@ -1,0 +1,20 @@
+{
+  "//": "Example Finora rules feed. Host this JSON at a URL (e.g. a GitHub raw link) and paste that URL into Settings → Rules & Facts → Rule updates. Bump `version` whenever you add a rule. Sync is additive: only rules whose `kind` an install doesn't already have are inserted; existing rules are never overwritten. Each spec carries EITHER `sql` (a deterministic `D` rule) or `prompt` (an `L`/`L+` rule); the SQL runs read-only and must select the finding-draft columns (key, title, detail, value, confidence, evidence_summary, evidence_records, created_at, plus optional dollar_impact_minor, currency, urgency, effort, severity, action_label, account_id).",
+  "version": 1,
+  "specs": [
+    {
+      "kind": "large-cash-withdrawal",
+      "domain": "spending",
+      "executionClass": "D",
+      "actionTier": "observer",
+      "scope": "banking",
+      "cadence": "event",
+      "keywords": "atm|cash withdrawal|cash out|取现|提现",
+      "prompt": null,
+      "facts": [],
+      "enabled": true,
+      "version": 1,
+      "sql": "SELECT t.id AS key, 'Large ATM / cash withdrawal' AS title, money(ABS(t.amount_minor), t.currency) || ' withdrawn on ' || t.date AS detail, money(ABS(t.amount_minor), t.currency) AS value, ABS(t.amount_minor) AS dollar_impact_minor, t.currency AS currency, 0.4 AS confidence, 1 AS effort, 'low' AS severity, 'ATM/cash withdrawal of ' || money(ABS(t.amount_minor), t.currency) || ' on ' || t.date || '.' AS evidence_summary, t.id AS evidence_records, t.account_id AS account_id, t.created_at AS created_at FROM transactions t WHERE t.amount_minor < 0 AND julianday(:now_iso) - julianday(t.date) <= 30 AND ABS(t.amount_minor) >= 40000 AND (lower(t.description) LIKE '%atm%' OR lower(COALESCE(t.category, '')) LIKE '%cash%') ORDER BY ABS(t.amount_minor) DESC LIMIT 10"
+    }
+  ]
+}

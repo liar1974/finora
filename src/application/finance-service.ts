@@ -17,6 +17,8 @@ import type {
   ProviderBrokerageTransactionInput,
   ProviderHoldingInput,
   ProviderTransactionInput,
+  MerchantIdentifier,
+  MerchantIdentityVerdict,
   RecurringClassifier,
   RecurringVerdict,
   RuleFeedClient,
@@ -42,7 +44,7 @@ import {
   normalizeCurrency,
   requireText,
 } from '../domain/invariants.js';
-import type { Account, AccountBalance, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, FactExpectation, Finding, ImportRecord, QuestionRecord, RecurringCandidate, RecurringClassification, RecurringDirection, RuleFactNeed, RuleRecord, RuleSpec, Transaction, TransactionInput } from '../domain/models.js';
+import type { Account, AccountBalance, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, FactExpectation, Finding, ImportRecord, MerchantCandidate, MerchantIdentity, QuestionRecord, RecurringCandidate, RecurringClassification, RecurringDirection, RuleFactNeed, RuleRecord, RuleSpec, Transaction, TransactionInput } from '../domain/models.js';
 import { builtinRuleSpecs, evaluateRules, executionStrategy, inferRule } from './rules-engine.js';
 import type { EvaluationData, QuestionDraft } from './rules-engine.js';
 import { clampChatInput, generateChatReply, LLM_PROVIDERS, providerContextTokens, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
@@ -176,6 +178,98 @@ export interface RecurringListItem {
   transactions: RecurringTransaction[]; // all charges, most recent first
 }
 
+// ── Advisor artifacts (the "Fight" layer) ──────────────────────────────────────
+// A finding's Observer tier surfaces the problem; the Advisor tier drafts a
+// document that helps the user act on it — a dispute letter, a fee-waiver
+// request, a negotiation script. The detection stays deterministic (an existing
+// D rule) and the money math is already computed; the model only turns the
+// finding's own facts into prose. It NEVER invents a number, date, or account
+// detail not present in the grounding JSON, and Finora never sends the document
+// — it drafts for the user to review and send themselves, so the read-only
+// promise holds. This mirrors the deterministic credit dispute-letter template.
+const ARTIFACT_DRAFTER_PREAMBLE = [
+  'You draft one short, ready-to-use document for a Finora user to review and send THEMSELVES.',
+  "Finora never sends anything on the user's behalf; write in the user's first-person voice.",
+  'Ground every amount, date, and merchant STRICTLY in the provided JSON. Never invent figures, account numbers, policy numbers, or facts that are not present.',
+  'Use [Your name], [Your address], [Account number] placeholders where personal details are needed.',
+  'Output ONLY the finished document text — no explanation, no preamble, no markdown code fences.',
+].join('\n');
+
+interface ArtifactSpec {
+  artifactType: string; // stable id surfaced on the finding and returned to the client
+  title: string; // human label for the drafted document
+  system: string; // the drafter instruction, prepended with ARTIFACT_DRAFTER_PREAMBLE
+}
+
+// Keyed by rule kind. Only rules whose D detector already exists appear here, so
+// adding a drafter is data, not new detection. The set is the "Fight" batch
+// (#8–#12 of the plan): duplicate charge, fees/interest, card interest,
+// subscription price increase, recurring subscription, newly converted trial.
+const ARTIFACT_SPECS: Record<string, ArtifactSpec> = {
+  'duplicate-charge': {
+    artifactType: 'dispute-letter',
+    title: 'Dispute letter',
+    system: [
+      ARTIFACT_DRAFTER_PREAMBLE,
+      'Write a concise dispute letter to the card issuer or bank contesting a duplicate charge.',
+      'State the merchant, both charge dates, and the amount, and request that the duplicate be reversed.',
+      'Reference the cardholder\'s right to dispute a billing error.',
+    ].join('\n'),
+  },
+  'cross-account-duplicate': {
+    artifactType: 'dispute-letter',
+    title: 'Dispute letter',
+    system: [
+      ARTIFACT_DRAFTER_PREAMBLE,
+      'Write a concise letter to the bank or card issuer about the same vendor and amount being paid from two different accounts.',
+      'State the vendor, both charge dates, and the amount, and request a reversal of the duplicate payment.',
+    ].join('\n'),
+  },
+  'fees-and-interest': {
+    artifactType: 'fee-waiver-request',
+    title: 'Fee-waiver request',
+    system: [
+      ARTIFACT_DRAFTER_PREAMBLE,
+      'Write a polite message to the bank requesting a waiver or courtesy refund of the listed fees or interest charges.',
+      'Cite the specific fee amounts and dates, note the account is otherwise in good standing, and ask for the refund.',
+    ].join('\n'),
+  },
+  'card-interest': {
+    artifactType: 'apr-reduction-request',
+    title: 'APR-reduction script',
+    system: [
+      ARTIFACT_DRAFTER_PREAMBLE,
+      'Write a brief phone or chat script asking the card issuer to lower the APR, referencing the interest recently paid.',
+      'Keep it to a few spoken lines the user can read aloud.',
+    ].join('\n'),
+  },
+  'subscription-price-increase': {
+    artifactType: 'retention-script',
+    title: 'Negotiation script',
+    system: [
+      ARTIFACT_DRAFTER_PREAMBLE,
+      'Write a short phone or chat retention script pushing back on a subscription price increase.',
+      'Reference the previous vs new amount, ask to keep the prior rate or a retention offer, and end with a polite cancel-if-not fallback.',
+    ].join('\n'),
+  },
+  'recurring-subscriptions': {
+    artifactType: 'cancellation-request',
+    title: 'Cancellation request',
+    system: [
+      ARTIFACT_DRAFTER_PREAMBLE,
+      'Write a clear cancellation request for the named subscription, asking for written confirmation and the effective date.',
+    ].join('\n'),
+  },
+  'new-recurring-charge': {
+    artifactType: 'trial-cancellation',
+    title: 'Cancel & refund request',
+    system: [
+      ARTIFACT_DRAFTER_PREAMBLE,
+      'Write a request to cancel a recently converted free trial and ask for a refund of the most recent charge, citing its date and amount.',
+    ].join('\n'),
+  },
+};
+
 export class FinanceService {
   private readonly telegramGateway: TelegramGateway;
   private backgroundServicesStarted = false;
@@ -187,12 +281,15 @@ export class FinanceService {
   private reflectionKick: ReturnType<typeof setTimeout> | undefined;
   private reflectionTimer: ReturnType<typeof setInterval> | undefined;
   private ruleFeedKick: ReturnType<typeof setTimeout> | undefined;
+  private ruleFeedTimer: ReturnType<typeof setInterval> | undefined;
 
   // When a classifier is injected (tests), it also stands in for "a model is
   // available"; otherwise the built-in LLM path is used and availability is
   // resolved from the configured provider.
   private readonly recurringClassifier: RecurringClassifier;
   private readonly recurringClassifierInjected: boolean;
+  private readonly merchantIdentifier: MerchantIdentifier;
+  private readonly merchantIdentifierInjected: boolean;
 
   constructor(
     private readonly repository: FinanceRepository,
@@ -200,9 +297,12 @@ export class FinanceService {
     private readonly localModel: LocalModelEngine,
     private readonly ruleFeed?: RuleFeedClient,
     recurringClassifier?: RecurringClassifier,
+    merchantIdentifier?: MerchantIdentifier,
   ) {
     this.recurringClassifierInjected = Boolean(recurringClassifier);
     this.recurringClassifier = recurringClassifier ?? ((candidates) => this.classifyRecurringWithModel(candidates));
+    this.merchantIdentifierInjected = Boolean(merchantIdentifier);
+    this.merchantIdentifier = merchantIdentifier ?? ((candidates) => this.identifyMerchantsWithModel(candidates));
     this.telegramGateway = new TelegramGateway({
       getToken: () => this.telegramToken(),
       getChatId: () => this.repository.getAppSetting('TELEGRAM_CHAT_ID'),
@@ -332,7 +432,13 @@ export class FinanceService {
 
   getCreditOverview() {
     const reports = this.repository.listCreditReports().map(sanitizeCreditReport);
-    const latest = reports[0] ?? null;
+    // "Latest" = the report with the newest report date among what remains (so
+    // deleting a report falls back to the next most recent one). Mirrors the UI's
+    // reportDateTime() so the overview and the reports list always agree.
+    const latest = reports.reduce<CreditReportRecord | null>(
+      (best, report) => (best && creditReportSortTime(best) >= creditReportSortTime(report) ? best : report),
+      null,
+    );
     const raw = latest?.raw ?? {};
     const accounts = asArray<CreditTradeline>(raw.accounts);
     const inquiries = asArray<CreditInquiry>(raw.inquiries);
@@ -1021,14 +1127,17 @@ export class FinanceService {
       this.providerSyncKick.unref();
     }
 
-    // Rule feed: pull the latest rule versions once, shortly after boot. Silent and
-    // best-effort — an unset RULES_FEED_URL (or no feed client) is a no-op, and any
-    // failure is logged, not surfaced. No interval: rule updates are infrequent and
-    // the manual "Check for updates" button covers on-demand refresh.
+    // Rule feed: pull new built-in rules shortly after boot, then once a day.
+    // Silent and best-effort — an unset RULES_FEED_URL (or no feed client) is a
+    // no-op, and any failure is logged, not surfaced. Sync is additive and
+    // idempotent, so a daily pass that finds nothing new is a cheap no-op.
+    const feedSync = () => this.syncRuleFeed().catch((error: unknown) => {
+      console.warn('Finora rule-feed sync failed:', error instanceof Error ? error.message : error);
+    });
     this.ruleFeedKick = setTimeout(() => {
-      void this.syncRuleFeed().catch((error: unknown) => {
-        console.warn('Finora rule-feed sync failed:', error instanceof Error ? error.message : error);
-      });
+      void feedSync();
+      this.ruleFeedTimer = setInterval(() => { void feedSync(); }, 24 * 60 * 60 * 1_000);
+      this.ruleFeedTimer.unref();
     }, 30_000);
     this.ruleFeedKick.unref();
 
@@ -1112,10 +1221,85 @@ export class FinanceService {
   }
 
   listFindings() {
-    return this.activeFindings();
+    return this.activeFindings().map((finding) => this.annotateArtifact(finding));
+  }
+
+  // Advertise which Advisor document (if any) Finora can draft for a finding, so
+  // the UI can offer it. This lives in the application layer, not the engine,
+  // because artifact specs are a delivery concern — the rule logic never changes.
+  private annotateArtifact(finding: Finding): Finding {
+    const spec = ARTIFACT_SPECS[finding.kind];
+    if (!spec || !finding.action) return finding;
+    return { ...finding, action: { ...finding.action, artifactType: spec.artifactType } };
+  }
+
+  // Advisor tier: draft the document that helps the user act on a finding. The
+  // numbers, dates, and merchant come deterministically from the finding's
+  // evidence; the model only turns them into prose (see ARTIFACT_SPECS). Findings
+  // are computed on read and never persisted, so the caller passes the finding id
+  // and we re-derive it here. Gated on a real model being present — the injected
+  // recurring classifier does NOT count, since this path actually calls the LLM.
+  async generateFindingArtifact(findingId: string): Promise<
+    | { status: 'not_found' }
+    | { status: 'unsupported' }
+    | { status: 'model_required'; provider: string; needsDownload: boolean }
+    | { status: 'ok'; findingId: string; artifactType: string; title: string; artifact: string }
+  > {
+    const finding = this.activeFindings().find((candidate) => candidate.id === findingId);
+    if (!finding) return { status: 'not_found' };
+    const spec = ARTIFACT_SPECS[finding.kind];
+    if (!spec) return { status: 'unsupported' };
+
+    const llm = this.llmConfig();
+    const modelReady = llm.provider === 'builtin' ? await this.localModel.weightsPresent() : llm.keySet;
+    if (!modelReady) {
+      return { status: 'model_required', provider: llm.provider, needsDownload: llm.provider === 'builtin' };
+    }
+
+    // Resolve the finding's evidence records to their transactions (fact:* refs,
+    // used by fact-gated rules, are not transactions and are skipped).
+    const txIds = finding.evidence.records.filter((record) => record && !record.startsWith('fact:'));
+    const txById = new Map(this.repository.listTransactionsByIds(txIds).map((tx) => [tx.id, tx]));
+    const accountName = new Map(this.repository.listAccounts().map((account) => [account.id, account.name]));
+    const charges = txIds
+      .map((id) => txById.get(id))
+      .filter((tx): tx is Transaction => Boolean(tx))
+      .map((tx) => ({
+        date: tx.date,
+        description: tx.description,
+        amount: formatMinorAmount(Math.abs(tx.amountMinor), tx.currency),
+        account: accountName.get(tx.accountId) ?? tx.accountId,
+      }));
+
+    const context = {
+      today: new Date().toISOString().slice(0, 10),
+      finding: {
+        title: finding.title,
+        detail: finding.detail,
+        value: finding.value,
+        estimatedImpact: finding.dollarImpactMinor ? formatMinorAmount(Math.abs(finding.dollarImpactMinor), finding.currency) : null,
+      },
+      charges,
+    };
+
+    let artifact: string;
+    try {
+      artifact = (await this.llmReply(llm, {
+        system: spec.system,
+        messages: [{ role: 'user', content: JSON.stringify(context) }],
+        timeoutMs: 120_000,
+        maxTokens: 1_200,
+      })).trim();
+    } catch (error) {
+      throw asAppError(error);
+    }
+    if (!artifact) throw new AppError('external_service', 'The model did not return a draft. Please try again.');
+    return { status: 'ok', findingId, artifactType: spec.artifactType, title: spec.title, artifact };
   }
 
   listRules() {
+    // All rules are built-in definitions; the UI shows every one with an on/off
+    // switch. No hidden subset.
     return this.repository.listRules();
   }
 
@@ -1137,32 +1321,37 @@ export class FinanceService {
     };
   }
 
-  createRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined; domain?: RuleRecord['domain'] | undefined }) {
+  createRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; channel?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
     const inferred = inferRule(this.repository.listRuleSpecs(), text, input.scope, input.cadence);
-    return this.repository.saveRule({
-      kind: inferred.kind,
-      domain: input.domain ?? inferred.domain,
+    // Adopt the matched rule definition into the user's list. The rule's logic and
+    // domain come from its definition; the user owns only the schedule/channel.
+    const rule = this.repository.adoptRule(inferred.kind, {
       sourceText: text,
-      executionClass: inferred.executionClass,
-      actionTier: inferred.actionTier,
-      scope: inferred.scope,
       cadence: inferred.cadence,
       channel: inferred.channel,
       scheduledHour: input.scheduledHour ?? null,
       scheduledDay: input.scheduledDay ?? null,
-      enabled: true,
     });
-  }
-
-  toggleRule(id: string, enabled: boolean) {
-    const rule = this.repository.toggleRule(id, enabled);
-    if (!rule) throw new AppError('not_found', 'Rule not found', { id });
+    if (!rule) throw new AppError('not_found', 'No rule definition matched', { kind: inferred.kind });
     return rule;
   }
 
-  removeRule(id: string) {
-    return { removed: this.repository.removeRule(id) };
+  toggleRule(kind: string, active: boolean) {
+    const rule = this.repository.toggleRule(kind, active);
+    if (!rule) throw new AppError('not_found', 'Rule not found', { kind });
+    return rule;
+  }
+
+  updateRuleSchedule(input: { kind: string; cadence?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
+    const kind = requireText(input.kind, 'kind');
+    const rule = this.repository.updateRuleSchedule(kind, {
+      cadence: input.cadence ?? 'event',
+      scheduledHour: input.scheduledHour ?? null,
+      scheduledDay: input.scheduledDay ?? null,
+    });
+    if (!rule) throw new AppError('not_found', 'Rule not found', { kind });
+    return rule;
   }
 
   // --- Facts and questions --------------------------------------------------
@@ -1280,25 +1469,42 @@ export class FinanceService {
   }
 
   // Over-the-air rule delivery. Fetches the configured feed URL, validates it, and
-  // upserts each spec as a `downloaded` rule when the feed's version is newer than
-  // the last applied one. Rules are pure data, so this needs no redeploy; a
-  // downloaded rule that declares user facts flows straight into the needs-input
-  // surface (factNeeds/questions read every spec regardless of source). The read-only
-  // query runner sandboxes downloaded SQL — it can never write. See docs/rules-design.md.
+  // INSERTS any rule whose kind this install doesn't already have. Existing rules
+  // are never overwritten, so the feed is an additive catalog of built-in rules — a
+  // way to ship new rules to installed versions without a code release, no redeploy.
+  // Dedup is by kind, so a re-sync that finds nothing new is a cheap no-op; the
+  // feed's `version` is informational only (shown in the UI, not gated on). The
+  // read-only query runner sandboxes downloaded SQL — it can never write. See
+  // docs/rules-design.md.
   async syncRuleFeed(): Promise<{ applied: number; skipped: boolean; version: number | null; reason?: string }> {
     const url = (this.repository.getAppSetting('RULES_FEED_URL') || '').trim();
     if (!url) return { applied: 0, skipped: true, version: null, reason: 'no-feed-url' };
     if (!this.ruleFeed) return { applied: 0, skipped: true, version: null, reason: 'no-client' };
 
-    const feed = parseRuleFeed(await this.ruleFeed.fetchFeed(url));
-    const appliedVersion = Number(this.repository.getAppSetting('RULES_FEED_VERSION') || 0);
-    if (feed.version <= appliedVersion) return { applied: 0, skipped: true, version: feed.version, reason: 'not-newer' };
+    // A network failure (unreachable URL, DNS, timeout) is not an error the user
+    // can fix from here — report it as a skip so the manual button degrades
+    // gracefully instead of 500ing. A malformed-but-reachable feed still throws
+    // (a 422), because that is a real, fixable problem with the feed itself.
+    let body: string;
+    try {
+      body = await this.ruleFeed.fetchFeed(url);
+    } catch {
+      return { applied: 0, skipped: true, version: null, reason: 'fetch-failed' };
+    }
+    const feed = parseRuleFeed(body);
 
-    for (const spec of feed.specs) this.repository.upsertRuleSpec({ ...spec, source: 'downloaded' });
-    this.repository.saveAppSettings({ RULES_FEED_VERSION: String(feed.version) });
-    // Surface any user input the new rules need right away.
+    // Additive only: insert the rules this install doesn't already have. Rules
+    // already present — whether from the built-in code seed or an earlier sync —
+    // are left untouched. The feed distributes NEW built-in rules to installed
+    // versions; it never re-syncs or overwrites an existing rule. Dedup by kind
+    // is what makes a repeated sync safe, so there is no version gate: applying
+    // an unchanged feed simply finds nothing fresh and returns applied: 0.
+    const existing = new Set(this.repository.listRuleSpecs().map((spec) => spec.kind));
+    const fresh = feed.specs.filter((spec) => !existing.has(spec.kind));
+    for (const spec of fresh) this.repository.upsertRuleSpec({ ...spec, source: 'downloaded' });
+    // Surface any user input the freshly-added rules need right away.
     this.refreshQuestions();
-    return { applied: feed.specs.length, skipped: false, version: feed.version };
+    return { applied: fresh.length, skipped: false, version: feed.version };
   }
 
   listFindingMutes() {
@@ -1706,11 +1912,15 @@ export class FinanceService {
       contentHash,
       transactions,
     });
-    // New transactions may create or reshape recurring series; refresh the
-    // classifier cache in the background (no-op without a model). Fire-and-forget
-    // so import stays synchronous; the recurring endpoint also refreshes on read.
+    // New transactions may create or reshape recurring series and introduce new
+    // merchants; refresh both caches in the background (no-op without a model).
+    // Fire-and-forget so import stays synchronous; the recurring endpoint also
+    // refreshes on read.
     void this.refreshRecurringClassifications().catch((error) => {
       console.warn('Finora recurring classification refresh failed:', error instanceof Error ? error.message : error);
+    });
+    void this.refreshMerchantIdentities().catch((error) => {
+      console.warn('Finora merchant identity refresh failed:', error instanceof Error ? error.message : error);
     });
     return record;
   }
@@ -1726,6 +1936,7 @@ export class FinanceService {
     if (this.reflectionKick) clearTimeout(this.reflectionKick);
     if (this.reflectionTimer) clearInterval(this.reflectionTimer);
     if (this.ruleFeedKick) clearTimeout(this.ruleFeedKick);
+    if (this.ruleFeedTimer) clearInterval(this.ruleFeedTimer);
     void this.localModel.unload();
     this.repository.close();
   }
@@ -1895,6 +2106,85 @@ export class FinanceService {
       classified += 1;
     }
     return { classified, skipped: false };
+  }
+
+  // ── Merchant identity (F1) ─────────────────────────────────────────────────
+  // Whether merchant identity resolution can run — an injected identifier (tests)
+  // counts, otherwise a real model must be configured. Same shape as
+  // recurringModelReady; the two are independent seams.
+  async merchantModelReady(): Promise<boolean> {
+    if (this.merchantIdentifierInjected) return true;
+    const llm = this.llmConfig();
+    if (llm.provider === 'builtin') return this.localModel.weightsPresent();
+    return llm.keySet;
+  }
+
+  // Resolve each not-yet-identified merchant to its canonical vendor and cache the
+  // verdict, so rules can group by vendor across differing billing descriptions.
+  // Only new merchants are sent (identity of a normalized merchant is stable), so
+  // the model is called sparingly. No-op when no model is available.
+  async refreshMerchantIdentities(): Promise<{ identified: number; skipped: boolean }> {
+    if (!(await this.merchantModelReady())) return { identified: 0, skipped: true };
+    const candidates = this.repository.listMerchantCandidates();
+    if (candidates.length === 0) return { identified: 0, skipped: false };
+    const stored = new Map(this.repository.listMerchantIdentities().map((row) => [row.merchant, row]));
+    const signature = merchantSignature();
+    const stale = candidates.filter((candidate) => stored.get(candidate.merchant)?.signature !== signature);
+    if (stale.length === 0) return { identified: 0, skipped: false };
+
+    const verdicts = new Map((await this.merchantIdentifier(stale)).map((verdict) => [verdict.merchant, verdict]));
+    const now = new Date().toISOString();
+    let identified = 0;
+    for (const candidate of stale) {
+      const verdict = verdicts.get(candidate.merchant);
+      if (!verdict) continue;
+      const canonicalName = verdict.canonicalName.trim() || candidate.label;
+      this.repository.upsertMerchantIdentity({
+        merchant: candidate.merchant,
+        canonicalName,
+        canonicalSlug: merchantSlug(canonicalName),
+        confidence: verdict.confidence,
+        signature,
+        updatedAt: now,
+      });
+      identified += 1;
+    }
+    return { identified, skipped: false };
+  }
+
+  // Default identifier: the model maps each normalized merchant to its real-world
+  // vendor using brand knowledge. Chunked so every candidate gets a complete
+  // verdict; a failed chunk yields no verdicts, leaving prior identities untouched.
+  private async identifyMerchantsWithModel(candidates: MerchantCandidate[]): Promise<MerchantIdentityVerdict[]> {
+    const CHUNK = 40;
+    const verdicts: MerchantIdentityVerdict[] = [];
+    for (let start = 0; start < candidates.length; start += CHUNK) {
+      verdicts.push(...(await this.identifyMerchantChunk(candidates.slice(start, start + CHUNK))));
+    }
+    return verdicts;
+  }
+
+  private async identifyMerchantChunk(candidates: MerchantCandidate[]): Promise<MerchantIdentityVerdict[]> {
+    if (candidates.length === 0) return [];
+    const llm = this.llmConfig();
+    const payload = candidates.map((candidate, ref) => ({
+      ref,
+      merchant: candidate.merchant,
+      name: candidate.label,
+      category: candidate.category || 'unknown',
+      count: candidate.count,
+    }));
+    try {
+      const reply = await this.llmReply(llm, {
+        system: MERCHANT_IDENTIFIER_SYSTEM,
+        messages: [{ role: 'user', content: JSON.stringify(payload) }],
+        timeoutMs: 120_000,
+        maxTokens: Math.min(4_000, 300 + candidates.length * 40),
+      });
+      return parseMerchantVerdicts(reply, candidates);
+    } catch {
+      return [];
+    }
   }
 
   // Feeds the Recurring table. Requires a model; when none is configured it does
@@ -2188,7 +2478,7 @@ export class FinanceService {
   // findings already ranked by score. The engine is the only place rule logic
   // lives; see docs/rules-design.md.
   private activeFindings(): Finding[] {
-    const { findings } = evaluateRules(this.repository.listRuleSpecs(), this.repository.listRules(), this.buildEvaluationData(), (sql, params) => this.repository.runRuleQuery(sql, params));
+    const { findings } = evaluateRules(this.repository.listRules(), this.buildEvaluationData(), (sql, params) => this.repository.runRuleQuery(sql, params));
     const now = Date.now();
     const mutes = this.repository.listFindingMutes().filter((mute) => {
       if (!mute.expiresAt) return true;
@@ -2212,7 +2502,7 @@ export class FinanceService {
   // keyed by fact so re-evaluation refreshes impact in place. A pending question
   // whose fact is now known is marked answered.
   private refreshQuestions(): QuestionDraft[] {
-    const { questions } = evaluateRules(this.repository.listRuleSpecs(), this.repository.listRules(), this.buildEvaluationData(), (sql, params) => this.repository.runRuleQuery(sql, params));
+    const { questions } = evaluateRules(this.repository.listRules(), this.buildEvaluationData(), (sql, params) => this.repository.runRuleQuery(sql, params));
     const openKeys = new Set(questions.map((question) => question.factKey));
     for (const question of questions) {
       this.repository.upsertQuestion({
@@ -2365,6 +2655,60 @@ function parseRecurringVerdicts(reply: string, candidates: RecurringCandidate[])
   return verdicts;
 }
 
+// ── Merchant identity (F1) ─────────────────────────────────────────────────────
+const MERCHANT_IDENTIFIER_SYSTEM = [
+  'You resolve a personal-finance app user\'s merchant descriptions to a canonical vendor identity.',
+  'Input is a JSON array; each entry is one normalized merchant with: ref, merchant (a normalized key), name (a representative raw description), category (Plaid-style), count.',
+  '',
+  'For each, return the real-world vendor it belongs to. Merchants that are the SAME company under different billing descriptors — e.g. "APPLE.COM/BILL", "ITUNES", "APPLE SERVICES" — must share ONE canonicalName. Distinct vendors must get distinct names. Use world knowledge of brands.',
+  'Do NOT over-merge: a payment-processor prefix (SQ *, TST*, PP*, PAYPAL *) is not the vendor — name the actual seller after it. Unrelated merchants that merely look similar must stay separate. When unsure, keep the merchant as its own identity, using a cleaned version of its name.',
+  '',
+  'Return ONLY a JSON array, one object per input, each: {"ref": <echo>, "canonicalName": clean vendor name, "confidence": 0..1}. No prose.',
+].join('\n');
+
+// Bump when the prompt or candidate shape changes so every cached identity is
+// recomputed. Identity of a fixed normalized merchant is otherwise stable, so a
+// merchant is classified exactly once between version bumps.
+const MERCHANT_IDENTIFIER_VERSION = 1;
+
+function merchantSignature(): string {
+  return `v${MERCHANT_IDENTIFIER_VERSION}`;
+}
+
+// The lowercased, whitespace-collapsed join key shared by every merchant that
+// maps to the same canonical vendor name.
+function merchantSlug(canonicalName: string): string {
+  return canonicalName.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function parseMerchantVerdicts(reply: string, candidates: MerchantCandidate[]): MerchantIdentityVerdict[] {
+  const match = reply.match(/\[[\s\S]*\]/);
+  if (!match) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(match[0]);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const verdicts: MerchantIdentityVerdict[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object') continue;
+    const record = entry as Record<string, unknown>;
+    const ref = Number(record.ref);
+    const candidate = candidates[ref];
+    if (!candidate) continue;
+    const canonicalName = record.canonicalName ? String(record.canonicalName).slice(0, 60).trim() : candidate.label;
+    verdicts.push({
+      merchant: candidate.merchant,
+      canonicalName: canonicalName || candidate.label,
+      canonicalSlug: merchantSlug(canonicalName || candidate.label),
+      confidence: Math.max(0, Math.min(1, Number(record.confidence))) || 0,
+    });
+  }
+  return verdicts;
+}
+
 // Parse and validate a rule-feed document into specs, throwing AppError on a
 // malformed feed. Each spec is coerced with safe defaults so the feed format can
 // grow additively; the caller stamps source = 'downloaded'. Deliberately hand-rolled
@@ -2404,7 +2748,6 @@ function coerceRuleSpec(raw: unknown, index: number): RuleSpec {
     actionTier: pick(r.actionTier, RULE_FEED_TIERS, 'observer') as RuleSpec['actionTier'],
     scope: str(r.scope, 'all'),
     cadence: str(r.cadence, 'event'),
-    alwaysOn: r.alwaysOn === true,
     keywords: str(r.keywords, ''),
     sql: strOrNull(r.sql),
     prompt: strOrNull(r.prompt),
@@ -3158,6 +3501,13 @@ function isInquiryNoiseLine(value: string): boolean {
     /^(?:type|date|date\(s\)|inquiry date|permissible purpose|requested by)$/i.test(value) ||
     /^(?:this section shows|this inquiry|a request for your credit history|too many hard inquiries|hard inquiries that can|soft inquiries that do|these are inquiries|you've applied for credit|and any unfamiliar inquiries|you have a right to receive)/i.test(value) ||
     /\b(?:credit report|credit history|credit rating\/score|impact your credit score|identity theft|relating to a credit transaction)\b/i.test(value);
+}
+
+// Report date if parsed, else upload time; invalid/missing sorts oldest. Kept in
+// sync with reportDateTime() in web/app.js so both rank reports identically.
+function creditReportSortTime(report: CreditReportRecord): number {
+  const time = new Date(report.reportDate || report.createdAt || '').getTime();
+  return Number.isFinite(time) ? time : 0;
 }
 
 function sanitizeCreditReport(report: CreditReportRecord): CreditReportRecord {

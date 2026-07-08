@@ -12,6 +12,7 @@ import type {
   ProviderConnectionSave,
   ProviderHoldingInput,
   ProviderTransactionInput,
+  RuleAdoption,
   SaveImportInput,
   SummaryQuery,
   TransactionQuery,
@@ -32,6 +33,8 @@ import type {
   FactRecord,
   FindingMuteRecord,
   ImportRecord,
+  MerchantCandidate,
+  MerchantIdentity,
   MoneySummary,
   Page,
   ProviderConnection,
@@ -120,6 +123,40 @@ const RULE_SPECS_SCHEMA = `
   );
 `;
 
+// The single rules table (migration v12): one row per rule carrying BOTH the
+// definition (code/feed owned) and the user's on/off + schedule (user owned).
+// Replaces the former rule_specs (definitions) + rules (instances) split. `kind`
+// is identity; the engine runs a row when enabled AND active. (The always_on and
+// user_rule columns here are created for the v12/v13 fold and dropped in v15.)
+const MERGED_RULES_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS rules (
+    kind TEXT PRIMARY KEY,
+    domain TEXT NOT NULL DEFAULT 'cash-flow',
+    execution_class TEXT NOT NULL DEFAULT 'D' CHECK (execution_class IN ('D', 'L', 'L+')),
+    action_tier TEXT NOT NULL DEFAULT 'observer' CHECK (action_tier IN ('observer', 'advisor', 'guardian', 'navigator')),
+    scope TEXT NOT NULL DEFAULT 'banking',
+    cadence TEXT NOT NULL DEFAULT 'event',
+    always_on INTEGER NOT NULL DEFAULT 0 CHECK (always_on IN (0, 1)),
+    keywords TEXT NOT NULL DEFAULT '',
+    sql TEXT,
+    prompt TEXT,
+    facts TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    version INTEGER NOT NULL DEFAULT 1,
+    source TEXT NOT NULL DEFAULT 'builtin',
+    user_rule INTEGER NOT NULL DEFAULT 0 CHECK (user_rule IN (0, 1)),
+    active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+    source_text TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL DEFAULT 'auto',
+    scheduled_hour INTEGER CHECK (scheduled_hour IS NULL OR (scheduled_hour >= 0 AND scheduled_hour <= 23)),
+    scheduled_day INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS rules_run_idx ON rules(enabled, always_on, active);
+`;
+
 // LLM verdicts on whether a merchant series is recurring, keyed by normalized
 // merchant + direction (account-agnostic — a merchant is recurring regardless of
 // which card paid it). Populated by an out-of-band classification pass so the
@@ -138,6 +175,20 @@ const RECURRING_CLASSIFICATIONS_SCHEMA = `
     signature TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (merchant, direction)
+  );
+`;
+
+// F1 merchant identity. Maps each normalized merchant to a canonical vendor so
+// rules can group by vendor across differing billing descriptions. Keyed by the
+// normalized merchant; canonical_slug is the shared lowercased join key.
+const MERCHANT_IDENTITIES_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS merchant_identities (
+    merchant TEXT PRIMARY KEY,
+    canonical_name TEXT NOT NULL,
+    canonical_slug TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0,
+    signature TEXT NOT NULL,
+    updated_at TEXT NOT NULL
   );
 `;
 
@@ -313,18 +364,24 @@ interface CreditReportRow extends Record<string, unknown> {
 }
 
 interface RuleRow extends Record<string, unknown> {
-  id: string;
   kind: string;
   domain: string;
-  source_text: string;
   execution_class: string;
   action_tier: string;
   scope: string;
   cadence: string;
+  keywords: string;
+  sql: string | null;
+  prompt: string | null;
+  facts: string;
+  enabled: number;
+  version: number;
+  source: string;
+  active: number;
+  source_text: string;
   channel: string;
   scheduled_hour: number | null;
   scheduled_day: number | null;
-  enabled: number;
   created_at: string;
   updated_at: string;
 }
@@ -345,7 +402,6 @@ interface RuleSpecRow extends Record<string, unknown> {
   action_tier: string;
   scope: string;
   cadence: string;
-  always_on: number;
   keywords: string;
   sql: string | null;
   prompt: string | null;
@@ -850,62 +906,76 @@ export class SqliteFinanceRepository implements FinanceRepository {
     }
   }
 
+  private readonly ruleColumns = `kind, domain, execution_class, action_tier, scope, cadence, keywords, sql, prompt, facts, enabled, version, source, active, source_text, channel, scheduled_hour, scheduled_day, created_at, updated_at`;
+
   listRules(): RuleRecord[] {
     const rows = this.database.prepare(`
-      SELECT id, kind, domain, source_text, execution_class, action_tier, scope, cadence, channel, scheduled_hour, scheduled_day, enabled, created_at, updated_at
-      FROM rules
-      ORDER BY enabled DESC, cadence, scope, created_at DESC
+      SELECT ${this.ruleColumns} FROM rules
+      ORDER BY active DESC, cadence, scope, kind
     `).all() as RuleRow[];
     return rows.map(mapRule);
   }
 
-  saveRule(input: Omit<RuleRecord, 'id' | 'createdAt' | 'updatedAt'>): RuleRecord {
-    const now = new Date().toISOString();
-    const row: RuleRecord = { id: randomUUID(), createdAt: now, updatedAt: now, ...input };
-    this.database.prepare(`
-      INSERT INTO rules (id, kind, domain, source_text, execution_class, action_tier, scope, cadence, channel, scheduled_hour, scheduled_day, enabled, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(row.id, row.kind, row.domain, row.sourceText, row.executionClass, row.actionTier, row.scope, row.cadence, row.channel, row.scheduledHour, row.scheduledDay, row.enabled ? 1 : 0, now, now);
-    return row;
-  }
-
-  toggleRule(id: string, enabled: boolean): RuleRecord | null {
-    this.database.prepare(`
-      UPDATE rules SET enabled = ?, updated_at = ? WHERE id = ?
-    `).run(enabled ? 1 : 0, new Date().toISOString(), id);
-    const row = this.database.prepare(`
-      SELECT id, kind, domain, source_text, execution_class, action_tier, scope, cadence, channel, scheduled_hour, scheduled_day, enabled, created_at, updated_at
-      FROM rules WHERE id = ?
-    `).get(id) as RuleRow | undefined;
+  private getRule(kind: string): RuleRecord | null {
+    const row = this.database.prepare(`SELECT ${this.ruleColumns} FROM rules WHERE kind = ?`).get(kind) as RuleRow | undefined;
     return row ? mapRule(row) : null;
   }
 
-  removeRule(id: string): boolean {
-    const result = this.database.prepare('DELETE FROM rules WHERE id = ?').run(id);
-    return result.changes > 0;
+  // Turn a rule on (by kind) with the user's schedule/channel. Definition columns
+  // are untouched. Returns null when the kind has no rule row.
+  adoptRule(kind: string, schedule: RuleAdoption): RuleRecord | null {
+    const result = this.database.prepare(`
+      UPDATE rules SET active = 1, source_text = ?, cadence = ?, channel = ?, scheduled_hour = ?, scheduled_day = ?, updated_at = ?
+      WHERE kind = ?
+    `).run(schedule.sourceText, schedule.cadence, schedule.channel, schedule.scheduledHour, schedule.scheduledDay, new Date().toISOString(), kind);
+    return result.changes > 0 ? this.getRule(kind) : null;
   }
 
+  toggleRule(kind: string, active: boolean): RuleRecord | null {
+    const result = this.database.prepare(`
+      UPDATE rules SET active = ?, updated_at = ? WHERE kind = ?
+    `).run(active ? 1 : 0, new Date().toISOString(), kind);
+    return result.changes > 0 ? this.getRule(kind) : null;
+  }
+
+  // Update a rule's delivery schedule (by kind), without changing its on/off state.
+  updateRuleSchedule(kind: string, schedule: { cadence: string; scheduledHour: number | null; scheduledDay: number | null }): RuleRecord | null {
+    const result = this.database.prepare(`
+      UPDATE rules SET cadence = ?, scheduled_hour = ?, scheduled_day = ?, updated_at = ? WHERE kind = ?
+    `).run(schedule.cadence, schedule.scheduledHour, schedule.scheduledDay, new Date().toISOString(), kind);
+    return result.changes > 0 ? this.getRule(kind) : null;
+  }
+
+  // The definition view over the single table (used by rule inference, the facts
+  // surface, and the feed sync). User-owned columns are omitted.
   listRuleSpecs(): RuleSpec[] {
     const rows = this.database.prepare(`
-      SELECT kind, domain, execution_class, action_tier, scope, cadence, always_on, keywords, sql, prompt, facts, enabled, version, source
-      FROM rule_specs
+      SELECT kind, domain, execution_class, action_tier, scope, cadence, keywords, sql, prompt, facts, enabled, version, source
+      FROM rules
       ORDER BY rowid
     `).all() as RuleSpecRow[];
     return rows.map(mapRuleSpec);
   }
 
+  // Upsert a rule DEFINITION (builtin seed / downloaded feed). On conflict it
+  // updates only the definition columns, never the user-owned adoption columns, so
+  // re-seeding on startup can't wipe the user's on/off, schedule, or channel.
   upsertRuleSpec(spec: RuleSpec): void {
+    const now = new Date().toISOString();
+    // Every rule ships ON by default: `active` seeds to 1 on first insert. On
+    // conflict it is preserved, so re-seeding never flips the user's switch back.
+    // cadence is likewise preserved (see the ON CONFLICT set).
     this.database.prepare(`
-      INSERT INTO rule_specs (kind, domain, execution_class, action_tier, scope, cadence, always_on, keywords, sql, prompt, facts, enabled, version, source, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO rules (kind, domain, execution_class, action_tier, scope, cadence, keywords, sql, prompt, facts, enabled, version, source, active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(kind) DO UPDATE SET
         domain = excluded.domain, execution_class = excluded.execution_class, action_tier = excluded.action_tier,
-        scope = excluded.scope, cadence = excluded.cadence, always_on = excluded.always_on, keywords = excluded.keywords,
+        scope = excluded.scope, keywords = excluded.keywords,
         sql = excluded.sql, prompt = excluded.prompt, facts = excluded.facts, enabled = excluded.enabled,
         version = excluded.version, source = excluded.source, updated_at = excluded.updated_at
-    `).run(spec.kind, spec.domain, spec.executionClass, spec.actionTier, spec.scope, spec.cadence, spec.alwaysOn ? 1 : 0,
+    `).run(spec.kind, spec.domain, spec.executionClass, spec.actionTier, spec.scope, spec.cadence,
       spec.keywords, spec.sql, spec.prompt, JSON.stringify(spec.facts), spec.enabled ? 1 : 0, spec.version, spec.source,
-      new Date().toISOString());
+      1, now, now);
   }
 
   // Deterministic candidate generation for the recurring classifier: one row per
@@ -1022,6 +1092,60 @@ export class SqliteFinanceRepository implements FinanceRepository {
         signature = excluded.signature, updated_at = excluded.updated_at
     `).run(row.merchant, row.direction, row.isRecurring ? 1 : 0, row.kind, row.cadence, row.canonicalName,
       row.confidence, row.signature, row.updatedAt);
+  }
+
+  // Deterministic candidate generation for the merchant identifier: one row per
+  // normalized merchant, with a representative raw description (the most frequent)
+  // and the transaction count, for the model to reason over.
+  listMerchantCandidates(): MerchantCandidate[] {
+    const rows = this.database.prepare(`
+      WITH base AS (
+        SELECT normalize_merchant(description) AS merchant, description, category
+        FROM transactions
+        WHERE normalize_merchant(description) <> ''
+      ), lab AS (
+        SELECT merchant, description AS label, MAX(category) AS category, COUNT(*) AS n,
+          ROW_NUMBER() OVER (PARTITION BY merchant ORDER BY COUNT(*) DESC, description) AS rn
+        FROM base GROUP BY merchant, description
+      ), agg AS (
+        SELECT merchant, COUNT(*) AS count FROM base GROUP BY merchant
+      )
+      SELECT a.merchant AS merchant, l.label AS label, l.category AS category, a.count AS count
+      FROM agg a JOIN (SELECT merchant, label, category FROM lab WHERE rn = 1) l ON l.merchant = a.merchant
+      ORDER BY a.count DESC
+      LIMIT 500
+    `).all() as Record<string, unknown>[];
+    return rows.map((row) => ({
+      merchant: String(row.merchant),
+      label: String(row.label ?? row.merchant),
+      category: row.category != null ? String(row.category) : null,
+      count: Number(row.count),
+    }));
+  }
+
+  listMerchantIdentities(): MerchantIdentity[] {
+    const rows = this.database.prepare(`
+      SELECT merchant, canonical_name, canonical_slug, confidence, signature, updated_at
+      FROM merchant_identities
+    `).all() as Record<string, unknown>[];
+    return rows.map((row) => ({
+      merchant: String(row.merchant),
+      canonicalName: String(row.canonical_name),
+      canonicalSlug: String(row.canonical_slug),
+      confidence: Number(row.confidence),
+      signature: String(row.signature),
+      updatedAt: String(row.updated_at),
+    }));
+  }
+
+  upsertMerchantIdentity(row: MerchantIdentity): void {
+    this.database.prepare(`
+      INSERT INTO merchant_identities (merchant, canonical_name, canonical_slug, confidence, signature, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(merchant) DO UPDATE SET
+        canonical_name = excluded.canonical_name, canonical_slug = excluded.canonical_slug,
+        confidence = excluded.confidence, signature = excluded.signature, updated_at = excluded.updated_at
+    `).run(row.merchant, row.canonicalName, row.canonicalSlug, row.confidence, row.signature, row.updatedAt);
   }
 
   listFindingMutes(): FindingMuteRecord[] {
@@ -1417,6 +1541,21 @@ export class SqliteFinanceRepository implements FinanceRepository {
       // Recurring detection moves from CV thresholds to an LLM classifier whose
       // verdicts live in recurring_classifications; the rules JOIN it.
       { version: 10, up: () => this.database.exec(RECURRING_CLASSIFICATIONS_SCHEMA) },
+      // F1: canonical merchant identities, so rules group by vendor across
+      // differing billing descriptions.
+      { version: 11, up: () => this.database.exec(MERCHANT_IDENTITIES_SCHEMA) },
+      // Collapse the rule_specs (definitions) + rules (instances) split into a
+      // single `rules` table keyed by kind.
+      { version: 12, up: () => this.applySingleRulesTable() },
+      // The engine now runs on `active` alone (no separate always-on class), so
+      // switch on every rule that was always-on to preserve its behaviour.
+      { version: 13, up: () => this.database.exec('UPDATE rules SET active = 1 WHERE always_on = 1;') },
+      // Every rule is enabled by default: switch them all on. Users can still turn
+      // individual rules off afterward (preserved across re-seeding).
+      { version: 14, up: () => this.database.exec('UPDATE rules SET active = 1;') },
+      // Drop the now-vestigial columns: the engine runs on `active` alone, so
+      // always_on and user_rule no longer carry meaning.
+      { version: 15, up: () => this.dropVestigialRuleColumns() },
     ];
 
     // Before mutating an existing user's data, snapshot it. This only runs when
@@ -1670,6 +1809,53 @@ export class SqliteFinanceRepository implements FinanceRepository {
       DROP TABLE IF EXISTS alert_rules;
       DROP TABLE IF EXISTS alert_mutes;
       ${RULES_ENGINE_SCHEMA}
+    `);
+  }
+
+  // Migration v15: the engine runs on `active` alone, so always_on and user_rule
+  // are dead weight. Drop them (recreating the run index without always_on first,
+  // since a column in an index can't be dropped).
+  private dropVestigialRuleColumns(): void {
+    this.database.exec(`
+      DROP INDEX IF EXISTS rules_run_idx;
+      ALTER TABLE rules DROP COLUMN always_on;
+      ALTER TABLE rules DROP COLUMN user_rule;
+      CREATE INDEX IF NOT EXISTS rules_run_idx ON rules(enabled, active);
+    `);
+  }
+
+  // Migration v12: fold the two-table model (rule_specs definitions + rules
+  // instances) into one `rules` table keyed by kind. Every definition becomes a
+  // row; a matching instance (if any) sets user_rule=1, active from its enabled
+  // flag, and carries its schedule/channel. On a fresh install rule_specs is
+  // still empty here (the service seeds builtins after migration), so this yields
+  // an empty merged table that seeding then fills.
+  private applySingleRulesTable(): void {
+    const now = new Date().toISOString();
+    this.database.exec(`
+      ALTER TABLE rules RENAME TO rules_legacy;
+      ${MERGED_RULES_SCHEMA}
+      INSERT INTO rules (
+        kind, domain, execution_class, action_tier, scope, cadence, always_on, keywords, sql, prompt, facts,
+        enabled, version, source, user_rule, active, source_text, channel, scheduled_hour, scheduled_day, created_at, updated_at
+      )
+      SELECT
+        s.kind, s.domain, s.execution_class, s.action_tier, s.scope, s.cadence, s.always_on, s.keywords, s.sql, s.prompt, s.facts,
+        s.enabled, s.version, s.source,
+        CASE WHEN o.kind IS NOT NULL THEN 1 ELSE 0 END,
+        CASE WHEN o.enabled = 1 THEN 1 ELSE 0 END,
+        COALESCE(o.source_text, ''),
+        COALESCE(o.channel, 'auto'),
+        o.scheduled_hour, o.scheduled_day,
+        COALESCE(o.created_at, '${now}'), '${now}'
+      FROM rule_specs s
+      LEFT JOIN (
+        SELECT kind, enabled, channel, scheduled_hour, scheduled_day, source_text, created_at,
+               ROW_NUMBER() OVER (PARTITION BY kind ORDER BY updated_at DESC) AS rn
+        FROM rules_legacy
+      ) o ON o.kind = s.kind AND o.rn = 1;
+      DROP TABLE rules_legacy;
+      DROP TABLE rule_specs;
     `);
   }
 
@@ -2191,19 +2377,30 @@ function mapAppSetting(row: AppSettingRow): AppSettingPreview {
 }
 
 function mapRule(row: RuleRow): RuleRecord {
+  let facts: RuleRecord['facts'] = [];
+  try {
+    const parsed: unknown = JSON.parse(row.facts);
+    if (Array.isArray(parsed)) facts = parsed as RuleRecord['facts'];
+  } catch { facts = []; }
   return {
-    id: row.id,
     kind: row.kind,
     domain: row.domain as RuleRecord['domain'],
-    sourceText: row.source_text,
     executionClass: row.execution_class as RuleRecord['executionClass'],
     actionTier: row.action_tier as RuleRecord['actionTier'],
     scope: row.scope,
     cadence: row.cadence,
+    keywords: row.keywords,
+    sql: row.sql,
+    prompt: row.prompt,
+    facts,
+    enabled: row.enabled === 1,
+    version: Number(row.version),
+    source: row.source,
+    active: row.active === 1,
+    sourceText: row.source_text,
     channel: row.channel,
     scheduledHour: typeof row.scheduled_hour === 'number' ? row.scheduled_hour : null,
     scheduledDay: typeof row.scheduled_day === 'number' ? row.scheduled_day : null,
-    enabled: row.enabled === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -2222,7 +2419,6 @@ function mapRuleSpec(row: RuleSpecRow): RuleSpec {
     actionTier: row.action_tier as RuleSpec['actionTier'],
     scope: row.scope,
     cadence: row.cadence,
-    alwaysOn: row.always_on === 1,
     keywords: row.keywords,
     sql: row.sql,
     prompt: row.prompt,

@@ -241,16 +241,17 @@ Date: 05/01/2026
     });
   });
 
-  it('honors a category override when saving a custom rule', async () => {
+  it('files a saved rule under its definition domain (single-table: domain is definition-owned)', async () => {
     const { base } = await httpFixture();
     const saved = await fetch(`${base}/v1/rules`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'flag large transactions', scope: 'banking', cadence: 'event', domain: 'credit' }),
+      body: JSON.stringify({ text: 'flag large transactions', scope: 'banking', cadence: 'event' }),
     });
     expect(saved.status).toBe(201);
-    // Kind is inferred from the text, but the user-chosen category wins over the inferred one.
-    expect(await saved.json()).toMatchObject({ kind: 'large-transaction', domain: 'credit' });
+    // Kind is inferred from the text; the rule's domain follows its shared
+    // definition (large-transaction is a spending rule) rather than a per-user override.
+    expect(await saved.json()).toMatchObject({ kind: 'large-transaction', domain: 'spending' });
   });
 
   it('lists active findings ranked with dollar impact and confidence', async () => {
@@ -275,7 +276,9 @@ Date: 05/01/2026
       body: JSON.stringify({
         accountId: account.id,
         filename: 'card.csv',
-        contentBase64: Buffer.from(`Date,Description,Amount\n${daysAgo(3)},Coffee Shop,-600.00\n`).toString('base64'),
+        // A prior charge at the same merchant keeps the enabled-by-default
+        // unfamiliar-merchant rule quiet, so this asserts on the large-transaction finding.
+        contentBase64: Buffer.from(`Date,Description,Amount\n${daysAgo(70)},Coffee Shop,-20.00\n${daysAgo(3)},Coffee Shop,-600.00\n`).toString('base64'),
       }),
     });
     expect(imported.status).toBe(200);
@@ -302,9 +305,45 @@ Date: 05/01/2026
       body: JSON.stringify({ text: 'weekly idle cash review', scope: 'banking', cadence: 'weekly', scheduledHour: 9, scheduledDay: 1 }),
     });
     expect(saved.status).toBe(201);
-    expect(await saved.json()).toMatchObject({ cadence: 'weekly', scheduledHour: 9, scheduledDay: 1 });
-    const listed = await (await fetch(`${base}/v1/rules`)).json() as { items: Array<{ scheduledDay: number | null }> };
-    expect(listed.items[0]).toMatchObject({ scheduledDay: 1 });
+    expect(await saved.json()).toMatchObject({ kind: 'idle-cash', cadence: 'weekly', scheduledHour: 9, scheduledDay: 1 });
+    // /v1/rules lists every rule; find the one we just scheduled by its kind.
+    const listed = await (await fetch(`${base}/v1/rules`)).json() as { items: Array<{ kind: string; scheduledDay: number | null }> };
+    expect(listed.items.find((r) => r.kind === 'idle-cash')).toMatchObject({ scheduledDay: 1 });
+  });
+
+  it('ships every rule enabled and active by default', async () => {
+    const { base } = await httpFixture();
+    const listed = await (await fetch(`${base}/v1/rules`)).json() as { items: Array<{ enabled: boolean; active: boolean }> };
+    expect(listed.items.length).toBeGreaterThanOrEqual(29);
+    expect(listed.items.every((r) => r.enabled && r.active)).toBe(true);
+  });
+
+  it('toggles a rule off and on and updates its schedule, all by kind', async () => {
+    const { base } = await httpFixture();
+    const post = (path: string, body: unknown) =>
+      fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const activeOf = async (kind: string) => {
+      const listed = await (await fetch(`${base}/v1/rules`)).json() as { items: Array<{ kind: string; active: boolean }> };
+      return listed.items.find((r) => r.kind === kind)?.active;
+    };
+
+    // Toggle off, reflected in the list.
+    const off = await post('/v1/rules/toggle', { kind: 'idle-cash', enabled: false });
+    expect(off.status).toBe(200);
+    expect(await off.json()).toMatchObject({ kind: 'idle-cash', active: false });
+    expect(await activeOf('idle-cash')).toBe(false);
+
+    // Toggle back on.
+    await post('/v1/rules/toggle', { kind: 'idle-cash', enabled: true });
+    expect(await activeOf('idle-cash')).toBe(true);
+
+    // Update the delivery schedule by kind (leaves it on).
+    const sched = await post('/v1/rules/schedule', { kind: 'idle-cash', cadence: 'monthly', scheduledHour: 8, scheduledDay: 3 });
+    expect(sched.status).toBe(200);
+    expect(await sched.json()).toMatchObject({ kind: 'idle-cash', cadence: 'monthly', scheduledHour: 8, scheduledDay: 3, active: true });
+
+    // An unknown kind is a 404, not a silent success.
+    expect((await post('/v1/rules/toggle', { kind: 'no-such-rule', enabled: false })).status).toBe(404);
   });
 
   it('turns a fact-dependent rule into a question, then unlocks it once the fact is saved', async () => {

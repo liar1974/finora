@@ -252,6 +252,16 @@ tbody tr.clickable:hover td { background: var(--card2); }
 .feedactions { display: flex; align-items: center; gap: 6px; }
 .feedactions .dismissbtn { width: 28px; height: 28px; border-radius: 8px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; color: var(--mut); font-size: 18px; line-height: 1; }
 .feedactions .dismissbtn:hover { background: rgba(38,34,29,.055); color: var(--red); }
+.feedactions .draftbtn { padding: 4px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card2); color: var(--brandd); font-size: 12px; font-weight: 650; white-space: nowrap; cursor: pointer; }
+.feedactions .draftbtn:hover:not(:disabled) { border-color: var(--brand); color: var(--brand); }
+.feedactions .draftbtn:disabled { opacity: .6; cursor: default; }
+.artifactbox { grid-column: 1 / -1; margin: 2px 0 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+.artifacttitle { font-weight: 750; font-size: 12.5px; color: var(--fg); margin-bottom: 6px; }
+.artifacttext { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); }
+.artifactfoot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
+.artifactnote { font-size: 11px; color: var(--mut); }
+.artifactfoot .copybtn { padding: 5px 12px; border-radius: 8px; border: 0; background: var(--brand); color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; }
+.artifactfoot .copybtn:hover { background: var(--brandd); }
 
 .dashgrid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; align-items: stretch; margin-top: 12px; }
 .modal.chartmodal-shell { width: min(1040px, 94vw); }

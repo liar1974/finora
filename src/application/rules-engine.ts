@@ -107,7 +107,6 @@ interface Evaluator {
   defaultTier: RuleActionTier;
   scope: string;
   keywords: RegExp; // for natural-language rule inference
-  alwaysOn?: boolean; // runs even with no stored rule of this kind
   facts?: FactNeed[];
   sql: string;
 }
@@ -214,7 +213,6 @@ const idleBrokerageCash: Evaluator = {
   defaultTier: 'advisor',
   scope: 'brokerage',
   keywords: /cash drag|brokerage cash|sweep|uninvested|现金拖累/,
-  alwaysOn: true,
   sql: `
     WITH latest AS (
       SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn FROM account_balances b
@@ -311,7 +309,6 @@ const portfolioConcentration: Evaluator = {
   defaultTier: 'observer',
   scope: 'brokerage',
   keywords: /concentration|portfolio|holding|allocation|持仓|集中/,
-  alwaysOn: true,
   sql: `
     WITH latest_h AS (
       SELECT h.*, ROW_NUMBER() OVER (
@@ -377,7 +374,6 @@ const connectionHealth: Evaluator = {
   defaultTier: 'observer',
   scope: 'all',
   keywords: /connection|sync|token|cursor|plaid|snaptrade|link/,
-  alwaysOn: true,
   sql: `
     SELECT
       provider || ':' || external_id AS key,
@@ -406,7 +402,6 @@ const employerMatch: Evaluator = {
   defaultTier: 'advisor',
   scope: 'all',
   keywords: /401k|401\(k\)|employer match|retirement match|matching|雇主匹配/,
-  alwaysOn: true,
   // Fact keys are namespaced by subject (income.* / retirement.*), not by rule
   // domain, so one answer serves every rule that references the key and downloaded
   // rules can't collide. income.gross_annual is an income fact this rule borrows.
@@ -456,7 +451,6 @@ const lowBalance: Evaluator = {
   defaultTier: 'observer',
   scope: 'banking',
   keywords: /low balance|overdraft|overdrawn|negative balance|低余额|余额不足/,
-  alwaysOn: true,
   sql: `
     WITH latest AS (
       SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn
@@ -493,7 +487,6 @@ const feesAndInterest: Evaluator = {
   defaultTier: 'advisor',
   scope: 'banking',
   keywords: /fee|fees|interest charge|finance charge|overdraft|费用|利息/,
-  alwaysOn: true,
   sql: `
     WITH fees AS (
       SELECT id, ABS(amount_minor) AS amt, currency
@@ -528,7 +521,6 @@ const subscriptionPriceIncrease: Evaluator = {
   defaultTier: 'advisor',
   scope: 'banking',
   keywords: /price increase|went up|price hike|raised|涨价|加价/,
-  alwaysOn: true,
   sql: `
     SELECT
       rs.merchant AS key,
@@ -678,7 +670,6 @@ const cashRunway: Evaluator = {
   defaultTier: 'observer',
   scope: 'banking',
   keywords: /runway|months of cash|cushion|emergency fund|现金储备|可支撑/,
-  alwaysOn: true,
   sql: `
     WITH lb AS (
       SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC) AS rn FROM account_balances b
@@ -718,7 +709,6 @@ const staleData: Evaluator = {
   defaultTier: 'observer',
   scope: 'all',
   keywords: /stale|out of date|not updated|needs refresh|过期|未更新/,
-  alwaysOn: true,
   sql: `
     WITH newest AS (
       SELECT MAX(d) AS d FROM (
@@ -755,25 +745,26 @@ const crossCardSubscription: Evaluator = {
   defaultTier: 'advisor',
   scope: 'banking',
   keywords: /duplicate subscription|two cards|paying twice|重复订阅/,
-  alwaysOn: true,
   sql: `
     WITH s AS (
       SELECT rs.merchant AS merchant, rs.currency AS currency, rs.account_id AS account_id,
-             COALESCE(rc.canonical_name, rs.label) AS label, rs.record_ids AS record_ids,
+             COALESCE(mi.canonical_name, rc.canonical_name, rs.label) AS label, rs.record_ids AS record_ids,
+             COALESCE(mi.canonical_slug, rs.merchant) AS group_key,
              CAST(ROUND(rs.latest_minor * rs.periods_per_year) AS INT) AS annual
       FROM recurring_series rs
       JOIN recurring_classifications rc ON rc.merchant = rs.merchant AND rc.direction = rs.direction
+      LEFT JOIN merchant_identities mi ON mi.merchant = rs.merchant
       WHERE rs.direction = 'out' AND rc.is_recurring = 1 AND rc.kind IN ('subscription', 'membership')
         AND fee_like(rs.label) = 0
     ),
     g AS (
-      SELECT merchant, MIN(currency) AS currency, COUNT(DISTINCT account_id) AS accts,
+      SELECT group_key, MIN(currency) AS currency, COUNT(DISTINCT account_id) AS accts,
              SUM(annual) AS total_annual, MAX(annual) AS max_annual,
              MIN(label) AS label, group_concat(record_ids) AS records
-      FROM s GROUP BY merchant HAVING COUNT(DISTINCT account_id) >= 2
+      FROM s GROUP BY group_key HAVING COUNT(DISTINCT account_id) >= 2
     )
     SELECT
-      merchant AS key,
+      group_key AS key,
       'Duplicate subscription: ' || label AS title,
       'Billed on ' || accts || ' accounts — about ' || money(total_annual - max_annual, currency) || '/yr is a duplicate.' AS detail,
       money(total_annual - max_annual, currency) AS value,
@@ -867,7 +858,6 @@ const cashFlowNegative: Evaluator = {
   defaultTier: 'observer',
   scope: 'banking',
   keywords: /cash flow|spending exceed|burning savings|入不敷出|现金流/,
-  alwaysOn: true,
   sql: `
     WITH flows AS (
       SELECT
@@ -900,7 +890,6 @@ const upcomingBills: Evaluator = {
   defaultTier: 'observer',
   scope: 'banking',
   keywords: /bill runway|upcoming bills|due soon|账单|透支/,
-  alwaysOn: true,
   sql: `
     WITH income AS (
       SELECT julianday(rs.last_date) + 365.0 / rs.periods_per_year AS next_jd
@@ -1175,6 +1164,109 @@ const washSaleRisk: Evaluator = {
   `,
 };
 
+// Spending (#16): the same vendor and amount charged to TWO DIFFERENT accounts
+// within a few days — an accidental double payment (e.g. autopay hit a card and
+// a bank draft). Uses F1 merchant_identities so it merges across differing
+// billing descriptions; falls back to the normalized merchant when unidentified.
+const crossAccountDuplicate: Evaluator = {
+  kind: 'cross-account-duplicate',
+  domain: 'spending',
+  executionClass: 'D',
+  defaultTier: 'advisor',
+  scope: 'banking',
+  keywords: /double paid|paid twice|two accounts|across accounts|duplicate payment|重复支付|两个账户/,
+  sql: `
+    WITH tx AS (
+      SELECT t.id, t.account_id, t.amount_minor, t.currency, t.date,
+             COALESCE(mi.canonical_slug, normalize_merchant(t.description)) AS vendor,
+             COALESCE(mi.canonical_name, t.description) AS vendor_name
+      FROM transactions t
+      LEFT JOIN merchant_identities mi ON mi.merchant = normalize_merchant(t.description)
+      WHERE t.amount_minor < 0 AND julianday(:now_iso) - julianday(t.date) <= 30
+        AND normalize_merchant(t.description) <> '' AND fee_like(t.description) = 0
+    ),
+    d AS (
+      SELECT a.id AS id1, b.id AS id2, a.amount_minor AS amount_minor, a.currency AS currency,
+             a.vendor_name AS vendor_name, a.date AS d1, b.date AS d2,
+             ABS(julianday(a.date) - julianday(b.date)) AS gap
+      FROM tx a JOIN tx b
+        ON a.vendor = b.vendor AND a.amount_minor = b.amount_minor
+        AND a.account_id <> b.account_id AND a.id < b.id
+        AND ABS(julianday(a.date) - julianday(b.date)) <= 5
+      WHERE ABS(a.amount_minor) >= 2000
+    )
+    SELECT
+      id1 || ':' || id2 AS key,
+      'Possible double payment: ' || vendor_name AS title,
+      money(ABS(amount_minor), currency) || ' to ' || vendor_name || ' hit two different accounts on ' || d1 || ' and ' || d2 || '.' AS detail,
+      money(ABS(amount_minor), currency) AS value,
+      ABS(amount_minor) AS dollar_impact_minor,
+      currency,
+      0.5 AS confidence,
+      3 AS effort,
+      'Same vendor and amount charged to two accounts within ' || CAST(ROUND(gap) AS INT) || ' day(s).' AS evidence_summary,
+      id1 || ',' || id2 AS evidence_records,
+      'Review and dispute the duplicate payment' AS action_label,
+      :now_iso AS created_at
+    FROM d
+    LIMIT 20
+  `,
+};
+
+// Spending / Protect (#13): a tiny probe charge at a brand-new merchant followed
+// within days by larger charges on the same account — the classic card-testing
+// pattern. Risk-based (no dollar value, explicit high severity so it always
+// surfaces). Kept tight (unfamiliar merchant + a real follow-on charge) to stay
+// quiet; the sharper "is this merchant sketchy" judgment is a future L+ upgrade.
+const cardTesting: Evaluator = {
+  kind: 'card-testing',
+  domain: 'spending',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'banking',
+  keywords: /card testing|card fraud|small probe|test charge|盗刷|试卡/,
+  sql: `
+    WITH probe AS (
+      SELECT t.id, t.account_id, t.date, t.currency, ABS(t.amount_minor) AS amt
+      FROM transactions t
+      WHERE t.amount_minor < 0 AND ABS(t.amount_minor) > 0 AND ABS(t.amount_minor) <= 300
+        AND julianday(:now_iso) - julianday(t.date) <= 30
+        AND normalize_merchant(t.description) <> ''
+        AND normalize_merchant(t.description) NOT IN (
+          SELECT normalize_merchant(description) FROM transactions
+          WHERE amount_minor < 0 AND julianday(:now_iso) - julianday(date) > 30
+        )
+    ),
+    hit AS (
+      SELECT probe.id AS probe_id, probe.account_id, probe.date AS probe_date, probe.currency,
+             probe.amt AS probe_amt, COUNT(*) AS big_count, MAX(ABS(big.amount_minor)) AS max_big
+      FROM probe JOIN transactions big
+        ON big.account_id = probe.account_id AND big.amount_minor < 0
+        AND ABS(big.amount_minor) >= 5000
+        AND julianday(big.date) >= julianday(probe.date)
+        AND julianday(big.date) - julianday(probe.date) <= 3
+        AND big.id <> probe.id
+      GROUP BY probe.id
+    )
+    SELECT
+      probe_id AS key,
+      'Possible card testing on ' || COALESCE(a.name, 'an account') AS title,
+      'A small ' || money(probe_amt, hit.currency) || ' charge on ' || probe_date || ' at a brand-new merchant was followed by ' || big_count || ' larger charge(s) up to ' || money(max_big, hit.currency) || ' — a common card-testing pattern.' AS detail,
+      money(probe_amt, hit.currency) AS value,
+      0.35 AS confidence,
+      'high' AS severity,
+      2 AS urgency,
+      2 AS effort,
+      'Small probe ' || money(probe_amt, hit.currency) || ' then ' || big_count || ' larger charge(s) within 3 days on the same account.' AS evidence_summary,
+      probe_id AS evidence_records,
+      'Review recent charges and contact your bank if any are unrecognized' AS action_label,
+      hit.account_id AS account_id,
+      probe_date AS created_at
+    FROM hit LEFT JOIN accounts a ON a.id = hit.account_id
+    LIMIT 10
+  `,
+};
+
 // Order matters for natural-language inference: the first evaluator whose
 // keywords match wins, so specific evaluators precede the broad idle-cash and
 // large-transaction fallbacks.
@@ -1196,6 +1288,8 @@ const EVALUATORS: Evaluator[] = [
   recurringSubscriptions,
   spendingCategorySpike,
   duplicateCharge,
+  crossAccountDuplicate,
+  cardTesting,
   unfamiliarMerchantCharge,
   idleBrokerageCash,
   portfolioConcentration,
@@ -1210,9 +1304,9 @@ const EVALUATORS: Evaluator[] = [
   largeTransaction,
 ];
 
-// The built-in rules as DATA, seeded into the rule_specs table on startup. From
-// then on the engine reads every spec (built-in + downloaded) from the table, so
-// adding a rule is a data change — no code. See docs/rules-design.md.
+// The built-in rules as DATA, seeded into the single `rules` table on startup.
+// From then on the engine reads every rule (built-in + downloaded) from the table,
+// so adding a rule is a data change — no code. See docs/rules-design.md.
 export function builtinRuleSpecs(): RuleSpec[] {
   return EVALUATORS.map((e) => ({
     kind: e.kind,
@@ -1221,7 +1315,6 @@ export function builtinRuleSpecs(): RuleSpec[] {
     actionTier: e.defaultTier,
     scope: e.scope,
     cadence: 'event',
-    alwaysOn: e.alwaysOn ?? false,
     keywords: e.keywords.source,
     sql: e.sql ?? null,
     prompt: null,
@@ -1240,7 +1333,7 @@ export function builtinRuleSpecs(): RuleSpec[] {
 
 // ── Interpreter ──────────────────────────────────────────────────────────────
 
-function finalize(rule: RuleRecord, spec: RuleSpec, draft: Draft): Finding {
+function finalize(rule: RuleRecord, draft: Draft): Finding {
   const dollarImpactMinor = draft.dollarImpactMinor ?? 0;
   const currency = draft.currency ?? 'USD';
   const urgency = draft.urgency ?? 1;
@@ -1250,10 +1343,10 @@ function finalize(rule: RuleRecord, spec: RuleSpec, draft: Draft): Finding {
   const severity = draft.severity ?? deriveSeverity(score);
   const tier = capTier(rule.actionTier, confidence);
   return {
-    id: `${rule.kind}:${rule.id || 'builtin'}:${draft.key}`,
-    ruleId: rule.id || null,
+    id: `${rule.kind}:${draft.key}`,
+    ruleId: rule.kind, // every finding traces back to its rule kind
     kind: rule.kind,
-    domain: spec.domain,
+    domain: rule.domain,
     scope: rule.scope,
     title: draft.title,
     detail: draft.detail,
@@ -1273,48 +1366,20 @@ function finalize(rule: RuleRecord, spec: RuleSpec, draft: Draft): Finding {
   };
 }
 
-// A synthetic rule for always-on specs that have no stored rule.
-function builtinRule(spec: RuleSpec, nowIso: string): RuleRecord {
-  return {
-    id: '',
-    kind: spec.kind,
-    domain: spec.domain,
-    sourceText: `Built-in ${spec.kind}`,
-    executionClass: spec.executionClass,
-    actionTier: spec.actionTier,
-    scope: spec.scope,
-    cadence: spec.cadence,
-    channel: 'auto',
-    scheduledHour: null,
-    scheduledDay: null,
-    enabled: true,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-  };
-}
-
-// Evaluate enabled rules plus any always-on spec not already covered by a stored
-// rule, resolving each rule's definition from the given specs (loaded from the
-// rule_specs table). A rule blocked on a missing required fact yields a question
-// instead of a finding. Findings below the suppression floor are dropped unless
-// they carry an explicit non-low severity. The caller applies mutes and delivery.
-export function evaluateRules(specs: RuleSpec[], rules: RuleRecord[], data: EvaluationData, runQuery: RuleQueryRunner): EngineResult {
-  const registry = new Map(specs.filter((s) => s.enabled).map((s) => [s.kind, s]));
+// Evaluate every rule that should run: enabled (available) AND active (switched
+// on). Every rule ships active by default and each is individually toggleable —
+// there is no separate always-on class. A rule blocked on a missing required fact
+// yields a question instead of a finding. Findings below the suppression floor are
+// dropped unless they carry an explicit non-low severity. The caller applies mutes
+// and delivery.
+export function evaluateRules(rules: RuleRecord[], data: EvaluationData, runQuery: RuleQueryRunner): EngineResult {
   const findings: Finding[] = [];
   const questions = new Map<string, QuestionDraft>();
-  const enabled = rules.filter((rule) => rule.enabled);
-  const covered = new Set(enabled.map((rule) => rule.kind));
   const nowIso = new Date(data.nowMs).toISOString();
-
-  const runnable: RuleRecord[] = [
-    ...enabled,
-    ...specs.filter((s) => s.enabled && s.alwaysOn && !covered.has(s.kind)).map((s) => builtinRule(s, nowIso)),
-  ];
+  const runnable = rules.filter((rule) => rule.enabled && rule.active);
 
   for (const rule of runnable) {
-    const spec = registry.get(rule.kind);
-    if (!spec) continue;
-    const missing = spec.facts.filter((need) => !data.facts.has(need.key));
+    const missing = rule.facts.filter((need) => !data.facts.has(need.key));
     if (missing.length > 0) {
       for (const need of missing) {
         questions.set(need.key, {
@@ -1328,9 +1393,9 @@ export function evaluateRules(specs: RuleSpec[], rules: RuleRecord[], data: Eval
       }
       continue; // blocked on a fact — produces a question, not a finding
     }
-    if (!spec.sql) continue; // prompt/LLM specs run once the L/L+ path exists
-    const rows = runQuery(spec.sql, {
-      rule_id: rule.id || '',
+    if (!rule.sql) continue; // prompt/LLM specs run once the L/L+ path exists
+    const rows = runQuery(rule.sql, {
+      rule_id: rule.kind,
       rule_created_at: rule.createdAt,
       now_iso: nowIso,
       now_ms: data.nowMs,
@@ -1339,7 +1404,7 @@ export function evaluateRules(specs: RuleSpec[], rules: RuleRecord[], data: Eval
       checking_apr: REFERENCE_TABLES.checkingApr,
     });
     for (const draft of rows.map(rowToDraft)) {
-      const finding = finalize(rule, spec, draft);
+      const finding = finalize(rule, draft);
       if (finding.score >= SUPPRESS_SCORE || finding.severity !== 'low') findings.push(finding);
     }
   }

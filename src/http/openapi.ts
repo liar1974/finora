@@ -167,6 +167,16 @@ export const openApiDocument = {
     '/v1/findings': {
       get: { summary: 'List active findings ranked by dollar impact and confidence', responses: { '200': { description: 'Finding collection' } } },
     },
+    '/v1/findings/artifact': {
+      post: {
+        summary: 'Draft an Advisor document for a finding (dispute letter, fee-waiver request, negotiation script)',
+        description: 'Grounds the draft in the finding\'s own transactions; Finora drafts for the user to review and send themselves, and never sends anything. Returns model_required when no language model is configured.',
+        responses: {
+          '200': { description: 'Draft result (ok / not_found / unsupported / model_required)' },
+          '422': { description: 'Validation failed' },
+        },
+      },
+    },
     '/v1/rules': {
       get: { summary: 'List rules', responses: { '200': { description: 'Rule collection' } } },
       post: { summary: 'Create a rule', responses: { '201': { description: 'Rule created' }, '422': { description: 'Validation failed' } } },
@@ -177,8 +187,8 @@ export const openApiDocument = {
     '/v1/rules/toggle': {
       post: { summary: 'Enable or disable a rule', responses: { '200': { description: 'Updated rule' }, '404': { description: 'Rule not found' } } },
     },
-    '/v1/rules/remove': {
-      post: { summary: 'Remove a rule', responses: { '200': { description: 'Removal result' } } },
+    '/v1/rules/schedule': {
+      post: { summary: 'Update a rule\'s delivery schedule (by kind)', responses: { '200': { description: 'Updated rule' }, '404': { description: 'Rule not found' } } },
     },
     '/v1/questions': {
       get: { summary: 'List pending questions ranked by unlockable dollar impact', responses: { '200': { description: 'Question collection' } } },

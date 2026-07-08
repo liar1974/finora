@@ -13,6 +13,8 @@ import type {
   FactRecord,
   FindingMuteRecord,
   ImportRecord,
+  MerchantCandidate,
+  MerchantIdentity,
   MoneySummary,
   Page,
   ProviderConnection,
@@ -24,6 +26,17 @@ import type {
   Transaction,
   TransactionInput,
 } from '../domain/models.js';
+
+// The user-owned fields set when a rule is adopted or edited. Cadence is a
+// delivery-scheduling preference the user picks, so it lives here (and is
+// preserved across definition re-seeding), not with the definition columns.
+export interface RuleAdoption {
+  sourceText: string;
+  cadence: string;
+  channel: string;
+  scheduledHour: number | null;
+  scheduledDay: number | null;
+}
 
 export interface AgentEventInput {
   turnId: string;
@@ -156,15 +169,20 @@ export interface FinanceRepository {
   getAppSetting(key: string): string | null;
   saveAppSettings(entries: Record<string, string>): void;
   listRules(): RuleRecord[];
-  saveRule(input: Omit<RuleRecord, 'id' | 'createdAt' | 'updatedAt'>): RuleRecord;
-  toggleRule(id: string, enabled: boolean): RuleRecord | null;
-  removeRule(id: string): boolean;
+  // Turn a rule on (by kind) with the user's schedule/channel: sets active=1.
+  // Returns null when no rule with that kind exists.
+  adoptRule(kind: string, schedule: RuleAdoption): RuleRecord | null;
+  toggleRule(kind: string, active: boolean): RuleRecord | null;
+  updateRuleSchedule(kind: string, schedule: { cadence: string; scheduledHour: number | null; scheduledDay: number | null }): RuleRecord | null;
   listRuleSpecs(): RuleSpec[];
   upsertRuleSpec(spec: RuleSpec): void;
   listRecurringCandidates(): RecurringCandidate[];
   listTransactionsByIds(ids: string[]): Transaction[];
   listRecurringClassifications(): RecurringClassification[];
   upsertRecurringClassification(row: RecurringClassification): void;
+  listMerchantCandidates(): MerchantCandidate[];
+  listMerchantIdentities(): MerchantIdentity[];
+  upsertMerchantIdentity(row: MerchantIdentity): void;
   listFindingMutes(): FindingMuteRecord[];
   saveFindingMute(input: Omit<FindingMuteRecord, 'id' | 'createdAt'>): FindingMuteRecord;
   removeFindingMute(id: string): boolean;
@@ -221,3 +239,12 @@ export type RecurringVerdict = Omit<RecurringClassification, 'signature' | 'upda
 // the classifier seam is exercised without a model. Injecting one also stands in
 // for "a model is available".
 export type RecurringClassifier = (candidates: RecurringCandidate[]) => Promise<RecurringVerdict[]>;
+
+// The verdict the merchant identifier returns for one candidate — the stored
+// identity minus the bookkeeping columns the service fills in.
+export type MerchantIdentityVerdict = Omit<MerchantIdentity, 'signature' | 'updatedAt'>;
+
+// Resolves normalized merchants to canonical vendor identities. Production calls
+// the configured LLM (world knowledge of brands); tests inject a deterministic
+// stub, which also stands in for "a model is available".
+export type MerchantIdentifier = (candidates: MerchantCandidate[]) => Promise<MerchantIdentityVerdict[]>;

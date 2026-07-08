@@ -14,13 +14,12 @@ money at stake." The ranking function, not any single rule, is the product.
 
 ## Principles
 
-- **Rules are data, not code.** A rule definition is a row in the `rule_specs`
-  table: metadata plus a **SQL query** (deterministic) or a prompt (LLM). Built-in
-  rules ship as a seed loaded into that table on startup; new rules are added or
-  changed as rows — no code, no redeploy. The engine is a generic interpreter that
-  runs whatever specs the table holds, so built-in and downloaded rules are
-  identical to it. (A future job can poll a versioned rule-definition file and
-  upsert changed specs into the table.)
+- **Rules are data, not code.** A rule is a row in the `rules` table: metadata
+  plus a **SQL query** (deterministic) or a prompt (LLM). Built-in rules ship as a
+  seed loaded into that table on startup; new rules are added or changed as rows —
+  no code, no redeploy. The engine is a generic interpreter that runs whatever
+  rows the table holds, so built-in and downloaded rules are identical to it. (A
+  future job can poll a versioned rule-definition file and upsert changed rows.)
 - **One finding contract.** Every rule, regardless of how it is evaluated,
   emits the same `Finding` shape. Downstream ranking, delivery, and action never
   need to know which engine produced a finding.
@@ -36,25 +35,33 @@ money at stake." The ranking function, not any single rule, is the product.
 - **Financial connections are read-only by default.** Any action that moves money
   is opt-in, per rule, and revocable.
 
-## A rule spec (definition) and a rule instance
+## One rule, one row
 
-A rule **definition** is a `RuleSpec` row in the `rule_specs` table:
+Every rule is a single row in the `rules` table, keyed by `kind`. The row carries
+BOTH the definition (code/feed-owned) and the user's on/off + schedule
+(user-owned):
 
-- `kind` (primary key), `domain`, `executionClass` (`D` / `L` / `L+`),
-  `actionTier`, `scope`, `cadence`.
-- `alwaysOn` — runs even with no stored rule instance.
-- `keywords` — a regex source string, for natural-language rule inference.
-- `sql` — the deterministic query (a `D` rule); OR `prompt` — the LLM spec.
-- `facts` — the user facts the rule needs (JSON).
-- `enabled`, `version`, `source` (`builtin` | `downloaded`).
+- **Definition** — `kind` (primary key), `domain`, `executionClass` (`D` / `L` /
+  `L+`), `actionTier`, `scope`, `keywords` (a regex source string for
+  natural-language inference), `sql` (a `D` rule's deterministic query) OR
+  `prompt` (an LLM spec), `facts` (the user facts the rule needs), `enabled`,
+  `version`, and `source` (`builtin` | `downloaded` | `user`). Built-in rules are
+  seeded from code on startup; downloaded rules are upserted by the feed. The
+  `RuleSpec` type is the definition-only view used by the seed, the feed, and
+  natural-language inference.
+- **User-owned** — `active` (the on/off switch), `channel`, `cadence`,
+  `scheduledHour`, `scheduledDay`, `sourceText`.
 
-A user's saved rule **instance** is a `RuleRecord` in the `rules` table — a `kind`
-plus its schedule (`cadence`, `channel`, `scheduledHour`, `scheduledDay`, and
-`enabled`); it references a spec by `kind`. Built-in `alwaysOn` specs run without
-any instance, so core safety findings (connection health, cash drag, low balance)
-appear out of the box; opt-in rules run once the user has an enabled instance.
+The engine runs a rule when **`enabled AND active`**. Every rule ships enabled and
+**active by default**, so all of them run out of the box; each can be toggled off
+individually. There is no separate "always-on" class at runtime — turning a rule
+off simply clears `active`. The startup seed and the feed upsert the definition
+columns only; they never touch the user's `active`, schedule, or channel, so
+re-seeding can't undo a toggle. (This single table replaced an earlier split of
+`rule_specs` definitions + a `rules` instances table; migration v12 folded them and
+v15 dropped the vestigial `always_on` / `user_rule` columns.)
 
-For a `D` spec the engine runs its `sql` through a read-only query runner (SQLite
+For a `D` rule the engine runs its `sql` through a read-only query runner (SQLite
 stays behind the repository port). The query selects the finding-draft columns
 (`title`, `detail`, `dollar_impact_minor`, `confidence`, `severity`, …) with a few
 bound params (`:now_iso`, `:rule_created_at`, `:hysa_apr`, …); the engine maps each
@@ -88,6 +95,27 @@ stays synchronous:
 3. **Consumption**: the recurring `D` rules and the `/v1/recurring` table just
    `JOIN recurring_classifications` and filter on `is_recurring` / `kind`. The
    engine reads a table; the model ran out-of-band.
+
+### Merchant identity (canonical vendors)
+
+The same vendor bills under many raw descriptions that normalize to different
+merchant keys (`APPLE.COM/BILL`, `ITUNES`, `APPLE SERVICES`). A second
+LLM-enrichment pipeline — identical in shape to recurring classification —
+resolves each normalized merchant to a **canonical vendor** and caches it, so
+rules can group by vendor rather than by raw string:
+
+1. **Candidates** (`repository.listMerchantCandidates`) — one row per normalized
+   merchant with a representative description.
+2. **Identification** (`FinanceService.refreshMerchantIdentities`, default
+   `identifyMerchantsWithModel`) — the model maps each merchant to a
+   `canonicalName` + `canonicalSlug`, stored in `merchant_identities`. Only
+   not-yet-identified merchants are sent, so the model is called sparingly; tests
+   inject a `MerchantIdentifier` stub.
+3. **Consumption** — `cross-card-subscription` and `cross-account-duplicate`
+   `LEFT JOIN merchant_identities` and group by `COALESCE(canonical_slug,
+   merchant)`, so a vendor billed under two descriptions on two cards is caught.
+   With no identities the `COALESCE` falls back to the raw merchant, so the rules
+   degrade cleanly.
 
 Evaluation is tri-state. If a required fact has no value yet, the rule does not
 fire — the engine emits a **question** instead (see facts).
@@ -232,9 +260,15 @@ self-entered fact) may not run above Advisor. Autonomous action requires both a
 high-confidence finding and an explicit Navigator grant. Every grant is per rule
 and revocable.
 
-Today detection and the tier/confidence capping are implemented, and financial
-connections stay read-only; Advisor artifact generation and Guardian/Navigator
-execution are modeled in the contract but not yet wired to act.
+Detection, the tier/confidence capping, and the **Advisor** tier are implemented:
+`FinanceService.generateFindingArtifact()` drafts the document for a finding —
+a dispute letter (duplicate charge, cross-account double payment), a fee-waiver
+request, an APR-reduction or retention script, a cancellation — grounded strictly
+in that finding's own transactions (see `ARTIFACT_SPECS`). The model only turns
+the finding's facts into prose; it never invents a figure, and **Finora never
+sends anything** — it drafts for the user to review and send themselves, so the
+read-only promise holds. Guardian/Navigator execution is modeled in the contract
+but not yet wired to act, and financial connections stay read-only.
 
 ## Domain taxonomy (UI grouping only)
 
@@ -250,19 +284,42 @@ Domains organize rules for the user; they do not drive engine logic.
 Additional domains (benefits, tax, medical, property) attach here as their
 reference tables and facts become available, without changing the engine.
 
+## Over-the-air rule updates
+
+Because rules are pure data, new built-in rules can ship from a remote feed
+without a code release. `FinanceService.syncRuleFeed()` fetches a configured
+`RULES_FEED_URL` through the injectable `RuleFeedClient` port and validates a
+`{ version, specs[] }` JSON document (e.g. a GitHub raw URL — see
+`rules-feed.example.json`). The sync is **additive**:
+
+- It **inserts** only the rules whose `kind` this install doesn't already have,
+  as `source: 'downloaded'`, enabled and active by default.
+- Rules already present — whether from the built-in code seed or an earlier
+  sync — are **never overwritten or re-synced**. The feed distributes *new* rules;
+  it does not edit existing ones.
+- Dedup is by `kind`, so a repeated sync that finds nothing new is a cheap no-op
+  (`applied: 0`). There is no version gate: the feed's `version` is informational
+  (surfaced in the UI), not a condition on applying it.
+
+The read-only query runner sandboxes downloaded SQL — it can never write. The feed
+URL is editable and a **Check for updates** button triggers a sync
+(`POST /v1/rules/sync`) under **Settings → Rules & Facts**; background services
+run a silent, best-effort sync shortly after boot and once a day thereafter.
+Built-ins seeded from code remain the offline floor.
+
 ## Shipped rules
 
-All current rules are `D` (deterministic) SQL specs over the connected-account
-stream plus shipped reference data — no user input except where noted. They are
-seeded into `rule_specs` on startup:
+All current rules are `D` (deterministic) SQL over the connected-account stream
+plus shipped reference data — no user input except where noted. They are seeded
+into the `rules` table on startup, enabled and active by default:
 
 - **Cash flow** — idle cash, low / negative balance, cash runway, cash-flow
   negative, upcoming bills / overdraft, net-worth movement, employer 401(k) match
   (fact-gated).
-- **Spending** — large transactions, duplicate charges, fees and interest,
-  subscription price increases, recurring subscriptions, new recurring charges,
-  discretionary category spikes, cross-card duplicate subscriptions, unfamiliar
-  merchant charges.
+- **Spending** — large transactions, duplicate charges, cross-account duplicate
+  payments, card-testing pattern, fees and interest, subscription price increases,
+  recurring subscriptions, new recurring charges, discretionary category spikes,
+  cross-card duplicate subscriptions, unfamiliar merchant charges.
 - **Credit** — credit utilization, card interest.
 - **Investments** — brokerage cash drag, portfolio concentration, single-name
   exposure, holding value swings, executed trades, dividends received, possible
@@ -276,29 +333,20 @@ seeded into `rule_specs` on startup:
   admit/reject/summarize with a deterministic fallback — is not implemented.
   Pure-LLM summaries (weekly digest, spending narrative, suspicious-charge
   judgment) wait on it.
-- **Over-the-air delivery.** Manual sync is built end to end: `FinanceService.syncRuleFeed()`
-  fetches a configured `RULES_FEED_URL` through the injectable `RuleFeedClient` port,
-  validates the `{ version, specs[] }` document, and upserts each spec as a `downloaded`
-  rule when the feed version is newer than the last applied one (stored in
-  `RULES_FEED_VERSION`). A downloaded rule that declares user facts flows straight into
-  the needs-input surface, and the read-only query runner sandboxes its SQL. The feed
-  URL is editable under **Settings → Rules & Facts**, and a **Check for updates** button
-  there triggers a sync (`POST /v1/rules/sync`). Background services also run one silent,
-  best-effort sync ~30s after boot (`ruleFeedKick` in `startBackgroundServices`), so a
-  fresh launch pulls the latest rules without the user acting. What is **deliberately
-  not** built is **periodic polling on a timer** — rule updates are infrequent, so
-  startup-once plus the manual button is enough; a short-interval poll was skipped on
-  purpose. Built-ins are still seeded from code on startup as the floor. Any
-  private-repo feed would additionally need auth-header support (not built; public raw
-  URLs work today), and feed signature verification is deferred until rules are
-  distributed beyond a trusted first-party URL.
+- **Over-the-air refinements.** The rule feed is shipped (see "Over-the-air rule
+  updates" above). What is deferred: **periodic polling on a timer** (rule updates
+  are infrequent, so startup-once plus the manual button is enough); **auth-header
+  support** for private-repo feeds (public raw URLs work today); and **feed
+  signature verification**, deferred until rules are distributed beyond a trusted
+  first-party URL.
 - **Deeper data products.** Rules needing Plaid **Liabilities** (card APR and
   interest projection, payment-due, student-loan and mortgage tracking) — the
   account is entitled, but Liabilities is not yet ingested. **Income** rules need a
   Plaid product request that has not been granted; paycheck detection is instead
   approximated from recurring inflows.
-- **Action execution.** Advisor artifact generation and Guardian/Navigator
-  automated action; connections remain read-only.
+- **Guardian / Navigator execution.** Automated action on a finding; connections
+  remain read-only. (The **Advisor** tier — drafting a document for the user to
+  review and send themselves — is now shipped; see "Actions and the trust ladder".)
 - **Delivery tiers.** The two-tier digest/push split and deadline-forced surfacing
   from the ranking section; today it is a single suppression floor plus
   fresh-since-last-run delivery.
