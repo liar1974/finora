@@ -531,23 +531,24 @@ const subscriptionPriceIncrease: Evaluator = {
   alwaysOn: true,
   sql: `
     SELECT
-      merchant AS key,
-      label || ' charge went up' AS title,
-      'Now ' || money(latest_minor, currency) || ' vs a usual ' || money(typical_minor, currency) || ' — about ' || money(CAST(ROUND((latest_minor - typical_minor) * periods_per_year) AS INT), currency) || '/yr more.' AS detail,
-      money(CAST(ROUND((latest_minor - typical_minor) * periods_per_year) AS INT), currency) AS value,
-      CAST(ROUND((latest_minor - typical_minor) * periods_per_year) AS INT) AS dollar_impact_minor,
-      currency,
+      rs.merchant AS key,
+      COALESCE(rc.canonical_name, rs.label) || ' charge went up' AS title,
+      'Now ' || money(rs.latest_minor, rs.currency) || ' vs a usual ' || money(rs.typical_minor, rs.currency) || ' — about ' || money(CAST(ROUND((rs.latest_minor - rs.typical_minor) * rs.periods_per_year) AS INT), rs.currency) || '/yr more.' AS detail,
+      money(CAST(ROUND((rs.latest_minor - rs.typical_minor) * rs.periods_per_year) AS INT), rs.currency) AS value,
+      CAST(ROUND((rs.latest_minor - rs.typical_minor) * rs.periods_per_year) AS INT) AS dollar_impact_minor,
+      rs.currency,
       0.6 AS confidence,
       2 AS effort,
-      'Latest ' || money(latest_minor, currency) || ' exceeds prior median ' || money(typical_minor, currency) || ' across ' || count || ' charges.' AS evidence_summary,
-      record_ids AS evidence_records,
+      'Latest ' || money(rs.latest_minor, rs.currency) || ' exceeds prior median ' || money(rs.typical_minor, rs.currency) || ' across ' || rs.count || ' charges.' AS evidence_summary,
+      rs.record_ids AS evidence_records,
       'Review or renegotiate the increase' AS action_label,
-      account_id AS account_id,
-      last_date AS created_at
-    FROM recurring_series
-    WHERE direction = 'out' AND count >= 3 AND span_days >= 60 AND fee_like(label) = 0
-      AND typical_minor > 0 AND latest_minor > typical_minor * 1.1
-      AND ROUND((latest_minor - typical_minor) * periods_per_year) >= 1200
+      rs.account_id AS account_id,
+      rs.last_date AS created_at
+    FROM recurring_series rs
+    JOIN recurring_classifications rc ON rc.merchant = rs.merchant AND rc.direction = rs.direction
+    WHERE rs.direction = 'out' AND rc.is_recurring = 1 AND fee_like(rs.label) = 0
+      AND rs.typical_minor > 0 AND rs.latest_minor > rs.typical_minor * 1.1
+      AND ROUND((rs.latest_minor - rs.typical_minor) * rs.periods_per_year) >= 1200
   `,
 };
 
@@ -562,23 +563,25 @@ const recurringSubscriptions: Evaluator = {
   keywords: /subscription|recurring|membership|订阅|会员/,
   sql: `
     SELECT
-      merchant AS key,
-      'Subscription: ' || label AS title,
-      'About ' || money(CAST(ROUND(latest_minor * periods_per_year) AS INT), currency) || '/yr — ' || count || ' charges of ~' || money(latest_minor, currency) || '.' AS detail,
-      money(CAST(ROUND(latest_minor * periods_per_year) AS INT), currency) AS value,
-      CAST(ROUND(latest_minor * periods_per_year) AS INT) AS dollar_impact_minor,
-      currency,
-      0.5 AS confidence,
+      rs.merchant AS key,
+      'Subscription: ' || COALESCE(rc.canonical_name, rs.label) AS title,
+      'About ' || money(CAST(ROUND(rs.latest_minor * rs.periods_per_year) AS INT), rs.currency) || '/yr — ' || rs.count || ' charges of ~' || money(rs.latest_minor, rs.currency) || '.' AS detail,
+      money(CAST(ROUND(rs.latest_minor * rs.periods_per_year) AS INT), rs.currency) AS value,
+      CAST(ROUND(rs.latest_minor * rs.periods_per_year) AS INT) AS dollar_impact_minor,
+      rs.currency,
+      COALESCE(rc.confidence, 0.5) AS confidence,
       1 AS effort,
-      count || ' recurring charges of ~' || money(latest_minor, currency) || '.' AS evidence_summary,
-      record_ids AS evidence_records,
+      rs.count || ' recurring charges of ~' || money(rs.latest_minor, rs.currency) || '.' AS evidence_summary,
+      rs.record_ids AS evidence_records,
       'Cancel if you no longer use it' AS action_label,
-      account_id AS account_id,
-      last_date AS created_at
-    FROM recurring_series
-    WHERE direction = 'out' AND count >= 3 AND span_days >= 60 AND fee_like(label) = 0
-      AND ROUND(latest_minor * periods_per_year) >= 6000
-    ORDER BY latest_minor * periods_per_year DESC
+      rs.account_id AS account_id,
+      rs.last_date AS created_at
+    FROM recurring_series rs
+    JOIN recurring_classifications rc ON rc.merchant = rs.merchant AND rc.direction = rs.direction
+    WHERE rs.direction = 'out' AND rc.is_recurring = 1 AND rc.kind IN ('subscription', 'membership')
+      AND fee_like(rs.label) = 0
+      AND ROUND(rs.latest_minor * rs.periods_per_year) >= 6000
+    ORDER BY rs.latest_minor * rs.periods_per_year DESC
     LIMIT 15
   `,
 };
@@ -631,7 +634,9 @@ const spendingCategorySpike: Evaluator = {
 };
 
 // Spending: a recurring charge that only started recently — a new subscription or
-// a free trial that has converted to paid. Relaxed recurring detection.
+// a free trial that has converted to paid. Fewer charges are required than for an
+// established subscription, so recurrence is proved by a stable amount (2 charges)
+// or a regular cadence (3+), never by merchant repetition alone.
 const newRecurringCharge: Evaluator = {
   kind: 'new-recurring-charge',
   domain: 'spending',
@@ -641,23 +646,25 @@ const newRecurringCharge: Evaluator = {
   keywords: /new subscription|new recurring|free trial|trial|新订阅|试用/,
   sql: `
     SELECT
-      merchant AS key,
-      'New recurring charge: ' || label AS title,
-      'Recently started at ' || money(latest_minor, currency) || ' — about ' || money(CAST(ROUND(latest_minor * periods_per_year) AS INT), currency) || '/yr if it continues.' AS detail,
-      money(CAST(ROUND(latest_minor * periods_per_year) AS INT), currency) AS value,
-      CAST(ROUND(latest_minor * periods_per_year) AS INT) AS dollar_impact_minor,
-      currency,
-      0.5 AS confidence,
+      rs.merchant AS key,
+      'New recurring charge: ' || COALESCE(rc.canonical_name, rs.label) AS title,
+      'Recently started at ' || money(rs.latest_minor, rs.currency) || ' — about ' || money(CAST(ROUND(rs.latest_minor * rs.periods_per_year) AS INT), rs.currency) || '/yr if it continues.' AS detail,
+      money(CAST(ROUND(rs.latest_minor * rs.periods_per_year) AS INT), rs.currency) AS value,
+      CAST(ROUND(rs.latest_minor * rs.periods_per_year) AS INT) AS dollar_impact_minor,
+      rs.currency,
+      COALESCE(rc.confidence, 0.5) AS confidence,
       2 AS effort,
-      'First seen ' || first_date || ', ' || count || ' charges of ~' || money(latest_minor, currency) || '.' AS evidence_summary,
-      record_ids AS evidence_records,
+      'First seen ' || rs.first_date || ', ' || rs.count || ' charges of ~' || money(rs.latest_minor, rs.currency) || '.' AS evidence_summary,
+      rs.record_ids AS evidence_records,
       'Confirm this is a subscription you want' AS action_label,
-      account_id AS account_id,
-      last_date AS created_at
-    FROM recurring_series
-    WHERE direction = 'out' AND count >= 2 AND count <= 4 AND span_days >= 18 AND fee_like(label) = 0
-      AND julianday(:now_iso) - julianday(first_date) <= 50
-      AND ROUND(latest_minor * periods_per_year) >= 6000
+      rs.account_id AS account_id,
+      rs.last_date AS created_at
+    FROM recurring_series rs
+    JOIN recurring_classifications rc ON rc.merchant = rs.merchant AND rc.direction = rs.direction
+    WHERE rs.direction = 'out' AND rc.is_recurring = 1 AND rc.kind IN ('subscription', 'membership')
+      AND rs.count >= 2 AND rs.count <= 4 AND fee_like(rs.label) = 0
+      AND julianday(:now_iso) - julianday(rs.first_date) <= 50
+      AND ROUND(rs.latest_minor * rs.periods_per_year) >= 6000
     LIMIT 10
   `,
 };
@@ -751,10 +758,13 @@ const crossCardSubscription: Evaluator = {
   alwaysOn: true,
   sql: `
     WITH s AS (
-      SELECT merchant, currency, account_id, label, record_ids,
-             CAST(ROUND(latest_minor * periods_per_year) AS INT) AS annual
-      FROM recurring_series
-      WHERE direction = 'out' AND count >= 3 AND span_days >= 60 AND fee_like(label) = 0
+      SELECT rs.merchant AS merchant, rs.currency AS currency, rs.account_id AS account_id,
+             COALESCE(rc.canonical_name, rs.label) AS label, rs.record_ids AS record_ids,
+             CAST(ROUND(rs.latest_minor * rs.periods_per_year) AS INT) AS annual
+      FROM recurring_series rs
+      JOIN recurring_classifications rc ON rc.merchant = rs.merchant AND rc.direction = rs.direction
+      WHERE rs.direction = 'out' AND rc.is_recurring = 1 AND rc.kind IN ('subscription', 'membership')
+        AND fee_like(rs.label) = 0
     ),
     g AS (
       SELECT merchant, MIN(currency) AS currency, COUNT(DISTINCT account_id) AS accts,
@@ -893,16 +903,20 @@ const upcomingBills: Evaluator = {
   alwaysOn: true,
   sql: `
     WITH income AS (
-      SELECT julianday(last_date) + 365.0 / periods_per_year AS next_jd
-      FROM recurring_series WHERE direction = 'in' AND count >= 2 AND span_days >= 20
-      ORDER BY latest_minor DESC LIMIT 1
+      SELECT julianday(rs.last_date) + 365.0 / rs.periods_per_year AS next_jd
+      FROM recurring_series rs
+      JOIN recurring_classifications rc ON rc.merchant = rs.merchant AND rc.direction = rs.direction
+      WHERE rs.direction = 'in' AND rc.is_recurring = 1
+      ORDER BY rs.latest_minor DESC LIMIT 1
     ),
     window_end AS (
       SELECT MIN(COALESCE((SELECT next_jd FROM income), julianday(:now_iso) + 14), julianday(:now_iso) + 14) AS jd
     ),
     bills AS (
-      SELECT latest_minor, (julianday(last_date) + 365.0 / periods_per_year) AS next_jd
-      FROM recurring_series WHERE direction = 'out' AND count >= 3 AND span_days >= 60
+      SELECT rs.latest_minor AS latest_minor, (julianday(rs.last_date) + 365.0 / rs.periods_per_year) AS next_jd
+      FROM recurring_series rs
+      JOIN recurring_classifications rc ON rc.merchant = rs.merchant AND rc.direction = rs.direction
+      WHERE rs.direction = 'out' AND rc.is_recurring = 1 AND fee_like(rs.label) = 0
     ),
     due AS (
       SELECT COALESCE(SUM(latest_minor), 0) AS amt, COUNT(*) AS n

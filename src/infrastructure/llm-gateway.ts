@@ -31,6 +31,11 @@ export interface EffectiveLlmConfig extends LlmConfig {
   needsKey: boolean;
   keySet: boolean;
   local: boolean;
+  // Upper bound for the Ollama num_ctx we request per call (LLM_NUM_CTX). The actual value is
+  // sized to the prompt and capped here, so long prompts (e.g. credit-report parsing) aren't
+  // silently truncated to Ollama's small server default, without pinning a huge window for
+  // short chats. Undefined → a built-in default cap.
+  numCtxMax?: number | undefined;
 }
 
 // Model selection is live, and every chat surface calls the same gateway.
@@ -151,6 +156,83 @@ export function resolveLlmConfig(getSetting: (key: string) => string | null): Ef
     needsKey: provider.needsKey,
     keySet: !provider.needsKey || Boolean(apiKey),
     local: Boolean(provider.local),
+    numCtxMax: parsePositiveInt(getSetting('LLM_NUM_CTX') || process.env.LLM_NUM_CTX),
+  };
+}
+
+function parsePositiveInt(value: string | null | undefined): number | undefined {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+// Size an Ollama context window to the prompt: estimate tokens (~3.5 chars/token) plus the
+// output budget and a margin, then round UP to a bucket so num_ctx stays stable across similar
+// requests (Ollama reloads the model when num_ctx changes). Capped by LLM_NUM_CTX (default
+// 32768) to bound memory. Prompts larger than the cap fall back to the cap.
+export function estimateOllamaNumCtx(
+  system: string,
+  messages: Array<{ content: string }>,
+  maxTokens: number | undefined,
+  cap: number | undefined,
+): number {
+  const chars = system.length + messages.reduce((sum, m) => sum + m.content.length, 0);
+  const target = Math.ceil(chars / 3.5) + (maxTokens ?? 768) + 512;
+  const buckets = [4096, 8192, 16384, 32768, 65536, 131072];
+  const bucketed = buckets.find((b) => b >= target) ?? target;
+  const ceiling = cap && cap > 0 ? cap : 32768;
+  return Math.min(bucketed, ceiling);
+}
+
+// Rough token budget for providers with a large context window (cloud models). We don't know
+// each model's exact limit, so this is a generous floor that no normal prompt reaches; the
+// clamp only bites pathological inputs. Ollama uses its own num_ctx cap; builtin passes its
+// small contextSize in explicitly.
+export const CLOUD_CONTEXT_TOKENS = 128_000;
+
+// Tokens of context the active provider can accept for input+output. Builtin isn't handled
+// here (it never reaches the gateway) — its caller passes contextSize directly to clampChatInput.
+export function providerContextTokens(config: EffectiveLlmConfig): number {
+  if (config.provider === 'ollama') return config.numCtxMax && config.numCtxMax > 0 ? config.numCtxMax : 32768;
+  return CLOUD_CONTEXT_TOKENS;
+}
+
+function middleTruncate(text: string, target: number, marker: string): string {
+  if (text.length <= target) return text;
+  const head = Math.ceil(target * 0.6);
+  const tail = Math.max(0, target - head);
+  return text.slice(0, head) + marker + text.slice(text.length - tail);
+}
+
+// Provider-agnostic input clamp: keep system + messages within the model's context window so no
+// provider silently truncates (Ollama) or hard-errors (builtin) on an oversized prompt. Trims
+// the largest content field via a middle ellipsis (preserving head + tail — instructions and
+// closing text, or first + last records) until the estimate fits the budget. Pure and testable;
+// `truncated` lets the caller log when it fired. Char/token ratio matches estimateOllamaNumCtx.
+export function clampChatInput(
+  input: { system: string; messages: Array<{ role: 'user' | 'assistant'; content: string }>; maxTokens?: number },
+  contextTokens: number,
+): { system: string; messages: Array<{ role: 'user' | 'assistant'; content: string }>; truncated: boolean } {
+  const CHARS_PER_TOKEN = 3.5;
+  const budgetChars = Math.max(1024, Math.floor((contextTokens - (input.maxTokens ?? 768) - 256) * CHARS_PER_TOKEN));
+  const fields = [input.system, ...input.messages.map((m) => m.content)];
+  const total = () => fields.reduce((sum, text) => sum + text.length, 0);
+  if (total() <= budgetChars) return { system: input.system, messages: input.messages, truncated: false };
+
+  const MARKER = '\n…[truncated to fit context]…\n';
+  const MIN_FIELD = 200;
+  let guard = fields.length + 4;
+  while (total() > budgetChars && guard-- > 0) {
+    let largest = 0;
+    for (let i = 1; i < fields.length; i += 1) if (fields[i]!.length > fields[largest]!.length) largest = i;
+    const field = fields[largest]!;
+    if (field.length <= MIN_FIELD + MARKER.length) break;
+    const target = Math.max(MIN_FIELD, field.length - (total() - budgetChars) - MARKER.length);
+    fields[largest] = middleTruncate(field, target, MARKER);
+  }
+  return {
+    system: fields[0]!,
+    messages: input.messages.map((m, i) => ({ ...m, content: fields[i + 1]! })),
+    truncated: true,
   };
 }
 
@@ -209,6 +291,7 @@ async function generateOllamaReply(input: {
       options: {
         temperature: 0.2,
         num_predict: input.maxTokens ?? 768,
+        num_ctx: estimateOllamaNumCtx(input.system, input.messages, input.maxTokens, input.config.numCtxMax),
       },
     }),
     signal: AbortSignal.timeout(input.timeoutMs ?? 120_000),

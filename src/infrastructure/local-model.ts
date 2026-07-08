@@ -291,6 +291,14 @@ export class LocalModelEngine {
     return this.engineAvailable;
   }
 
+  // Cheap presence check: whether downloaded weights exist, without loading the
+  // native engine (which status() does via checkEngine, and which is expensive to
+  // import on a hot path). Callers that only need "can we try to run the model"
+  // should use this rather than status().
+  async weightsPresent(): Promise<boolean> {
+    return (await this.findModelFile()) !== null;
+  }
+
   private async findModelFile(): Promise<string | null> {
     let entries: string[];
     try {

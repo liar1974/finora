@@ -156,6 +156,8 @@ const state = {
   accounts: [],
   summary: [],
   transactions: [],
+  recurring: null,
+  recurringLoading: false,
   nextCursor: null,
   connections: [],
   brokerageSummary: [],
@@ -1252,6 +1254,15 @@ function chartRowsForContext(rows, limit = 80) {
   })));
 }
 
+function attachmentTypeLabel(type) {
+  return { chart: 'Chart', item: 'Item' }[type] || 'Table';
+}
+
+function stableItemId(prefix, values) {
+  const slug = normalizeText(values.join(' ')).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
+  return `${prefix}:${slug || 'row'}`;
+}
+
 function addContextAttachment(attachment) {
   const next = {
     ...attachment,
@@ -1267,8 +1278,22 @@ function addContextAttachment(attachment) {
   renderChat();
   if (!exists) openChatDrawer();
   $('#input').focus();
-  toast(`${next.type === 'chart' ? 'Chart' : 'Table'} ${exists ? 'removed from' : 'added to'} chat context.`);
+  toast(`${attachmentTypeLabel(next.type)} ${exists ? 'removed from' : 'added to'} chat context.`);
   if (!$('#modalRoot')?.children.length) render();
+}
+
+// Attach a single record (one table row or one credit-report item) to chat context.
+// columns/values are parallel arrays of plain text; the attachment carries a one-row table.
+function addItemContext(id, title, columns, values, section) {
+  addContextAttachment({
+    id,
+    type: 'item',
+    title,
+    section,
+    columns,
+    rows: [Object.fromEntries(columns.map((column, index) => [column, values[index] ?? '']))],
+    totalRows: 1,
+  });
 }
 
 function addTableContext(id, title, headers, rows, totalRows = rows.length) {
@@ -1451,6 +1476,7 @@ async function loadData() {
   state.accounts = accounts.items;
   state.summary = summary.items;
   state.transactions = txns.items;
+  state.recurring = null; // recomputed server-side on next Recurring tab view
   state.nextCursor = txns.nextCursor;
   state.connections = connections.items;
   state.brokerageSummary = brokerageSummary.items;
@@ -1728,15 +1754,34 @@ function renderDataTable(headers, rows, options = {}) {
     contextAction.addEventListener('click', () => addTableContext(contextIdValue, contextTitle, headers, filtered, filtered.length));
   }
   if (key || contextAction) wrap.appendChild(tableControls(key, filtered, renderFn, options.itemLabel, contextAction));
+  const itemContext = Boolean(options.itemContext);
+  const textHeaders = itemContext ? headers.map(textFromHtml) : null;
   const table = document.createElement('table');
-  table.innerHTML = `<thead><tr>${headers.map((header, index) => `<th class="${index ? 'r' : ''}">${esc(header)}</th>`).join('')}</tr></thead>`;
+  const headerCells = headers.map((header, index) => `<th class="${index ? 'r' : ''}">${esc(header)}</th>`).join('');
+  table.innerHTML = `<thead><tr>${headerCells}${itemContext ? '<th class="r rowaction" aria-label="Add to context"></th>' : ''}</tr></thead>`;
   const body = document.createElement('tbody');
   if (!visibleRows.length) {
-    body.innerHTML = `<tr><td colspan="${headers.length}" class="empty">${esc(options.emptyText || 'No rows match.')}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="${headers.length + (itemContext ? 1 : 0)}" class="empty">${esc(options.emptyText || 'No rows match.')}</td></tr>`;
   }
   for (const row of visibleRows) {
     const tr = document.createElement('tr');
     tr.innerHTML = row.map((cell, index) => `<td class="${index ? 'r' : ''}">${cell}</td>`).join('');
+    if (itemContext) {
+      const values = row.map((cell) => textFromHtml(cell));
+      const id = stableItemId('item', [contextTitle, ...values]);
+      const title = values.filter(Boolean).slice(0, 2).join(' · ') || contextTitle;
+      const cell = el('td', 'r rowaction');
+      const button = chatContextButton('', 'Add this row to chat context');
+      setContextButtonState(button, id);
+      // Don't let the context button also trigger a row click.
+      button.addEventListener('click', (event) => { event.stopPropagation(); addItemContext(id, title, textHeaders, values, options.section); });
+      cell.appendChild(button);
+      tr.appendChild(cell);
+    }
+    if (options.onRowClick && row.meta !== undefined) {
+      tr.classList.add('clickable');
+      tr.addEventListener('click', () => options.onRowClick(row.meta));
+    }
     body.appendChild(tr);
   }
   table.appendChild(body);
@@ -1808,20 +1853,43 @@ function topMerchants(rows = selectedTransactions()) {
   return [...byMerchant.values()].sort((a, b) => b.amount - a.amount);
 }
 
-function recurringRows(rows = selectedTransactions()) {
-  const groups = new Map();
-  for (const txn of rows.filter(isSpendingTransaction)) {
-    const key = (txn.description || '').toLowerCase().replace(/\s+/g, ' ').trim();
-    if (!key) continue;
-    const current = groups.get(key) || { merchant: txn.description, category: txn.category || 'Uncategorized', count: 0, amount: 0, currency: txn.currency, lastDate: txn.date };
-    current.count += 1;
-    current.amount += Math.abs(txn.amountMinor);
-    if (txn.date > current.lastDate) current.lastDate = txn.date;
-    groups.set(key, current);
+// Recurring detection is server-side: the backend classifies each merchant series
+// with the configured AI model (subscription, bill, income, …) and returns only
+// the recurring ones. Fetched lazily into state.recurring and re-rendered.
+async function loadRecurring() {
+  if (state.recurringLoading) return;
+  state.recurringLoading = true;
+  try {
+    state.recurring = await api('/v1/recurring');
+  } catch (error) {
+    state.recurring = { status: 'error', message: error instanceof Error ? error.message : 'Failed to load recurring transactions' };
+  } finally {
+    state.recurringLoading = false;
+    if (state.section === 'banks' && state.bankTab === 'recurring') renderBanks();
   }
-  return [...groups.values()]
-    .filter((item) => item.count >= 2)
-    .sort((a, b) => b.amount - a.amount);
+}
+
+const RECURRING_KIND_LABELS = {
+  subscription: 'Subscription', membership: 'Membership', bill: 'Bill',
+  insurance: 'Insurance', loan: 'Loan', rent: 'Rent', income: 'Income', other: 'Recurring',
+};
+
+function recurringModelPrompt(data) {
+  const box = el('div', 'empty');
+  const line = el('p');
+  line.textContent = data.needsDownload
+    ? 'Recurring detection uses an AI model to identify subscriptions, bills, and income. Set up the built-in model to enable it.'
+    : 'Recurring detection uses an AI model to identify subscriptions, bills, and income. Connect a model to enable it.';
+  box.appendChild(line);
+  const button = el('button', 'primary');
+  button.type = 'button';
+  button.textContent = data.needsDownload ? 'Set up the model' : 'Connect a model';
+  button.addEventListener('click', () => {
+    state.settingsTab = 'models';
+    setSection('settings');
+  });
+  box.appendChild(button);
+  return box;
 }
 
 function renderBankSummary(view) {
@@ -1834,7 +1902,7 @@ function renderBankSummary(view) {
       categoryCell(row.category),
       `<span class="pill">${row.count}</span>`,
       `<span class="num neg">${money(row.amount, row.currency)}</span>`,
-    ]), { pageKey: `bank-categories-${state.accountId || 'all'}-${state.from}-${state.to}` })
+    ]), { pageKey: `bank-categories-${state.accountId || 'all'}-${state.from}-${state.to}`, itemContext: true })
     : empty('No spending in this range.'));
   view.appendChild(categories);
 
@@ -1846,7 +1914,7 @@ function renderBankSummary(view) {
       esc(row.merchant),
       `<span class="pill">${row.count}</span>`,
       `<span class="num neg">${money(row.amount, row.currency)}</span>`,
-    ]), { pageKey: `bank-merchants-${state.accountId || 'all'}-${state.from}-${state.to}` })
+    ]), { pageKey: `bank-merchants-${state.accountId || 'all'}-${state.from}-${state.to}`, itemContext: true })
     : empty('No merchant spending in this range.'));
   view.appendChild(top);
 }
@@ -1863,7 +1931,7 @@ function renderBankTransactions(view) {
     esc(accountLabel(txn.accountId)),
     `<span class="num ${txn.amountMinor < 0 ? 'neg' : 'pos'}">${money(txn.amountMinor, txn.currency)}</span>`,
   ]);
-  sec.appendChild(renderDataTable(['Date', 'Description', 'Category', 'Account', 'Amount'], rows, { pageKey: key, render: renderBanks, emptyText: 'No transactions match.' }));
+  sec.appendChild(renderDataTable(['Date', 'Description', 'Category', 'Account', 'Amount'], rows, { pageKey: key, render: renderBanks, emptyText: 'No transactions match.', itemContext: true }));
   view.appendChild(sec);
 }
 
@@ -1889,26 +1957,56 @@ function renderBankCashflow(view) {
       `<span class="num pos">${money(row.income, row.currency)}</span>`,
       `<span class="num neg">${money(row.expense, row.currency)}</span>`,
       `<span class="num ${row.net < 0 ? 'neg' : 'pos'}">${money(row.net, row.currency)}</span>`,
-    ]), { pageKey: `bank-cashflow-${state.accountId || 'all'}` }));
+    ]), { pageKey: `bank-cashflow-${state.accountId || 'all'}`, itemContext: true }));
   }
   view.appendChild(sec);
 }
 
 function renderBankRecurring(view) {
-  const rows = recurringRows();
   const sec = el('div', 'sec');
-  const monthly = rows.reduce((sum, item) => sum + item.amount / Math.max(1, item.count), 0);
-  sec.innerHTML = `<div class="sechdr"><h3>Recurring</h3><span class="pill">~${money(monthly, rows[0]?.currency || 'USD')}/mo</span></div>`;
-  sec.appendChild(rows.length
-    ? transactionLikeTable(['Merchant', 'Category', 'Transactions', 'Average', 'Last seen'], rows.map((row) => [
-      esc(row.merchant),
-      categoryCell(row.category),
-      `<span class="pill">${row.count}</span>`,
-      `<span class="num neg">${money(Math.round(row.amount / row.count), row.currency)}</span>`,
-      esc(row.lastDate),
-    ]), { pageKey: `bank-recurring-${state.accountId || 'all'}-${state.from}-${state.to}` })
-    : empty('No recurring charges detected yet.'));
+  sec.innerHTML = `<div class="sechdr"><h3>Recurring</h3></div>`;
+  const data = state.recurring;
+  if (!data) {
+    sec.appendChild(empty('Detecting recurring transactions…'));
+    loadRecurring();
+  } else if (data.status === 'model_required') {
+    sec.appendChild(recurringModelPrompt(data));
+  } else if (data.status === 'error') {
+    sec.appendChild(empty(data.message || 'Could not load recurring transactions.'));
+  } else if (!data.items || !data.items.length) {
+    sec.appendChild(empty('No recurring transactions detected yet.'));
+  } else {
+    sec.appendChild(transactionLikeTable(['Merchant', 'Type', 'Cadence', 'Transactions', 'Typical', 'Last seen'], data.items.map((item) => {
+      const row = [
+        esc(item.merchant),
+        `<span class="pill">${esc(RECURRING_KIND_LABELS[item.kind] || 'Recurring')}</span>`,
+        esc(item.cadence || '—'),
+        `<span class="pill">${item.count}</span>`,
+        `<span class="num ${item.direction === 'in' ? 'pos' : 'neg'}">${money(item.amountMinor, item.currency)}</span>`,
+        esc(item.lastDate),
+      ];
+      row.meta = item; // carried through filter/pagination for the row click
+      return row;
+    }), { pageKey: 'bank-recurring', itemContext: true, onRowClick: openRecurringDetail }));
+  }
   view.appendChild(sec);
+}
+
+// Drill-down: every transaction behind a recurring row.
+function openRecurringDetail(item) {
+  const content = el('div', 'sec');
+  const head = el('div', 'sechdr');
+  const cadence = item.cadence && item.cadence !== 'irregular' ? ` · ${esc(item.cadence)}` : '';
+  head.innerHTML = `<h3>${esc(item.merchant)}</h3><span class="pill">${esc(RECURRING_KIND_LABELS[item.kind] || 'Recurring')}${cadence}</span>`;
+  content.appendChild(head);
+  const rows = (item.transactions || []).map((tx) => [
+    esc(tx.date),
+    esc(tx.description),
+    esc(accountLabel(tx.accountId)),
+    `<span class="num ${tx.amountMinor < 0 ? 'neg' : 'pos'}">${money(tx.amountMinor, tx.currency)}</span>`,
+  ]);
+  content.appendChild(renderDataTable(['Date', 'Description', 'Account', 'Amount'], rows, { context: false, emptyText: 'No transactions.' }));
+  modal(content);
 }
 
 function transactionLikeTable(headers, rows, options = {}) {
@@ -2087,7 +2185,7 @@ function renderBrokerageSummary(view) {
         row.cashMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.cashMinor, row.currency)}</span>`,
         row.buyingPowerMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.buyingPowerMinor, row.currency)}</span>`,
       ]),
-      { pageKey: `brokerage-balances-${state.accountId || 'all'}`, itemLabel: 'balance' },
+      { pageKey: `brokerage-balances-${state.accountId || 'all'}`, itemLabel: 'balance', itemContext: true },
     ));
     view.appendChild(sec);
   }
@@ -2105,7 +2203,7 @@ function renderBrokerageSummary(view) {
       row.priceMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.priceMinor, row.currency)}</span>`,
       `<span class="num">${money(row.valueMinor, row.currency)}</span>`,
     ]),
-    { pageKey: `brokerage-holdings-${state.accountId || 'all'}`, itemLabel: 'holding' },
+    { pageKey: `brokerage-holdings-${state.accountId || 'all'}`, itemLabel: 'holding', itemContext: true },
   ));
   view.appendChild(holdings);
 }
@@ -2127,7 +2225,7 @@ function renderBrokerageTransactions(view) {
       row.priceMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.priceMinor, row.currency)}</span>`,
       `<span class="num ${row.amountMinor < 0 ? 'neg' : 'pos'}">${money(row.amountMinor, row.currency)}</span>`,
     ]),
-    { pageKey: `brokerage-transactions-${state.accountId || 'all'}-${state.from}-${state.to}` },
+    { pageKey: `brokerage-transactions-${state.accountId || 'all'}-${state.from}-${state.to}`, itemContext: true },
   ));
   view.appendChild(txns);
 }
@@ -2225,6 +2323,14 @@ function latestCreditMetrics() {
   ];
 }
 
+// A subtle note when the LLM verify/fallback pass recovered rows the deterministic parse missed.
+function aiReviewNote(report) {
+  const review = report?.raw?.aiReview;
+  const added = review ? (Number(review.addedAccounts) || 0) + (Number(review.addedInquiries) || 0) : 0;
+  if (!added) return '';
+  return ` · <span class="pill" title="AI recovered items the deterministic parser missed">AI-reviewed · +${added}</span>`;
+}
+
 function renderLatestCreditReportOverview(view) {
   const latest = state.credit.latest;
   if (!latest) {
@@ -2241,7 +2347,7 @@ function renderLatestCreditReportOverview(view) {
       <div>
         <div class="kicker">Latest uploaded report</div>
         <div class="creditreporttitle">${esc(reportLabel(latest))}</div>
-        <div class="creditreportmeta">${esc(latest.filename)} · Uploaded ${esc(formatReportDate(latest.createdAt))}${latest.reportDate ? ` · Report date ${esc(formatReportDate(latest.reportDate))}` : ''}</div>
+        <div class="creditreportmeta">${esc(latest.filename)} · Uploaded ${esc(formatReportDate(latest.createdAt))}${latest.reportDate ? ` · Report date ${esc(formatReportDate(latest.reportDate))}` : ''}${aiReviewNote(latest)}</div>
       </div>
       <span class="status ${state.credit.suggestions.length ? 'warn' : 'good'}">${state.credit.suggestions.length ? `${state.credit.suggestions.length} review flag${state.credit.suggestions.length === 1 ? '' : 's'}` : 'No obvious flags'}</span>
     </div>`;
@@ -2281,7 +2387,17 @@ function renderMiniReportList(rows, emptyText, limit = 5) {
   }
   for (const row of rows.slice(0, limit)) {
     const item = el('div', `reportminirow ${row.level || ''}`);
-    item.innerHTML = `<div class="nm">${esc(row.title)}</div><div class="sub">${esc(row.detail)}</div>`;
+    const text = el('div', 'reportminitext');
+    text.innerHTML = `<div class="nm">${esc(row.title)}</div><div class="sub">${esc(row.detail)}</div>`;
+    item.appendChild(text);
+    if (row.context) {
+      const { title, columns, values } = row.context;
+      const id = stableItemId('item', [title, ...values]);
+      const button = chatContextButton('', 'Add this item to chat context');
+      setContextButtonState(button, id);
+      button.addEventListener('click', () => addItemContext(id, title, columns, values, 'credit'));
+      item.appendChild(button);
+    }
     block.appendChild(item);
   }
   if (rows.length > limit) {
@@ -2292,31 +2408,64 @@ function renderMiniReportList(rows, emptyText, limit = 5) {
   return block;
 }
 
+// Attach a whole credit list (open accounts / inquiries) to chat context as a table,
+// mirroring the whole-table button Banking/Brokerage tables get from renderDataTable.
+function creditListContextButton(id, title, columns, valueRows) {
+  const button = chatContextButton('Chat', 'Add this list to chat context');
+  setContextButtonState(button, id);
+  button.addEventListener('click', () => addTableContext(id, title, columns, valueRows, valueRows.length));
+  return button;
+}
+
 function renderCreditOpenAccounts(view) {
   const accounts = state.credit.accounts || [];
+  const columns = ['Creditor', 'Summary', 'Flag'];
   const openAccounts = accounts
     .filter((account) => account.isOpen)
-    .map((account) => ({
-      title: `${account.creditor}${account.accountMask ? ` ${account.accountMask}` : ''}`,
-      detail: accountBalanceSummary(account),
-      level: Number(account.pastDueMinor || 0) > 0 || account.isNegative ? 'medium' : '',
-    }));
+    .map((account) => {
+      const title = `${account.creditor}${account.accountMask ? ` ${account.accountMask}` : ''}`;
+      const detail = accountBalanceSummary(account);
+      const flagged = Number(account.pastDueMinor || 0) > 0 || account.isNegative;
+      return {
+        title,
+        detail,
+        level: flagged ? 'medium' : '',
+        context: { title, columns, values: [title, detail, flagged ? 'Needs review' : 'OK'] },
+      };
+    });
   const section = el('div', 'sec creditdetails');
   section.innerHTML = '<div class="sechdr"><h3>Open accounts</h3><span class="pill">Latest report</span></div>';
+  if (openAccounts.length) {
+    section.querySelector('.sechdr').appendChild(
+      creditListContextButton('table:credit-open-accounts', 'Credit open accounts', columns, openAccounts.map((row) => row.context.values)),
+    );
+  }
   section.appendChild(renderMiniReportList(openAccounts, 'No open accounts parsed.', 8));
   view.appendChild(section);
 }
 
 function renderCreditInquiries(view) {
   const inquiries = state.credit.inquiries || [];
+  const columns = ['Company', 'Type', 'Date'];
   const rows = inquiries
-    .map((inquiry) => ({
-      title: inquiry.company || 'Unknown company',
-      detail: `${inquiry.type === 'hard' ? 'Hard' : 'Soft'} inquiry${inquiry.inquiryDate ? ` · ${formatReportDate(inquiry.inquiryDate)}` : ''}`,
-      level: inquiry.type === 'hard' ? 'medium' : '',
-    }));
+    .map((inquiry) => {
+      const title = inquiry.company || 'Unknown company';
+      const type = inquiry.type === 'hard' ? 'Hard' : 'Soft';
+      const date = inquiry.inquiryDate ? formatReportDate(inquiry.inquiryDate) : '';
+      return {
+        title,
+        detail: `${type} inquiry${date ? ` · ${date}` : ''}`,
+        level: inquiry.type === 'hard' ? 'medium' : '',
+        context: { title, columns, values: [title, type, date] },
+      };
+    });
   const section = el('div', 'sec creditdetails');
   section.innerHTML = '<div class="sechdr"><h3>Inquiries</h3><span class="pill">Hard + soft</span></div>';
+  if (rows.length) {
+    section.querySelector('.sechdr').appendChild(
+      creditListContextButton('table:credit-inquiries', 'Credit inquiries', columns, rows.map((row) => row.context.values)),
+    );
+  }
   section.appendChild(renderMiniReportList(rows, 'No inquiries parsed.', rows.length));
   view.appendChild(section);
 }
@@ -3872,7 +4021,7 @@ function renderChat() {
     const chip = el('button', 'contextchip');
     chip.type = 'button';
     chip.title = 'Remove from chat context';
-    chip.innerHTML = `<span>${esc(item.type === 'chart' ? 'Chart' : 'Table')}</span>${esc(item.title)}`;
+    chip.innerHTML = `<span>${esc(attachmentTypeLabel(item.type))}</span>${esc(item.title)}`;
     chip.addEventListener('click', () => {
       state.contextAttachments = state.contextAttachments.filter((candidate) => candidate.id !== item.id);
       renderChat();

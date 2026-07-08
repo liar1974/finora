@@ -2,7 +2,8 @@ import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { FinanceService } from '../src/application/finance-service.js';
+import { FinanceService, enrichCreditExtractionWithLlm } from '../src/application/finance-service.js';
+import type { RecurringClassifier } from '../src/application/ports.js';
 import { LocalModelEngine } from '../src/infrastructure/local-model.js';
 import { CsvStatementParser } from '../src/infrastructure/parsers/csv-parser.js';
 import { OfxStatementParser } from '../src/infrastructure/parsers/ofx-parser.js';
@@ -22,11 +23,45 @@ function localModel() {
   return new LocalModelEngine(join(tmpdir(), 'finora-test-models-missing'));
 }
 
-function application() {
+// A deterministic stand-in for the LLM recurring classifier: recognizes a few
+// known recurring payees by name and rejects everything else (Uber, duty-free,
+// one-off shops). Injecting it also marks the model as "available", so recurring
+// rules and the table run without a real model.
+const recurringNames = /netflix|spotify|acme|payroll|clipper|visible|hulu|gym|verizon|kikoff/;
+const fakeRecurringClassifier: RecurringClassifier = async (candidates) =>
+  candidates.map((candidate) => {
+    const name = candidate.label.toLowerCase();
+    const isRecurring = recurringNames.test(name);
+    const kind = !isRecurring
+      ? null
+      : candidate.direction === 'in'
+        ? 'income'
+        : /kikoff/.test(name)
+          ? 'loan'
+          : /clipper|visible|verizon/.test(name)
+            ? 'bill'
+            : 'subscription';
+    // Collapse Kikoff's varying reference-code descriptions to one canonical payee
+    // (mirrors what the real model is prompted to do), so fragments merge.
+    const canonicalName = /kikoff/.test(name) ? 'Kikoff' : candidate.label;
+    return {
+      merchant: candidate.merchant,
+      direction: candidate.direction,
+      isRecurring,
+      kind,
+      cadence: 'monthly',
+      canonicalName,
+      confidence: 0.9,
+    };
+  });
+
+function application(classifier?: RecurringClassifier) {
   return new FinanceService(
     new SqliteFinanceRepository(':memory:'),
     [new OfxStatementParser(), new CsvStatementParser()],
     localModel(),
+    undefined,
+    classifier,
   );
 }
 
@@ -406,8 +441,8 @@ describe('FinanceService', () => {
     service.close();
   });
 
-  it('detects a subscription price increase and annualizes the delta', () => {
-    const service = application();
+  it('detects a subscription price increase and annualizes the delta', async () => {
+    const service = application(fakeRecurringClassifier);
     service.createRule({ text: 'flag subscription price increases', scope: 'banking', cadence: 'weekly' });
     const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
     service.importStatement({
@@ -417,6 +452,7 @@ describe('FinanceService', () => {
         'Date,Description,Amount\n2026-03-05,ACME STREAMING,-60.00\n2026-04-05,ACME STREAMING,-60.00\n2026-05-05,ACME STREAMING,-60.00\n2026-06-05,ACME STREAMING,-80.00\n',
       ),
     });
+    await service.refreshRecurringClassifications();
     const finding = service.listFindings().find((f) => f.kind === 'subscription-price-increase');
     expect(finding?.title).toContain('ACME STREAMING');
     // $20/mo more, annualized to roughly $240; surfaces above the suppression floor.
@@ -424,17 +460,142 @@ describe('FinanceService', () => {
     service.close();
   });
 
-  it('flags the same subscription billed across two accounts', () => {
-    const service = application();
+  it('flags the same subscription billed across two accounts', async () => {
+    const service = application(fakeRecurringClassifier);
     const monthly = (name: string) =>
       `Date,Description,Amount\n2026-03-08,${name},-11.99\n2026-04-08,${name},-11.99\n2026-05-08,${name},-11.99\n2026-06-08,${name},-11.99\n`;
     for (const card of ['Card A', 'Card B']) {
       const account = service.createAccount({ institution: 'Example Bank', name: card, type: 'credit', currency: 'USD' });
       service.importStatement({ accountId: account.id, filename: `${card}.csv`, content: Buffer.from(monthly('SPOTIFY')) });
     }
+    await service.refreshRecurringClassifications();
     const finding = service.listFindings().find((f) => f.kind === 'cross-card-subscription');
     expect(finding?.title).toContain('SPOTIFY');
     expect(finding && finding.dollarImpactMinor > 0).toBe(true);
+    service.close();
+  });
+
+  it('classifies recurring by merchant, not by repetition — Uber and duty-free are excluded', async () => {
+    const service = application(fakeRecurringClassifier);
+    service.createRule({ text: 'recurring subscriptions', scope: 'banking', cadence: 'monthly' });
+    const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    const row = (desc: string, day: number, amount: string) => `${daysAgo(day)},${desc},${amount}`;
+    service.importStatement({
+      accountId: account.id,
+      filename: 'mix.csv',
+      content: Buffer.from(
+        ['Date,Description,Amount',
+          // A real subscription: fixed price, monthly.
+          row('NETFLIX', 92, '-15.99'), row('NETFLIX', 61, '-15.99'), row('NETFLIX', 31, '-15.99'), row('NETFLIX', 1, '-15.99'),
+          // Ride-hailing: sporadic timing, varying amounts — a familiar merchant, not a subscription.
+          row('UBER', 90, '-12.40'), row('UBER', 88, '-33.10'), row('UBER', 20, '-8.90'), row('UBER', 5, '-56.00'),
+          // A transit card reloaded at varying amounts — recurring even though the amount drifts.
+          row('CLIPPER', 75, '-20.00'), row('CLIPPER', 45, '-40.00'), row('CLIPPER', 15, '-25.00'),
+          // Two one-off duty-free trips.
+          row('DUTY ZERO BY CDF', 40, '-420.00'), row('DUTY ZERO BY CDF', 10, '-185.00'),
+          // A regular paycheck (income).
+          row('CHASE PAYROLL', 84, '251.00'), row('CHASE PAYROLL', 70, '251.00'), row('CHASE PAYROLL', 56, '251.00'),
+          row('CHASE PAYROLL', 42, '251.00'), row('CHASE PAYROLL', 28, '251.00'), row('CHASE PAYROLL', 14, '251.00'),
+          ''].join('\n'),
+      ),
+    });
+    await service.refreshRecurringClassifications();
+
+    const recurring = await service.listRecurring();
+    if (recurring.status !== 'ok') throw new Error(`expected ok, got ${recurring.status}`);
+    const merchants = recurring.items.map((item) => item.merchant.toUpperCase());
+    expect(merchants).toContain('NETFLIX');
+    expect(merchants).toContain('CLIPPER');
+    expect(merchants).toContain('CHASE PAYROLL');
+    expect(merchants).not.toContain('UBER');
+    expect(merchants.some((m) => m.includes('DUTY ZERO'))).toBe(false);
+    // Income and bills carry their classified kind; only true subscriptions surface as the Subscription finding.
+    expect(recurring.items.find((i) => i.merchant.toUpperCase() === 'CHASE PAYROLL')?.direction).toBe('in');
+
+    const subs = service.listFindings().filter((f) => f.kind === 'recurring-subscriptions').map((f) => f.title);
+    expect(subs.some((t) => t.includes('NETFLIX'))).toBe(true);
+    expect(subs.some((t) => t.includes('UBER'))).toBe(false);
+    expect(subs.some((t) => t.includes('CLIPPER'))).toBe(false); // a bill, not a subscription
+    service.close();
+  });
+
+  it('does not guess recurring transactions when no model is configured', async () => {
+    const service = application(); // no classifier, built-in model has no weights
+    const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    service.importStatement({
+      accountId: account.id,
+      filename: 'nf.csv',
+      content: Buffer.from('Date,Description,Amount\n2026-04-01,NETFLIX,-15.99\n2026-05-01,NETFLIX,-15.99\n2026-06-01,NETFLIX,-15.99\n'),
+    });
+    const recurring = await service.listRecurring();
+    expect(recurring.status).toBe('model_required');
+    service.close();
+  });
+
+  it('merges a payees varying descriptions into one row and attaches every transaction', async () => {
+    const service = application(fakeRecurringClassifier);
+    const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    const row = (desc: string, day: number, amount: string) => `${daysAgo(day)},${desc},${amount}`;
+    // The same Kikoff loan, billed under different reference-code descriptions —
+    // deterministic grouping would split these into separate 2-count rows.
+    service.importStatement({
+      accountId: account.id,
+      filename: 'kikoff.csv',
+      content: Buffer.from(
+        ['Date,Description,Amount',
+          row('KIKOFF $12* CFPFIQLS5H', 96, '-10.30'), row('KIKOFF $12* CFPFIQLS5H', 66, '-10.30'),
+          row('KIKOFFINC* CLIJ6K4ACX', 36, '-35.00'), row('KIKOFFINC* CLIJ6K4ACX', 6, '-35.00'),
+          ''].join('\n'),
+      ),
+    });
+    await service.refreshRecurringClassifications();
+
+    const recurring = await service.listRecurring();
+    if (recurring.status !== 'ok') throw new Error(`expected ok, got ${recurring.status}`);
+    const kikoff = recurring.items.filter((item) => item.merchant.toLowerCase() === 'kikoff');
+    expect(kikoff).toHaveLength(1); // merged, not two fragments
+    expect(kikoff[0]!.count).toBe(4); // all four charges, not "twice"
+    expect(kikoff[0]!.kind).toBe('loan');
+    expect(kikoff[0]!.transactions).toHaveLength(4);
+    // Attached transactions are ordered most-recent first for drill-down.
+    expect(kikoff[0]!.transactions[0]!.date >= kikoff[0]!.transactions[3]!.date).toBe(true);
+    service.close();
+  });
+
+  it('drops a variable-amount charge the model mislabels as a membership (fixed-fee backstop)', async () => {
+    // A model that calls everything a recurring membership; the deterministic
+    // backstop must still reject the one whose amounts vary like shopping.
+    const alwaysMembership: RecurringClassifier = async (candidates) =>
+      candidates.map((candidate) => ({
+        merchant: candidate.merchant,
+        direction: candidate.direction,
+        isRecurring: true,
+        kind: 'membership',
+        cadence: 'monthly',
+        canonicalName: candidate.label,
+        confidence: 0.9,
+      }));
+    const service = application(alwaysMembership);
+    const account = service.createAccount({ institution: 'Example Bank', name: 'Checking', type: 'checking', currency: 'USD' });
+    const row = (desc: string, day: number, amount: string) => `${daysAgo(day)},${desc},${amount}`;
+    service.importStatement({
+      accountId: account.id,
+      filename: 'm.csv',
+      content: Buffer.from(
+        ['Date,Description,Amount',
+          // A real fixed monthly fee — stable amount → survives.
+          row('CITY GYM CLUB', 65, '-40.00'), row('CITY GYM CLUB', 35, '-40.00'), row('CITY GYM CLUB', 5, '-40.00'),
+          // "Membership" in name only: amounts swing like ordinary shopping → backstop drops it.
+          row('CORNER MARKET', 60, '-8.00'), row('CORNER MARKET', 20, '-73.00'),
+          ''].join('\n'),
+      ),
+    });
+    await service.refreshRecurringClassifications();
+    const recurring = await service.listRecurring();
+    if (recurring.status !== 'ok') throw new Error(`expected ok, got ${recurring.status}`);
+    const names = recurring.items.map((item) => item.merchant.toUpperCase());
+    expect(names.some((n) => n.includes('CITY GYM CLUB'))).toBe(true);
+    expect(names.some((n) => n.includes('CORNER MARKET'))).toBe(false);
     service.close();
   });
 
@@ -801,5 +962,70 @@ Soft
     expect(overview.latest?.inquiries).toBe(1);
     expect(overview.reports[0]?.raw.inquiries).toEqual(overview.inquiries);
     service.close();
+  });
+});
+
+describe('enrichCreditExtractionWithLlm', () => {
+  const acct = (creditor: string, accountMask: string | null) => ({
+    creditor, accountMask, accountType: 'Credit card', status: 'Open/Never late.',
+    isOpen: true, isNegative: false, isRevolving: true, dateOpened: null, dateReported: null,
+    balanceMinor: 0, creditLimitMinor: 1000000, pastDueMinor: null,
+  });
+  const base = (text: string, accounts: ReturnType<typeof acct>[], inquiries: { company: string; inquiryDate: string | null; type: 'hard' | 'soft' }[]) => ({
+    bureau: 'experian', reportDate: null, score: null, scoreModel: null,
+    accounts, inquiries, suggestions: [], textSample: text.slice(0, 1200), text,
+  });
+  const reply = (json: string) => async () => json;
+  const meta = { provider: 'anthropic', model: 'claude', now: '2026-07-07T00:00:00Z' };
+  // Report text the model must ground against; contains US BANK, DISCOVERC, BANK OF AMERICA,
+  // FACTUAL DATA — but NOT "GHOST BANK" or "FAKE INQUIRY CO".
+  const text = 'BANK OF AMERICA 440066 Credit card $0\nUS BANK 403784 Credit Card $25,000 Open/Never late.\nHard Inquiries\nFACTUAL DATA Inquired on 01/21/2026\nDISCOVERC Inquired on 09/30/2024';
+
+  it('adds grounded rows the deterministic parse missed and drops hallucinated ones', async () => {
+    const extracted = base(text, [acct('BANK OF AMERICA', '*0066')], [{ company: 'FACTUAL DATA', inquiryDate: '2026-01-21', type: 'hard' }]);
+    const json = JSON.stringify({
+      accounts: [
+        { creditor: 'US BANK', accountMask: '*3784', accountType: 'Credit Card', status: 'Open/Never late.', balance: '$0', creditLimit: '$25,000', dateOpened: null },
+        { creditor: 'GHOST BANK', accountMask: '*9999', balance: '$500', creditLimit: '$1,000', status: 'Open' },
+      ],
+      inquiries: [
+        { company: 'DISCOVERC', inquiryDate: '09/30/2024', type: 'hard' },
+        { company: 'FAKE INQUIRY CO', inquiryDate: '01/01/2020', type: 'hard' },
+        { company: 'FACTUAL DATA', inquiryDate: '2026-01-21', type: 'hard' },
+      ],
+    });
+    const { extraction, aiReview } = await enrichCreditExtractionWithLlm(extracted, text, reply(json), meta);
+    expect(aiReview).toMatchObject({ addedAccounts: 1, addedInquiries: 1, provider: 'anthropic' });
+    expect(extraction.accounts.map((a) => a.creditor)).toEqual(['BANK OF AMERICA', 'US BANK']);
+    expect(extraction.accounts[1]?.creditLimitMinor).toBe(2500000);
+    expect(extraction.inquiries.map((q) => q.company)).toEqual(['FACTUAL DATA', 'DISCOVERC']);
+    expect(extraction.inquiries.find((q) => q.company === 'DISCOVERC')?.inquiryDate).toBe('2024-09-30');
+    // Hallucinated entries never present in the text are dropped.
+    expect(extraction.accounts.some((a) => a.creditor === 'GHOST BANK')).toBe(false);
+    expect(extraction.inquiries.some((q) => q.company === 'FAKE INQUIRY CO')).toBe(false);
+  });
+
+  it('leaves the deterministic result untouched when the model call fails', async () => {
+    const extracted = base(text, [acct('BANK OF AMERICA', '*0066')], [{ company: 'FACTUAL DATA', inquiryDate: '2026-01-21', type: 'hard' }]);
+    const throwing = async () => { throw new Error('model down'); };
+    const { extraction, aiReview } = await enrichCreditExtractionWithLlm(extracted, text, throwing, meta);
+    expect(aiReview).toBeNull();
+    expect(extraction.accounts).toHaveLength(1);
+    expect(extraction.inquiries).toHaveLength(1);
+  });
+
+  it('salvages an unknown-format report the deterministic parse left empty', async () => {
+    const extracted = base(text, [], []);
+    const json = JSON.stringify({ accounts: [], inquiries: [{ company: 'DISCOVERC', inquiryDate: '09/30/2024', type: 'hard' }] });
+    const { extraction, aiReview } = await enrichCreditExtractionWithLlm(extracted, text, reply(json), meta);
+    expect(aiReview).toMatchObject({ addedInquiries: 1 });
+    expect(extraction.inquiries).toEqual([{ company: 'DISCOVERC', inquiryDate: '2024-09-30', type: 'hard' }]);
+  });
+
+  it('returns null review when the model adds nothing new', async () => {
+    const extracted = base(text, [acct('BANK OF AMERICA', '*0066')], [{ company: 'FACTUAL DATA', inquiryDate: '2026-01-21', type: 'hard' }]);
+    const json = JSON.stringify({ accounts: [], inquiries: [{ company: 'FACTUAL DATA', inquiryDate: '2026-01-21', type: 'hard' }] });
+    const { aiReview } = await enrichCreditExtractionWithLlm(extracted, text, reply(json), meta);
+    expect(aiReview).toBeNull();
   });
 });

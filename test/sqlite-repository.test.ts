@@ -45,7 +45,7 @@ describe('SqliteFinanceRepository migrations', () => {
   it('applies all migrations once on a fresh database', () => {
     const path = tempDbPath();
     new SqliteFinanceRepository(path);
-    expect(appliedVersions(path)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(appliedVersions(path)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 
   it('is idempotent and preserves data when the database is reopened', () => {
@@ -55,7 +55,7 @@ describe('SqliteFinanceRepository migrations', () => {
 
     const second = new SqliteFinanceRepository(path);
 
-    expect(appliedVersions(path)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(appliedVersions(path)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(second.listAccounts().map((account) => account.name)).toContain('Checking');
   });
 

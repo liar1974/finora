@@ -1,8 +1,10 @@
 # Getting Started with Finora
 
 This guide walks you through installing Finora, bringing in your financial data,
-and finding your way around the app. There's no Finora account to sign up for,
-and your data stays on your own computer.
+and finding your way around the app. There's no Finora account to sign up for and
+no Finora server — your data lives in one file on your own computer. (If you later
+turn on a cloud AI provider or push alerts to Telegram/Slack, only what those
+features need is sent, to the service you set up — see below.)
 
 ---
 
@@ -203,11 +205,11 @@ below.
 
 ## 5. Get insights in Telegram or Slack
 
-Everything in Finora stays on your computer, and the **Insights** feed always
-lives there. If you'd like, you can also have Finora *push* rule-triggered
-insights to a chat you already check — your own **Telegram** chat or a **Slack**
-channel. Only the alerts you choose to send leave your machine, and you connect
-each channel with your own bot credentials.
+Your ledger and the **Insights** feed live on your computer. If you'd like, you
+can also have Finora *push* rule-triggered insights to a chat you already check —
+your own **Telegram** chat or a **Slack** channel. Only the alerts you choose to
+send leave your machine, and you connect each channel with your own bot
+credentials.
 
 Open **Settings → Delivery** and pick a channel. Each one shows a short,
 numbered setup right on the screen.
@@ -226,8 +228,9 @@ numbered setup right on the screen.
    **Ready** and a **Bound chat**, you're set.
 
 > **Bonus:** Telegram is two-way. Once connected, you can message the bot to ask
-> questions about your own accounts, transactions, and holdings — the answers
-> come from the local model on your computer. Send `/help` to see what it can do.
+> questions about your own accounts, transactions, and holdings — answered by
+> your configured AI model (the built-in local one, or a cloud provider you set
+> up in **Settings → Models**). Send `/help` to see what it can do.
 
 ### Slack — best for a shared household, advisor, or ops channel
 

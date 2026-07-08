@@ -17,6 +17,8 @@ import type {
   Page,
   ProviderConnection,
   QuestionRecord,
+  RecurringCandidate,
+  RecurringClassification,
   RuleRecord,
   RuleSpec,
   Transaction,
@@ -159,6 +161,10 @@ export interface FinanceRepository {
   removeRule(id: string): boolean;
   listRuleSpecs(): RuleSpec[];
   upsertRuleSpec(spec: RuleSpec): void;
+  listRecurringCandidates(): RecurringCandidate[];
+  listTransactionsByIds(ids: string[]): Transaction[];
+  listRecurringClassifications(): RecurringClassification[];
+  upsertRecurringClassification(row: RecurringClassification): void;
   listFindingMutes(): FindingMuteRecord[];
   saveFindingMute(input: Omit<FindingMuteRecord, 'id' | 'createdAt'>): FindingMuteRecord;
   removeFindingMute(id: string): boolean;
@@ -205,3 +211,13 @@ export interface StatementParser {
 export interface RuleFeedClient {
   fetchFeed(url: string): Promise<string>;
 }
+
+// The verdict a classifier returns for one candidate series — the stored
+// classification minus the bookkeeping columns the service fills in.
+export type RecurringVerdict = Omit<RecurringClassification, 'signature' | 'updatedAt'>;
+
+// Turns deterministic candidate series into recurrence verdicts. The production
+// implementation calls the configured LLM; tests inject a deterministic stub so
+// the classifier seam is exercised without a model. Injecting one also stands in
+// for "a model is available".
+export type RecurringClassifier = (candidates: RecurringCandidate[]) => Promise<RecurringVerdict[]>;

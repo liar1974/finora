@@ -251,6 +251,46 @@ export interface RuleSpec {
   version: number;
 }
 
+// Recurrence is a merchant-level property (direction distinguishes a paycheck
+// from a refund at the same payer), classified by an LLM from the deterministic
+// candidate features below. Amounts are integer minor units.
+export type RecurringDirection = 'in' | 'out';
+
+// The deterministic shape of one merchant's charge series, fed to the classifier.
+export interface RecurringCandidate {
+  merchant: string; // normalized key
+  direction: RecurringDirection;
+  label: string; // representative raw description (most recent)
+  category: string | null;
+  currency: string;
+  count: number;
+  firstDate: string;
+  lastDate: string;
+  spanDays: number;
+  latestMinor: number;
+  typicalMinor: number; // median of prior charges
+  minMinor: number;
+  maxMinor: number;
+  periodsPerYear: number;
+  amountCv: number | null; // coefficient of variation of amounts
+  intervalCv: number | null; // coefficient of variation of gaps between charges
+  recordIds: string[]; // ids of the transactions in this series
+}
+
+// The stored verdict for a merchant series. signature is the candidate shape at
+// classification time, so a materially changed series is re-classified.
+export interface RecurringClassification {
+  merchant: string;
+  direction: RecurringDirection;
+  isRecurring: boolean;
+  kind: string | null; // subscription | membership | bill | insurance | loan | rent | income | other
+  cadence: string | null; // weekly | biweekly | monthly | quarterly | annual | irregular
+  canonicalName: string | null;
+  confidence: number;
+  signature: string;
+  updatedAt: string;
+}
+
 // A single actionable finding, uniform across every evaluator. dollarImpactMinor
 // is signed integer minor units normalized to a twelve-month horizon so findings
 // are comparable; confidence is 0..1; score is the computed ranking value.

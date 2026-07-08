@@ -57,7 +57,7 @@ const chatSchema = z.object({
   section: z.string().trim().max(60).optional(),
   contextAttachments: z.array(z.object({
     id: z.string().trim().max(80),
-    type: z.enum(['chart', 'table']),
+    type: z.enum(['chart', 'table', 'item']),
     title: z.string().trim().max(160),
     section: z.string().trim().max(60).optional(),
     totalRows: z.number().int().min(0).max(100000).optional(),
@@ -256,6 +256,9 @@ async function route(
       to: url.searchParams.get('to'),
     });
     return sendJson(response, 200, { items: service.summarize(query) });
+  }
+  if (url.pathname === '/v1/recurring' && method === 'GET') {
+    return sendJson(response, 200, await service.listRecurring());
   }
   if (url.pathname === '/v1/provider-connections' && method === 'GET') {
     return sendJson(response, 200, { items: service.listProviderConnections() });

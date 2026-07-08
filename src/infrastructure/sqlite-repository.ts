@@ -36,6 +36,8 @@ import type {
   Page,
   ProviderConnection,
   QuestionRecord,
+  RecurringCandidate,
+  RecurringClassification,
   RuleRecord,
   RuleSpec,
   Transaction,
@@ -115,6 +117,27 @@ const RULE_SPECS_SCHEMA = `
     version INTEGER NOT NULL DEFAULT 1,
     source TEXT NOT NULL DEFAULT 'builtin',
     updated_at TEXT NOT NULL
+  );
+`;
+
+// LLM verdicts on whether a merchant series is recurring, keyed by normalized
+// merchant + direction (account-agnostic — a merchant is recurring regardless of
+// which card paid it). Populated by an out-of-band classification pass so the
+// synchronous rules engine and the recurring view can just JOIN this table. The
+// signature captures the series shape at classification time; when it changes
+// materially the row is re-classified.
+const RECURRING_CLASSIFICATIONS_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS recurring_classifications (
+    merchant TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+    is_recurring INTEGER NOT NULL DEFAULT 0 CHECK (is_recurring IN (0, 1)),
+    kind TEXT,
+    cadence TEXT,
+    canonical_name TEXT,
+    confidence REAL NOT NULL DEFAULT 0,
+    signature TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (merchant, direction)
   );
 `;
 
@@ -885,6 +908,122 @@ export class SqliteFinanceRepository implements FinanceRepository {
       new Date().toISOString());
   }
 
+  // Deterministic candidate generation for the recurring classifier: one row per
+  // normalized merchant + direction, merged across accounts (a merchant is
+  // recurring regardless of which card paid it), with the shape features the LLM
+  // reasons over. The heavy lifting (median, consecutive-gap CV) reuses the same
+  // primitives as the recurring_series view.
+  listRecurringCandidates(): RecurringCandidate[] {
+    const rows = this.database.prepare(`
+      WITH base AS (
+        SELECT id, date, description, category,
+          CASE WHEN amount_minor < 0 THEN 'out' ELSE 'in' END AS direction,
+          ABS(amount_minor) AS amt, currency,
+          normalize_merchant(description) AS merchant
+        FROM transactions
+        WHERE normalize_merchant(description) <> '' AND julianday('now') - julianday(date) <= 400
+          AND lower(COALESCE(category, '')) NOT LIKE '%transfer%'
+      ), ranked AS (
+        SELECT b.*,
+          ROW_NUMBER() OVER (PARTITION BY merchant, direction ORDER BY date DESC, id DESC) AS rn_desc,
+          julianday(date) - julianday(
+            LAG(date) OVER (PARTITION BY merchant, direction ORDER BY date ASC, id ASC)
+          ) AS gap_days
+        FROM base b
+      ), cat AS (
+        SELECT merchant, direction, category,
+          ROW_NUMBER() OVER (PARTITION BY merchant, direction ORDER BY COUNT(*) DESC) AS rn
+        FROM base WHERE category IS NOT NULL AND category <> ''
+        GROUP BY merchant, direction, category
+      ), agg AS (
+        SELECT
+          merchant, direction,
+          MIN(currency) AS currency,
+          COUNT(*) AS count,
+          MIN(date) AS first_date, MAX(date) AS last_date,
+          (julianday(MAX(date)) - julianday(MIN(date))) AS span_days,
+          MAX(CASE WHEN rn_desc = 1 THEN description END) AS label,
+          MAX(CASE WHEN rn_desc = 1 THEN amt END) AS latest_minor,
+          median(CASE WHEN rn_desc > 1 THEN amt END) AS typical_minor,
+          MIN(amt) AS min_minor, MAX(amt) AS max_minor,
+          MAX(1.0, MIN(52.0, 365.0 / (MAX(0.5, julianday(MAX(date)) - julianday(MIN(date))) / MAX(1, COUNT(*) - 1)))) AS periods_per_year,
+          sqrt(MAX(0.0, AVG(1.0 * amt * amt) - AVG(1.0 * amt) * AVG(1.0 * amt))) / NULLIF(AVG(1.0 * amt), 0) AS amount_cv,
+          CASE WHEN COUNT(gap_days) >= 2
+            THEN sqrt(MAX(0.0, AVG(gap_days * gap_days) - AVG(gap_days) * AVG(gap_days))) / NULLIF(AVG(gap_days), 0)
+          END AS interval_cv,
+          group_concat(id) AS record_ids
+        FROM ranked
+        GROUP BY merchant, direction
+        HAVING COUNT(*) >= 2
+      )
+      SELECT agg.*, c.category AS category
+      FROM agg LEFT JOIN (SELECT merchant, direction, category FROM cat WHERE rn = 1) c
+        ON c.merchant = agg.merchant AND c.direction = agg.direction
+      ORDER BY agg.count DESC, agg.latest_minor DESC
+      LIMIT 500
+    `).all() as Record<string, unknown>[];
+    return rows.map((row) => ({
+      merchant: String(row.merchant),
+      direction: String(row.direction) as RecurringCandidate['direction'],
+      label: String(row.label ?? row.merchant),
+      category: row.category != null ? String(row.category) : null,
+      currency: String(row.currency || 'USD'),
+      count: Number(row.count),
+      firstDate: String(row.first_date),
+      lastDate: String(row.last_date),
+      spanDays: Number(row.span_days),
+      latestMinor: Number(row.latest_minor),
+      typicalMinor: Number(row.typical_minor ?? row.latest_minor),
+      minMinor: Number(row.min_minor),
+      maxMinor: Number(row.max_minor),
+      periodsPerYear: Number(row.periods_per_year),
+      amountCv: row.amount_cv != null ? Number(row.amount_cv) : null,
+      intervalCv: row.interval_cv != null ? Number(row.interval_cv) : null,
+      recordIds: row.record_ids ? String(row.record_ids).split(',').filter(Boolean) : [],
+    }));
+  }
+
+  listTransactionsByIds(ids: string[]): Transaction[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = this.database.prepare(`
+      SELECT id, account_id, source_id, date, description, amount_minor, currency, category, pending, metadata, created_at
+      FROM transactions WHERE id IN (${placeholders})
+      ORDER BY date DESC, id DESC
+    `).all(...ids) as TransactionRow[];
+    return rows.map(mapTransaction);
+  }
+
+  listRecurringClassifications(): RecurringClassification[] {
+    const rows = this.database.prepare(`
+      SELECT merchant, direction, is_recurring, kind, cadence, canonical_name, confidence, signature, updated_at
+      FROM recurring_classifications
+    `).all() as Record<string, unknown>[];
+    return rows.map((row) => ({
+      merchant: String(row.merchant),
+      direction: String(row.direction) as RecurringClassification['direction'],
+      isRecurring: Number(row.is_recurring) === 1,
+      kind: row.kind != null ? String(row.kind) : null,
+      cadence: row.cadence != null ? String(row.cadence) : null,
+      canonicalName: row.canonical_name != null ? String(row.canonical_name) : null,
+      confidence: Number(row.confidence),
+      signature: String(row.signature),
+      updatedAt: String(row.updated_at),
+    }));
+  }
+
+  upsertRecurringClassification(row: RecurringClassification): void {
+    this.database.prepare(`
+      INSERT INTO recurring_classifications (merchant, direction, is_recurring, kind, cadence, canonical_name, confidence, signature, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(merchant, direction) DO UPDATE SET
+        is_recurring = excluded.is_recurring, kind = excluded.kind, cadence = excluded.cadence,
+        canonical_name = excluded.canonical_name, confidence = excluded.confidence,
+        signature = excluded.signature, updated_at = excluded.updated_at
+    `).run(row.merchant, row.direction, row.isRecurring ? 1 : 0, row.kind, row.cadence, row.canonicalName,
+      row.confidence, row.signature, row.updatedAt);
+  }
+
   listFindingMutes(): FindingMuteRecord[] {
     const rows = this.database.prepare(`
       SELECT id, kind, account_id, label, expires_at, created_at
@@ -1271,6 +1410,13 @@ export class SqliteFinanceRepository implements FinanceRepository {
       { version: 6, up: () => this.applyRecurringSeriesView() },
       { version: 7, up: () => this.database.exec(RULE_SPECS_SCHEMA) },
       { version: 8, up: () => this.renameNamespacedFactKeys() },
+      // Recurring series now exposes amount_cv / interval_cv so recurring rules
+      // can require an actual regular cadence and stable amount, not just repeat
+      // visits to one merchant. Re-runs the (now DROP-and-recreate) view builder.
+      { version: 9, up: () => this.applyRecurringSeriesView() },
+      // Recurring detection moves from CV thresholds to an LLM classifier whose
+      // verdicts live in recurring_classifications; the rules JOIN it.
+      { version: 10, up: () => this.database.exec(RECURRING_CLASSIFICATIONS_SCHEMA) },
     ];
 
     // Before mutating an existing user's data, snapshot it. This only runs when
@@ -1536,8 +1682,12 @@ export class SqliteFinanceRepository implements FinanceRepository {
   // span, latest/typical amount, and cadence. Uses the normalize_merchant and
   // median UDFs registered on the connection.
   private applyRecurringSeriesView(): void {
+    // DROP first so an existing database picks up column/definition changes: a
+    // bare CREATE VIEW IF NOT EXISTS would keep the stale view. This makes the
+    // method safe to re-run from a later migration when the shape changes.
     this.database.exec(`
-      CREATE VIEW IF NOT EXISTS recurring_series AS
+      DROP VIEW IF EXISTS recurring_series;
+      CREATE VIEW recurring_series AS
       WITH base AS (
         SELECT account_id, id, date, description,
           CASE WHEN amount_minor < 0 THEN 'out' ELSE 'in' END AS direction,
@@ -1546,7 +1696,11 @@ export class SqliteFinanceRepository implements FinanceRepository {
         FROM transactions
         WHERE normalize_merchant(description) <> '' AND julianday('now') - julianday(date) <= 400
       ), ranked AS (
-        SELECT b.*, ROW_NUMBER() OVER (PARTITION BY account_id, merchant, direction ORDER BY date DESC, id DESC) AS rn_desc
+        SELECT b.*,
+          ROW_NUMBER() OVER (PARTITION BY account_id, merchant, direction ORDER BY date DESC, id DESC) AS rn_desc,
+          julianday(date) - julianday(
+            LAG(date) OVER (PARTITION BY account_id, merchant, direction ORDER BY date ASC, id ASC)
+          ) AS gap_days
         FROM base b
       )
       SELECT
@@ -1561,6 +1715,20 @@ export class SqliteFinanceRepository implements FinanceRepository {
         MIN(date) AS first_date,
         MAX(date) AS last_date,
         MAX(1.0, MIN(52.0, 365.0 / ((julianday(MAX(date)) - julianday(MIN(date))) / (COUNT(*) - 1)))) AS periods_per_year,
+        -- Amount consistency: population coefficient of variation of the charge
+        -- amounts. Near 0 for a fixed-price subscription; large for variable
+        -- spend at one merchant (ride-hailing, shopping) where every charge is a
+        -- different size. This is what separates a subscription from a merchant
+        -- you simply buy from repeatedly.
+        sqrt(MAX(0.0, AVG(1.0 * amt * amt) - AVG(1.0 * amt) * AVG(1.0 * amt))) / NULLIF(AVG(1.0 * amt), 0) AS amount_cv,
+        -- Cadence regularity: coefficient of variation of the gaps between
+        -- consecutive charges. Low when charges land on a schedule (a monthly
+        -- bill), high when they cluster and gap at random. NULL until there are
+        -- at least two gaps (three charges) to compare — with fewer, cadence
+        -- cannot be judged and callers fall back to amount consistency.
+        CASE WHEN COUNT(gap_days) >= 2
+          THEN sqrt(MAX(0.0, AVG(gap_days * gap_days) - AVG(gap_days) * AVG(gap_days))) / NULLIF(AVG(gap_days), 0)
+        END AS interval_cv,
         group_concat(id) AS record_ids
       FROM ranked
       GROUP BY account_id, merchant, direction;

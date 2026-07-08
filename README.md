@@ -4,8 +4,12 @@
 
 Finora is a personal finance app that brings your bank accounts, investments,
 and credit reports together into one clear picture. It runs on your own laptop
-and keeps everything in a single file on your machine — nothing is uploaded to a
-finance company's servers.
+and keeps everything in a single file on your machine. There is no Finora
+server: your ledger is never uploaded to us or to a finance company. The only
+things that ever leave your machine are ones you set up yourself — syncing a bank
+you connected, alerts you push to your own Telegram/Slack, and (if you choose a
+cloud AI provider instead of the built-in local model) the context for that AI
+request.
 
 Finora never moves your money, never stores your bank passwords anywhere online,
 and never gives financial advice. It just helps you *see* and *understand* your
@@ -122,6 +126,12 @@ data only**. Each clip loops automatically — click it to open the full video.
 - **Connections are optional.** If you connect a bank or brokerage, those
   credentials are saved only on your computer and used only to talk to that
   provider.
+- **AI runs where you choose.** Finora has no AI service of its own. Chat and
+  AI-assisted insights run on the **built-in local model** (fully on your
+  machine — nothing leaves), or, if you set up a cloud provider (Anthropic,
+  OpenAI, Google, Ollama, or any OpenAI-compatible endpoint), Finora sends just
+  that request's context to the provider *you* chose, under their terms. There is
+  no Finora server in the middle either way.
 - **Upgrades keep a safety copy.** Before ever changing how your data is stored,
   Finora writes a one-time backup file (`finora.db.backup-v…`) next to your data
   so an update can't lose anything.

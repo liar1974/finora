@@ -63,6 +63,32 @@ the UDFs `money()`, `normalize_merchant()`, `fee_like()`, the `median` aggregate
 and the `recurring_series` view — let even the gnarly recurring/temporal rules stay
 pure SQL, so a downloaded rule can just `SELECT … FROM recurring_series`.
 
+Deciding what is *recurring* is not a threshold problem. Repeated visits to one
+merchant (ride-hailing, a duty-free shop) are not a subscription, while a variable
+utility bill or a bi-weekly paycheck is — and no coefficient of variation on
+amount or cadence separates those cleanly. So recurrence is classified by the
+configured LLM, which weighs the merchant name (world knowledge — Netflix vs a
+duty-free shop) against the observed pattern.
+
+The pipeline is a deterministic prefilter feeding a model, cached so the engine
+stays synchronous:
+
+1. **Candidate generation** (`repository.listRecurringCandidates`) groups
+   transactions by normalized merchant + direction across accounts and derives the
+   shape features (count, span, cadence estimate, amount stats, `amount_cv`,
+   `interval_cv`, category). `recurring_series` still exposes those CV columns, now
+   as *features*, not gates.
+2. **Classification** (`FinanceService.classifyRecurringWithModel`) sends the
+   candidates to the LLM in one batched call and stores the verdicts —
+   `is_recurring`, `kind`, `cadence`, `canonical_name`, `confidence` — in
+   `recurring_classifications`, keyed by merchant + direction. Only candidates
+   whose shape *signature* changed are re-classified, so the model is called
+   sparingly. There is no heuristic fallback: with no model configured the table
+   returns `model_required` and the UI routes the user to model settings.
+3. **Consumption**: the recurring `D` rules and the `/v1/recurring` table just
+   `JOIN recurring_classifications` and filter on `is_recurring` / `kind`. The
+   engine reads a table; the model ran out-of-band.
+
 Evaluation is tri-state. If a required fact has no value yet, the rule does not
 fire — the engine emits a **question** instead (see facts).
 
@@ -257,10 +283,15 @@ seeded into `rule_specs` on startup:
   `RULES_FEED_VERSION`). A downloaded rule that declares user facts flows straight into
   the needs-input surface, and the read-only query runner sandboxes its SQL. The feed
   URL is editable under **Settings → Rules & Facts**, and a **Check for updates** button
-  there triggers a sync (`POST /v1/rules/sync`). What is **not** built yet is
-  **automatic polling**: nothing calls `syncRuleFeed()` on a timer, so the app never
-  pulls newer rules on its own — the user has to press the button. Built-ins are still
-  seeded from code on startup as the floor.
+  there triggers a sync (`POST /v1/rules/sync`). Background services also run one silent,
+  best-effort sync ~30s after boot (`ruleFeedKick` in `startBackgroundServices`), so a
+  fresh launch pulls the latest rules without the user acting. What is **deliberately
+  not** built is **periodic polling on a timer** — rule updates are infrequent, so
+  startup-once plus the manual button is enough; a short-interval poll was skipped on
+  purpose. Built-ins are still seeded from code on startup as the floor. Any
+  private-repo feed would additionally need auth-header support (not built; public raw
+  URLs work today), and feed signature verification is deferred until rules are
+  distributed beyond a trusted first-party URL.
 - **Deeper data products.** Rules needing Plaid **Liabilities** (card APR and
   interest projection, payment-due, student-loan and mortgage tracking) — the
   account is entitled, but Liabilities is not yet ingested. **Income** rules need a

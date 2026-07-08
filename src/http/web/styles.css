@@ -169,6 +169,11 @@ td.r, th.r { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo
 .tabletools select { min-width: 112px; }
 .tabletools .pginfo { color: var(--mut); font-size: 12px; font-variant-numeric: tabular-nums; }
 .contextsend { width: 32px; height: 32px; min-height: 32px; padding: 0; }
+td.rowaction { width: 1%; white-space: nowrap; text-align: right; }
+td.rowaction .contextsend { width: 28px; height: 28px; min-height: 28px; }
+tbody tr.clickable { cursor: pointer; }
+tbody tr.clickable:hover td { background: var(--card2); }
+.sechdr .contextsend { margin-left: auto; flex: none; }
 .contextsend.active, .chartaction.active { color: var(--brand); border-color: color-mix(in srgb, var(--brand) 45%, var(--line)); background: rgba(176,90,56,.1); }
 .pager { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding-top: 10px; }
 .pager .pginfo { color: var(--mut); font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -486,7 +491,8 @@ td.r, th.r { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo
 .creditmetric .lab { color: var(--mut); font-size: 10.5px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
 .creditmetric .value { margin-top: 5px; color: var(--fg); font-size: 19px; line-height: 1.2; font-weight: 850; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .reportdetailblock { min-width: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--card); overflow: hidden; }
-.reportminirow { min-width: 0; padding: 10px 12px; border-top: 1px solid var(--line); }
+.reportminirow { min-width: 0; padding: 10px 12px; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.reportminitext { min-width: 0; }
 .reportminirow:first-of-type { border-top: 0; }
 .reportminirow.medium { background: rgba(180,83,9,.055); }
 .reportminirow.high { background: rgba(220,38,38,.055); }

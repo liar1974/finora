@@ -17,6 +17,8 @@ import type {
   ProviderBrokerageTransactionInput,
   ProviderHoldingInput,
   ProviderTransactionInput,
+  RecurringClassifier,
+  RecurringVerdict,
   RuleFeedClient,
   StatementParser,
   SummaryQuery,
@@ -40,11 +42,11 @@ import {
   normalizeCurrency,
   requireText,
 } from '../domain/invariants.js';
-import type { Account, AccountBalance, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, FactExpectation, Finding, ImportRecord, QuestionRecord, RuleFactNeed, RuleRecord, RuleSpec, Transaction, TransactionInput } from '../domain/models.js';
+import type { Account, AccountBalance, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, FactExpectation, Finding, ImportRecord, QuestionRecord, RecurringCandidate, RecurringClassification, RecurringDirection, RuleFactNeed, RuleRecord, RuleSpec, Transaction, TransactionInput } from '../domain/models.js';
 import { builtinRuleSpecs, evaluateRules, executionStrategy, inferRule } from './rules-engine.js';
 import type { EvaluationData, QuestionDraft } from './rules-engine.js';
-import { generateChatReply, LLM_PROVIDERS, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
-import { LocalModelEngine, ModelNotDownloadedError } from '../infrastructure/local-model.js';
+import { clampChatInput, generateChatReply, LLM_PROVIDERS, providerContextTokens, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
+import { BUILTIN_MODEL, LocalModelEngine, ModelNotDownloadedError } from '../infrastructure/local-model.js';
 import { TelegramGateway, sendTelegramMessage } from '../infrastructure/telegram-gateway.js';
 
 export interface ChatMessage {
@@ -66,7 +68,7 @@ export function dailyResetBoundary(now: Date, hour = 4): Date {
 
 export interface ChatContextAttachment {
   id: string;
-  type: 'chart' | 'table';
+  type: 'chart' | 'table' | 'item';
   title: string;
   section?: string | undefined;
   totalRows?: number | undefined;
@@ -133,6 +135,45 @@ interface CreditExtraction {
   inquiries: CreditInquiry[];
   suggestions: CreditDisputeSuggestion[];
   textSample: string;
+  // Full normalized report text, kept in-memory for LLM enrichment/grounding only.
+  // Not persisted (importCreditReport stores textSample, not this).
+  text: string;
+}
+
+export interface CreditAiReview {
+  provider: string;
+  model: string;
+  addedAccounts: number;
+  addedInquiries: number;
+  ranAt: string;
+}
+
+export interface RecurringTransaction {
+  id: string;
+  date: string;
+  description: string;
+  amountMinor: number;
+  currency: string;
+  accountId: string;
+}
+
+// One row of the Recurring table, after LLM classification. A row is one payee
+// (canonical name), merged across the possibly-many raw descriptions the payee
+// bills under, with every underlying transaction attached for drill-down.
+export interface RecurringListItem {
+  merchant: string; // canonical display name
+  direction: RecurringDirection;
+  kind: string | null;
+  cadence: string | null;
+  category: string | null;
+  count: number; // number of transactions in the merged series
+  amountMinor: number; // typical (median) per-charge amount
+  annualMinor: number; // typical amount annualized by cadence
+  currency: string;
+  firstDate: string;
+  lastDate: string;
+  confidence: number;
+  transactions: RecurringTransaction[]; // all charges, most recent first
 }
 
 export class FinanceService {
@@ -145,13 +186,23 @@ export class FinanceService {
   private providerSyncInFlight: Promise<unknown> | null = null;
   private reflectionKick: ReturnType<typeof setTimeout> | undefined;
   private reflectionTimer: ReturnType<typeof setInterval> | undefined;
+  private ruleFeedKick: ReturnType<typeof setTimeout> | undefined;
+
+  // When a classifier is injected (tests), it also stands in for "a model is
+  // available"; otherwise the built-in LLM path is used and availability is
+  // resolved from the configured provider.
+  private readonly recurringClassifier: RecurringClassifier;
+  private readonly recurringClassifierInjected: boolean;
 
   constructor(
     private readonly repository: FinanceRepository,
     private readonly parsers: readonly StatementParser[],
     private readonly localModel: LocalModelEngine,
     private readonly ruleFeed?: RuleFeedClient,
+    recurringClassifier?: RecurringClassifier,
   ) {
+    this.recurringClassifierInjected = Boolean(recurringClassifier);
+    this.recurringClassifier = recurringClassifier ?? ((candidates) => this.classifyRecurringWithModel(candidates));
     this.telegramGateway = new TelegramGateway({
       getToken: () => this.telegramToken(),
       getChatId: () => this.repository.getAppSetting('TELEGRAM_CHAT_ID'),
@@ -970,6 +1021,17 @@ export class FinanceService {
       this.providerSyncKick.unref();
     }
 
+    // Rule feed: pull the latest rule versions once, shortly after boot. Silent and
+    // best-effort — an unset RULES_FEED_URL (or no feed client) is a no-op, and any
+    // failure is logged, not surfaced. No interval: rule updates are infrequent and
+    // the manual "Check for updates" button covers on-demand refresh.
+    this.ruleFeedKick = setTimeout(() => {
+      void this.syncRuleFeed().catch((error: unknown) => {
+        console.warn('Finora rule-feed sync failed:', error instanceof Error ? error.message : error);
+      });
+    }, 30_000);
+    this.ruleFeedKick.unref();
+
     // Reflection ("dreaming"): distill the agent event log into durable memory.
     // First pass 5 minutes after boot, then once a day. Timers are unref'd so
     // they never keep the process alive.
@@ -1505,7 +1567,24 @@ export class FinanceService {
     const existing = this.repository.listCreditReports().find((report) => report.contentHash === contentHash);
     if (existing) return { ok: true, status: 'duplicate', report: existing, ...this.getCreditOverview() };
 
-    const extracted = await extractCreditReport(input.content, filename);
+    let extracted = await extractCreditReport(input.content, filename);
+    // Best-effort LLM verify + unknown-format fallback: recovers missed rows and handles
+    // layouts no deterministic extractor knows. Runs only when a model is configured/ready;
+    // grounded and non-blocking (failures leave the deterministic result untouched). Runs
+    // before the empty-check so a fully-unrecognized report can still be salvaged.
+    let aiReview: CreditAiReview | null = null;
+    const llm = this.llmConfig();
+    const modelReady = llm.provider === 'builtin' ? await this.localModel.weightsPresent() : llm.keySet;
+    if (modelReady) {
+      const enriched = await enrichCreditExtractionWithLlm(
+        extracted,
+        extracted.text,
+        (request) => this.llmReply(llm, request),
+        { provider: llm.provider, model: llm.chatModel, now: new Date().toISOString() },
+      );
+      extracted = enriched.extraction;
+      aiReview = enriched.aiReview;
+    }
     if (extracted.accounts.length === 0 && extracted.inquiries.length === 0 && !extracted.score) {
       throw new AppError(
         'invalid_input',
@@ -1535,6 +1614,7 @@ export class FinanceService {
         inquiries: extracted.inquiries,
         suggestions: extracted.suggestions,
         textSample: extracted.textSample,
+        ...(aiReview ? { aiReview } : {}),
       },
       bytes: input.content.byteLength,
     });
@@ -1619,13 +1699,20 @@ export class FinanceService {
       return { ...normalized, fingerprint: this.fingerprint(account.id, normalized) };
     });
 
-    return this.repository.saveImport({
+    const record = this.repository.saveImport({
       account,
       filename,
       format: parser.format,
       contentHash,
       transactions,
     });
+    // New transactions may create or reshape recurring series; refresh the
+    // classifier cache in the background (no-op without a model). Fire-and-forget
+    // so import stays synchronous; the recurring endpoint also refreshes on read.
+    void this.refreshRecurringClassifications().catch((error) => {
+      console.warn('Finora recurring classification refresh failed:', error instanceof Error ? error.message : error);
+    });
+    return record;
   }
 
   close(): void {
@@ -1638,6 +1725,7 @@ export class FinanceService {
     // close() and call runReflection() against an already-closed repository.
     if (this.reflectionKick) clearTimeout(this.reflectionKick);
     if (this.reflectionTimer) clearInterval(this.reflectionTimer);
+    if (this.ruleFeedKick) clearTimeout(this.ruleFeedKick);
     void this.localModel.unload();
     this.repository.close();
   }
@@ -1721,10 +1809,18 @@ export class FinanceService {
     timeoutMs?: number;
     maxTokens?: number;
   }): Promise<string> {
-    if (config.provider === 'builtin') {
-      return this.localModel.generateReply(input);
+    // Single choke point for context sizing: clamp the prompt to the active provider's window
+    // so no provider silently truncates (Ollama) or hard-errors (builtin) on oversized input.
+    const contextTokens = config.provider === 'builtin' ? BUILTIN_MODEL.contextSize : providerContextTokens(config);
+    const clamped = clampChatInput(input, contextTokens);
+    if (clamped.truncated) {
+      console.warn(`LLM input clamped to fit ${config.provider} context (~${contextTokens} tokens)`);
     }
-    return generateChatReply({ config, ...input });
+    const request = { ...input, system: clamped.system, messages: clamped.messages };
+    if (config.provider === 'builtin') {
+      return this.localModel.generateReply(request);
+    }
+    return generateChatReply({ config, ...request });
   }
 
   private async inferRuleWithModel(text: string, fallback: ReturnType<typeof inferRule>) {
@@ -1751,6 +1847,159 @@ export class FinanceService {
       };
     } catch {
       return { ...fallback, inference: { source: 'heuristic' } };
+    }
+  }
+
+  // ── Recurring classification ───────────────────────────────────────────────
+  // Whether recurring detection can run at all. An injected classifier (tests)
+  // counts as ready; otherwise a real model must be configured — a keyed remote
+  // provider, or the built-in model with weights downloaded and engine present.
+  async recurringModelReady(): Promise<boolean> {
+    if (this.recurringClassifierInjected) return true;
+    const llm = this.llmConfig();
+    // Presence only — a cheap fs check, not the native-engine load status() does.
+    // If weights exist but the engine can't run, the classifier call fails and is
+    // caught, leaving prior verdicts untouched.
+    if (llm.provider === 'builtin') return this.localModel.weightsPresent();
+    return llm.keySet;
+  }
+
+  // Re-classify only the candidate series whose shape changed since last time, so
+  // the model is called sparingly. No-op (skipped) when no model is available.
+  async refreshRecurringClassifications(): Promise<{ classified: number; skipped: boolean }> {
+    if (!(await this.recurringModelReady())) return { classified: 0, skipped: true };
+    const candidates = this.repository.listRecurringCandidates();
+    if (candidates.length === 0) return { classified: 0, skipped: false };
+    const stored = new Map(this.repository.listRecurringClassifications().map((row) => [recurringKey(row), row]));
+    const stale = candidates.filter((candidate) => stored.get(recurringKey(candidate))?.signature !== recurringSignature(candidate));
+    if (stale.length === 0) return { classified: 0, skipped: false };
+
+    const verdicts = new Map((await this.recurringClassifier(stale)).map((verdict) => [recurringKey(verdict), verdict]));
+    const now = new Date().toISOString();
+    let classified = 0;
+    for (const candidate of stale) {
+      const verdict = verdicts.get(recurringKey(candidate));
+      if (!verdict) continue;
+      const isRecurring = verdict.isRecurring && !violatesFixedFeeBackstop(verdict, candidate);
+      this.repository.upsertRecurringClassification({
+        merchant: candidate.merchant,
+        direction: candidate.direction,
+        isRecurring,
+        kind: isRecurring ? verdict.kind : null,
+        cadence: verdict.cadence,
+        canonicalName: verdict.canonicalName,
+        confidence: verdict.confidence,
+        signature: recurringSignature(candidate),
+        updatedAt: now,
+      });
+      classified += 1;
+    }
+    return { classified, skipped: false };
+  }
+
+  // Feeds the Recurring table. Requires a model; when none is configured it does
+  // not guess — it tells the client to route the user to model settings.
+  async listRecurring(): Promise<
+    | { status: 'model_required'; provider: string; needsDownload: boolean }
+    | { status: 'ok'; items: RecurringListItem[] }
+  > {
+    if (!(await this.recurringModelReady())) {
+      const llm = this.llmConfig();
+      return { status: 'model_required', provider: llm.provider, needsDownload: llm.provider === 'builtin' };
+    }
+    await this.refreshRecurringClassifications();
+    const verdicts = new Map(this.repository.listRecurringClassifications().map((row) => [recurringKey(row), row]));
+
+    // Keep only the candidate groups the model called recurring, then merge them
+    // by the model's canonical payee name (case-insensitive) + direction, so the
+    // many raw descriptions one payee bills under collapse into a single row.
+    const recurring = this.repository.listRecurringCandidates()
+      .map((candidate) => ({ candidate, verdict: verdicts.get(recurringKey(candidate)) }))
+      .filter((entry): entry is { candidate: RecurringCandidate; verdict: RecurringClassification } => Boolean(entry.verdict?.isRecurring));
+
+    const allIds = recurring.flatMap((entry) => entry.candidate.recordIds);
+    const txById = new Map(this.repository.listTransactionsByIds(allIds).map((tx) => [tx.id, tx]));
+
+    const groups = new Map<string, { verdicts: RecurringClassification[]; direction: RecurringDirection; category: string | null; currency: string; transactions: RecurringTransaction[] }>();
+    for (const { candidate, verdict } of recurring) {
+      const key = canonicalMergeKey(candidate.direction, verdict.canonicalName || candidate.label, candidate.merchant);
+      const group = groups.get(key) ?? { verdicts: [], direction: candidate.direction, category: candidate.category, currency: candidate.currency, transactions: [] };
+      group.verdicts.push(verdict);
+      if (!group.category) group.category = candidate.category;
+      for (const id of candidate.recordIds) {
+        const tx = txById.get(id);
+        if (tx) group.transactions.push({ id: tx.id, date: tx.date, description: tx.description, amountMinor: tx.amountMinor, currency: tx.currency, accountId: tx.accountId });
+      }
+      groups.set(key, group);
+    }
+
+    const items: RecurringListItem[] = [...groups.values()]
+      .map((group) => {
+        const transactions = dedupeById(group.transactions).sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+        const best = group.verdicts.slice().sort((a, b) => b.confidence - a.confidence)[0]!;
+        const amounts = transactions.map((tx) => Math.abs(tx.amountMinor));
+        const amountMinor = median(amounts);
+        const periodsPerYear = estimatePeriodsPerYear(transactions.map((tx) => tx.date));
+        return {
+          merchant: best.canonicalName || group.verdicts[0]!.merchant,
+          direction: group.direction,
+          kind: best.kind,
+          cadence: best.cadence,
+          category: group.category,
+          count: transactions.length,
+          amountMinor,
+          annualMinor: Math.round(amountMinor * periodsPerYear),
+          currency: group.currency,
+          firstDate: transactions.length ? transactions[transactions.length - 1]!.date : '',
+          lastDate: transactions.length ? transactions[0]!.date : '',
+          confidence: best.confidence,
+          transactions,
+        };
+      })
+      .sort((a, b) => b.annualMinor - a.annualMinor);
+    return { status: 'ok', items };
+  }
+
+  // Default classifier: the model weighs the merchant name (world knowledge)
+  // against the observed cadence, amount, and direction. Candidates are split into
+  // small chunks so the model reliably returns a complete, well-formed verdict for
+  // every one (a single huge prompt drops fields and truncates). A failed chunk
+  // yields no verdicts for its members, leaving their prior cache untouched.
+  private async classifyRecurringWithModel(candidates: RecurringCandidate[]): Promise<RecurringVerdict[]> {
+    const CHUNK = 25;
+    const verdicts: RecurringVerdict[] = [];
+    for (let start = 0; start < candidates.length; start += CHUNK) {
+      verdicts.push(...(await this.classifyRecurringChunk(candidates.slice(start, start + CHUNK))));
+    }
+    return verdicts;
+  }
+
+  private async classifyRecurringChunk(candidates: RecurringCandidate[]): Promise<RecurringVerdict[]> {
+    if (candidates.length === 0) return [];
+    const llm = this.llmConfig();
+    const payload = candidates.map((candidate, ref) => ({
+      ref,
+      name: candidate.label,
+      flow: candidate.direction === 'in' ? 'money in' : 'money out',
+      category: candidate.category || 'unknown',
+      count: candidate.count,
+      spanDays: Math.round(candidate.spanDays),
+      perYear: Math.round(candidate.periodsPerYear),
+      typical: Number((candidate.typicalMinor / 100).toFixed(2)),
+      range: [Number((candidate.minMinor / 100).toFixed(2)), Number((candidate.maxMinor / 100).toFixed(2))],
+      amountVariation: candidate.amountCv == null ? null : Number(candidate.amountCv.toFixed(2)),
+      timingVariation: candidate.intervalCv == null ? null : Number(candidate.intervalCv.toFixed(2)),
+    }));
+    try {
+      const reply = await this.llmReply(llm, {
+        system: RECURRING_CLASSIFIER_SYSTEM,
+        messages: [{ role: 'user', content: JSON.stringify(payload) }],
+        timeoutMs: 120_000,
+        maxTokens: Math.min(4_000, 300 + candidates.length * 80),
+      });
+      return parseRecurringVerdicts(reply, candidates);
+    } catch {
+      return [];
     }
   }
 
@@ -1995,6 +2244,125 @@ function parseRuleInference(reply: string): Partial<{ scope: string; cadence: st
   } catch {
     return {};
   }
+}
+
+// ── Recurring classifier helpers ──────────────────────────────────────────────
+const RECURRING_KINDS = ['subscription', 'membership', 'bill', 'insurance', 'loan', 'rent', 'income', 'other'];
+const RECURRING_CADENCES = ['weekly', 'biweekly', 'monthly', 'quarterly', 'annual', 'irregular'];
+
+// Deterministic backstop over the model's verdict. A subscription or membership is
+// a FIXED periodic fee, so its charges should be about the same size every time;
+// if the amounts vary materially it is really discretionary spending (shopping,
+// per-use fares) the model mislabeled, so we reject it. Only these two "fixed fee"
+// kinds are guarded — bills, insurance, loans, rent, and income legitimately vary.
+const FIXED_FEE_KINDS = new Set(['subscription', 'membership']);
+const FIXED_FEE_AMOUNT_CV_MAX = 0.4;
+
+function violatesFixedFeeBackstop(verdict: RecurringVerdict, candidate: RecurringCandidate): boolean {
+  return (
+    FIXED_FEE_KINDS.has(verdict.kind ?? '') &&
+    candidate.amountCv != null &&
+    candidate.amountCv > FIXED_FEE_AMOUNT_CV_MAX
+  );
+}
+
+const RECURRING_CLASSIFIER_SYSTEM = [
+  'You classify a personal-finance app user\'s merchant transaction series as recurring or not.',
+  'Input is a JSON array; each entry is one merchant series with: ref, name, flow ("money out"=you paid, "money in"=you received), category (Plaid-style), count, spanDays, perYear (estimated charges per year), typical (typical amount in dollars), range [min,max], amountVariation (0=identical amounts), timingVariation (0=perfectly regular spacing; null when unknown).',
+  '',
+  'THE TEST: a series is recurring ONLY if it is a standing agreement that keeps charging (or paying) on a schedule until it is cancelled, closed, or paid off. If you would have to cancel a plan / close an account / finish paying to make it stop, it is recurring. If each occurrence is a fresh, separate decision to buy, it is NOT recurring — no matter how many times it repeats.',
+  'RECURRING kinds (essentially only these): subscription (Netflix, Spotify, Oracle Cloud), membership FEE (a fixed periodic access fee like a gym or Costco/Prime — the fee itself, NOT purchases made there), utility/telecom/insurance bill (PG&E, Verizon, Visible, GEICO), rent or mortgage, loan or installment payment to a named lender (Kikoff, Affirm, SoFi), and regular income (payroll, benefits, dividends).',
+  'NOT RECURRING = ordinary spending, even when the same merchant appears several times, because each visit is a separate purchase: stores and general merchandise (Target, Dollar Tree, Simon Mall), grocery/markets/convenience (99 Ranch, Safeway, 7-Eleven), restaurants and fast food, coffee, ride-hailing/taxi (Uber, Lyft), gas/fuel, transit fares per ride, travel/hotels, duty-free, ATM, gift-card loads, and one-off or occasional charity donations. Two or three purchases at a shop is NOT a "membership" or "subscription" — do NOT use the membership/subscription label to make ordinary shopping look recurring.',
+  'ALSO NOT RECURRING = internal money movement, not a commitment to a third party: transfers between the user\'s own accounts, and paying off / autopaying your own credit-card statement. A generic name like "Payment" / "Payment Thank You" — especially money in, or category LOAN_PAYMENTS with no named lender — is a credit-card statement payment, NOT a loan; mark it isRecurring=false. A loan/installment payment is money out to a NAMED lender and IS recurring.',
+  '',
+  'Membership/subscription require a fixed access FEE (low amountVariation) on a regular schedule — if the amounts vary from visit to visit, it is shopping, not a membership. When the merchant is a store/market/restaurant/charity and there is no clear standing plan, answer isRecurring=false. When unsure, prefer isRecurring=false; do not stretch to fill the table.',
+  'Do not invent product types (no "Gift Card/Subscription"): name the payee as it actually is.',
+  '',
+  'canonicalName identifies the distinct recurring item. Strip reference codes, transaction ids, store numbers, and location suffixes so charges of the SAME item share the same canonicalName. But treat different products/plans from one brand as DIFFERENT items with different canonicalNames — e.g. a $10 credit-builder and a $35 loan from the same company are two rows, not one. Do not force unrelated charges to share a name; when the typical amount and purpose differ, the canonicalName should differ too.',
+  '',
+  'Return ONLY a JSON array, one object per input, each: {"ref": <echo>, "isRecurring": bool, "kind": one of subscription|membership|bill|insurance|loan|rent|income|other, "cadence": one of weekly|biweekly|monthly|quarterly|annual|irregular, "canonicalName": clean payee name, "confidence": 0..1}. No prose.',
+].join('\n');
+
+function recurringKey(row: { merchant: string; direction: RecurringDirection }): string {
+  return `${row.direction}|${row.merchant}`;
+}
+
+// Rows merge only when the model gives them the SAME canonical item name (case-
+// insensitive), so identity is entirely the model's call — no hardcoded brand
+// rules. Same item under varying reference codes → one row; different products
+// from one brand (different names) → separate rows.
+function canonicalMergeKey(direction: RecurringDirection, canonicalName: string, rawMerchant: string): string {
+  const name = canonicalName.trim().toLowerCase();
+  return name ? `${direction}|${name}` : `${direction}|raw:${rawMerchant}`;
+}
+
+function dedupeById<T extends { id: string }>(rows: T[]): T[] {
+  const seen = new Map<string, T>();
+  for (const row of rows) if (!seen.has(row.id)) seen.set(row.id, row);
+  return [...seen.values()];
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid]! : Math.round((sorted[mid - 1]! + sorted[mid]!) / 2);
+}
+
+// Charges per year implied by the merged series' date span. Clamped to [1, 52];
+// falls back to monthly when there is only one charge to measure.
+function estimatePeriodsPerYear(dates: string[]): number {
+  if (dates.length < 2) return 12;
+  const times = dates.map((date) => Date.parse(date)).filter((ms) => !Number.isNaN(ms)).sort((a, b) => a - b);
+  if (times.length < 2) return 12;
+  const spanDays = (times[times.length - 1]! - times[0]!) / 86_400_000;
+  if (spanDays <= 0) return 52;
+  return Math.max(1, Math.min(52, 365 / (spanDays / (times.length - 1))));
+}
+
+// Bump when the classifier prompt or candidate shape changes so every cached
+// verdict is recomputed — the signature embeds it, so a version change makes all
+// rows stale at once.
+const RECURRING_CLASSIFIER_VERSION = 8;
+
+// The series shape at classification time. When it changes materially — a new
+// count bucket or a ~$5 shift in the typical amount — the row is re-classified;
+// otherwise the cached verdict stands and no model call is made.
+function recurringSignature(candidate: RecurringCandidate): string {
+  const countBucket = candidate.count < 3 ? String(candidate.count) : candidate.count < 6 ? '3-5' : candidate.count < 12 ? '6-11' : '12+';
+  const amountBucket = Math.round(candidate.typicalMinor / 500);
+  return `v${RECURRING_CLASSIFIER_VERSION}|${countBucket}|${amountBucket}`;
+}
+
+function parseRecurringVerdicts(reply: string, candidates: RecurringCandidate[]): RecurringVerdict[] {
+  const match = reply.match(/\[[\s\S]*\]/);
+  if (!match) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(match[0]);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const verdicts: RecurringVerdict[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object') continue;
+    const ref = Number((entry as Record<string, unknown>).ref);
+    const candidate = candidates[ref];
+    if (!candidate) continue;
+    const record = entry as Record<string, unknown>;
+    const isRecurring = Boolean(record.isRecurring);
+    verdicts.push({
+      merchant: candidate.merchant,
+      direction: candidate.direction,
+      isRecurring,
+      kind: isRecurring ? normalizeChoice(String(record.kind ?? 'other'), RECURRING_KINDS, 'other') : null,
+      cadence: normalizeChoice(String(record.cadence ?? 'irregular'), RECURRING_CADENCES, 'irregular'),
+      canonicalName: record.canonicalName ? String(record.canonicalName).slice(0, 60) : candidate.label,
+      confidence: Math.max(0, Math.min(1, Number(record.confidence))) || 0,
+    });
+  }
+  return verdicts;
 }
 
 // Parse and validate a rule-feed document into specs, throwing AppError on a
@@ -2285,6 +2653,161 @@ async function extractCreditReport(content: Uint8Array, filename: string): Promi
     inquiries: fallbackInquiries,
     suggestions: suggestCreditDisputes(fallbackAccounts, fallbackInquiries),
     textSample: text.slice(0, 1200),
+    text,
+  };
+}
+
+// Best-effort LLM pass over a deterministic extraction: it recovers accounts/inquiries the
+// bureau/generic extractors missed (verify) and gives us structured output for layouts no
+// deterministic extractor recognizes (fallback). Provider-agnostic: `reply` is the caller's
+// llmReply. NEVER trusted blindly — every returned entry must be *grounded* (its creditor/
+// company appears verbatim, modulo case/punctuation, in the report text) or it is dropped, so
+// the model cannot fabricate accounts or inquiries that feed FCRA dispute letters. Deterministic
+// entries stay authoritative; the LLM only adds non-duplicate, grounded rows. Any failure or
+// timeout returns the input unchanged — enrichment is additive and must not break imports.
+export async function enrichCreditExtractionWithLlm(
+  extracted: CreditExtraction,
+  text: string,
+  reply: (input: { system: string; messages: Array<{ role: 'user' | 'assistant'; content: string }>; timeoutMs?: number; maxTokens?: number }) => Promise<string>,
+  meta: { provider: string; model: string; now: string },
+): Promise<{ extraction: CreditExtraction; aiReview: CreditAiReview | null }> {
+  const textNorm = groundKey(text);
+  const budget = text.slice(0, 48_000);
+  const system = [
+    'You extract credit-report data. Output ONLY compact JSON, no prose.',
+    'Shape: {"accounts":[{"creditor","accountMask","accountType","status","balance","creditLimit","dateOpened"}],"inquiries":[{"company","inquiryDate","type"}]}.',
+    'Copy every value VERBATIM from the report text. Never infer, guess, or invent a value.',
+    'If a field is not present, use null. If you are unsure an entry exists, omit it entirely.',
+    'Money as the printed string (e.g. "$1,234"); dates as printed; type is "hard" or "soft".',
+    'List only real tradelines and inquiries — not headings, explanatory text, or addresses.',
+  ].join('\n');
+  const user = [
+    'Report text:',
+    budget,
+    '',
+    'Already extracted (do not repeat these; only add what is missing):',
+    JSON.stringify({
+      accounts: extracted.accounts.map((a) => ({ creditor: a.creditor, accountMask: a.accountMask })),
+      inquiries: extracted.inquiries.map((q) => ({ company: q.company, inquiryDate: q.inquiryDate })),
+    }),
+  ].join('\n');
+
+  let parsed: { accounts?: unknown; inquiries?: unknown };
+  try {
+    const raw = await reply({ system, messages: [{ role: 'user', content: user }], timeoutMs: 60_000, maxTokens: 2_000 });
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return { extraction: extracted, aiReview: null };
+    parsed = JSON.parse(match[0]);
+  } catch {
+    return { extraction: extracted, aiReview: null };
+  }
+
+  const llmAccounts = Array.isArray(parsed.accounts) ? parsed.accounts : [];
+  const llmInquiries = Array.isArray(parsed.inquiries) ? parsed.inquiries : [];
+
+  const addedAccounts: CreditTradeline[] = [];
+  const accountKeys = new Set(extracted.accounts.map(accountKey));
+  for (const raw of llmAccounts) {
+    const account = coerceLlmAccount(raw, textNorm);
+    if (!account) continue;
+    const key = accountKey(account);
+    if (accountKeys.has(key)) continue;
+    accountKeys.add(key);
+    addedAccounts.push(account);
+  }
+
+  const addedInquiries: CreditInquiry[] = [];
+  const inquiryKeys = new Set(extracted.inquiries.map(inquiryKey));
+  for (const raw of llmInquiries) {
+    const inquiry = coerceLlmInquiry(raw, textNorm);
+    if (!inquiry) continue;
+    const key = inquiryKey(inquiry);
+    if (inquiryKeys.has(key)) continue;
+    inquiryKeys.add(key);
+    addedInquiries.push(inquiry);
+  }
+
+  if (!addedAccounts.length && !addedInquiries.length) return { extraction: extracted, aiReview: null };
+
+  const accounts = extracted.accounts.concat(addedAccounts);
+  const inquiries = extracted.inquiries.concat(addedInquiries);
+  return {
+    extraction: {
+      ...extracted,
+      accounts,
+      inquiries,
+      suggestions: suggestCreditDisputes(accounts, inquiries),
+    },
+    aiReview: {
+      provider: meta.provider,
+      model: meta.model,
+      addedAccounts: addedAccounts.length,
+      addedInquiries: addedInquiries.length,
+      ranAt: meta.now,
+    },
+  };
+}
+
+// Normalized key for grounding/dedupe: lowercase, alphanumerics only. Lenient enough to match
+// across case and PDF line-wrap artifacts ("CONSUMERINF O.COM" vs "CONSUMERINFO.COM"), strict
+// enough that a wholly invented name won't be found in the report text.
+function groundKey(value: string): string {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function groundedIn(textNorm: string, value: string): boolean {
+  const key = groundKey(value);
+  return key.length >= 3 && textNorm.includes(key);
+}
+
+function accountKey(account: CreditTradeline): string {
+  return `${groundKey(account.creditor)}|${(account.accountMask || '').replace(/\D/g, '').slice(-4)}`;
+}
+
+function inquiryKey(inquiry: CreditInquiry): string {
+  return `${groundKey(inquiry.company)}|${inquiry.inquiryDate || ''}`;
+}
+
+function moneyStringToMinor(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const digits = String(value).replace(/[^0-9.\-]/g, '');
+  if (!digits) return null;
+  const amount = Number(digits);
+  return Number.isFinite(amount) ? Math.round(amount * 100) : null;
+}
+
+function coerceLlmAccount(raw: unknown, textNorm: string): CreditTradeline | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const item = raw as Record<string, unknown>;
+  const creditor = typeof item.creditor === 'string' ? item.creditor.trim() : '';
+  if (!creditor || !groundedIn(textNorm, creditor)) return null;
+  const status = typeof item.status === 'string' ? item.status.trim() : null;
+  const accountType = typeof item.accountType === 'string' ? item.accountType.trim() : null;
+  return {
+    creditor,
+    accountMask: typeof item.accountMask === 'string' ? item.accountMask.trim() || null : null,
+    accountType,
+    status,
+    isOpen: !/closed|paid and closed/i.test(status || ''),
+    isNegative: /collection|charge[- ]?off|delinquent|late|repossession|foreclosure|derogatory|past due/i.test(status || ''),
+    isRevolving: /credit card|revolving|charge/i.test(accountType || ''),
+    dateOpened: normalizeDate(typeof item.dateOpened === 'string' ? item.dateOpened : ''),
+    dateReported: null,
+    balanceMinor: moneyStringToMinor(item.balance),
+    creditLimitMinor: moneyStringToMinor(item.creditLimit),
+    pastDueMinor: null,
+  };
+}
+
+function coerceLlmInquiry(raw: unknown, textNorm: string): CreditInquiry | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const item = raw as Record<string, unknown>;
+  const company = typeof item.company === 'string' ? item.company.trim() : '';
+  if (!company || isInquiryNoiseLine(company) || !groundedIn(textNorm, company)) return null;
+  return {
+    company,
+    inquiryDate: normalizeDate(typeof item.inquiryDate === 'string' ? item.inquiryDate : ''),
+    type: item.type === 'soft' ? 'soft' : 'hard',
   };
 }
 
@@ -2365,27 +2888,71 @@ function extractExperianTradelines(text: string): CreditTradeline[] {
   return dedupeCreditAccounts(accounts);
 }
 
+// Experian's ACR export lays each inquiry out as:
+//   <company name — often wrapped across several lines>
+//   Inquired on
+//   MM/DD/YYYY            (hard inquiries may list several dates joined by "and"/",")
+//   <address lines>
+//   <description>         hard: "…scheduled to continue on record until <Month Year>."
+//                         soft: a phone number, e.g. "(855) 423-3729"
+// The literal "Inquired on" only appears in the inquiry sections, so we scan the whole
+// document rather than slicing to a heading — the first "Hard Inquiries" string is a
+// table-of-contents anchor, and the real entries sit after a "Soft Inquiries /
+// No public records reported." block, so heading-based slicing misses them entirely.
 function extractExperianInquiries(text: string): CreditInquiry[] {
-  const start = text.indexOf('Hard Inquiries');
-  if (start < 0) return [];
-  const end = text.indexOf('Soft Inquiries', start);
-  const section = text.slice(start, end > start ? end : start + 8000);
-  const lines = section.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (!/Annual Credit Report - Experian|usa\.experian\.com/i.test(text)) return [];
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
   const inquiries: CreditInquiry[] = [];
   for (let index = 0; index < lines.length; index += 1) {
     if (!/^Inquired on$/i.test(lines[index]!)) continue;
-    const date = normalizeDate(lines[index + 1] || '');
-    const companyParts: string[] = [];
-    for (let offset = index - 1; offset >= 0 && companyParts.length < 4; offset -= 1) {
-      const value = lines[offset]!;
-      if (/^(Hard Inquiries|No public records reported\.|This inquiry|on behalf of|Credit Granting\.|Auto loan\.|Unspeciced\.|Real Estate)$/i.test(value)) break;
-      if (/^(PO BOX|\d|\(?\d{3}\)|[A-Z]{2},?\s*\d{5})/.test(value)) break;
-      companyParts.unshift(value);
+
+    // First MM/DD/YYYY that follows the "Inquired on" marker (the most recent date).
+    let date: string | null = null;
+    for (let offset = index + 1; offset < Math.min(index + 4, lines.length); offset += 1) {
+      if (/^Inquired on$/i.test(lines[offset]!)) break;
+      if (/^\d{2}\/\d{2}\/\d{4}$/.test(lines[offset]!)) {
+        date = normalizeDate(lines[offset]!);
+        break;
+      }
     }
-    const company = companyParts.join(' ').trim();
-    if (company && date) inquiries.push({ company, inquiryDate: date, type: 'hard' });
+
+    // Company name: the non-boundary lines immediately preceding "Inquired on".
+    const companyParts: string[] = [];
+    for (let offset = index - 1; offset >= 0 && companyParts.length < 5; offset -= 1) {
+      if (isExperianInquiryBoundary(lines[offset]!)) break;
+      companyParts.unshift(lines[offset]!);
+    }
+    const company = companyParts.join(' ').replace(/\s+/g, ' ').trim();
+
+    // Hard inquiries stay on record; soft inquiries list a phone number instead.
+    let type: CreditInquiry['type'] = 'soft';
+    for (let offset = index + 1; offset < lines.length; offset += 1) {
+      if (/^Inquired on$/i.test(lines[offset]!)) break;
+      if (/continue on record/i.test(lines[offset]!)) { type = 'hard'; break; }
+      if (/^\(\d{3}\)\s?\d{3}-\d{4}$/.test(lines[offset]!)) { type = 'soft'; break; }
+    }
+
+    if (company && date) inquiries.push({ company, inquiryDate: date, type });
   }
   return inquiries;
+}
+
+// Lines that cannot be part of a company name when walking backward from "Inquired on":
+// dates, "and"/"," joiners, addresses, phone numbers, inquiry descriptions, section
+// headings, and Experian's per-page header (timestamp, title, print URL, "18/31").
+function isExperianInquiryBoundary(value: string): boolean {
+  return /^Inquired on$/i.test(value) ||
+    /^\d{2}\/\d{2}\/\d{4}$/.test(value) ||
+    /^(and|,)$/i.test(value) ||
+    /^\d/.test(value) ||
+    /^PO BOX/i.test(value) ||
+    /^\(\d{3}\)/.test(value) ||
+    /[A-Z]{2},?\s*\d{5}/.test(value) ||
+    /(continue on record|on behalf of|this inquiry|real estate|auto loan|credit granting|unspeci|\buntil\b)/i.test(value) ||
+    /(Hard Inquiries|Soft Inquiries|No public records|Personal Information|Public Records)/i.test(value) ||
+    /(Annual Credit Report|usa\.experian\.com)/i.test(value) ||
+    /^\d{1,2}\/\d{1,2}\/\d{2},/.test(value) ||
+    /^\d+\/\d+$/.test(value);
 }
 
 function extractEquifaxTradelines(text: string): CreditTradeline[] {
