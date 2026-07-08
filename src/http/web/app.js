@@ -2050,8 +2050,6 @@ function artifactLabel(type) {
     'fee-waiver-request': 'Draft waiver request',
     'apr-reduction-request': 'Draft APR script',
     'retention-script': 'Draft negotiation script',
-    'cancellation-request': 'Draft cancellation',
-    'trial-cancellation': 'Draft cancel & refund',
   })[type] || 'Draft document';
 }
 
@@ -3043,34 +3041,62 @@ function formatModelSize(bytes) {
 
 function renderSettingsModels(view) {
   const effective = state.llm?.effective || {};
+  // The dropdown selection can be STAGED before it is saved (built-in only), so the
+  // user can download + test the model first. Every other provider commits on change.
+  const selected = state.pendingLlmProvider || effective.provider;
+  if (selected === 'builtin') renderBuiltinModelSettings(view, effective);
+  else renderApiModelSettings(view, effective);
+}
+
+// The API / custom-provider path: key, base URL, and model fields saved via the
+// form. Switching provider commits immediately (so "Test model", which tests the
+// SAVED config, exercises the selection); switching to the built-in model instead
+// stages it for the download → test → save flow.
+function renderApiModelSettings(view, effective) {
   const providers = state.llm?.providers || [];
-  const isBuiltin = effective.provider === 'builtin';
   const providerOptions = providers.map((provider) =>
     `<option value="${esc(provider.id)}"${provider.id === effective.provider ? ' selected' : ''}>${esc(provider.label)}</option>`
   ).join('');
-  // The built-in local model needs no key, base URL, or model names — those
-  // fields only make sense for the API-based and custom providers.
-  const rows = [`<label>Provider<select name="LLM_PROVIDER">${providerOptions}</select></label>`];
-  if (!isBuiltin) {
-    rows.push(
-      settingRow('LLM_API_KEY', 'API key', 'password'),
-      settingRow('LLM_BASE_URL', 'Base URL'),
-      settingRow('LLM_MODEL', 'Extraction model'),
-      settingRow('LLM_CHAT_MODEL', 'Chat model'),
-    );
-  }
-  const subtitle = isBuiltin
-    ? 'Finora is using its built-in local model — no API key required. Download the model once below, then web chat and Telegram run fully on your computer.'
-    : `Web chat and Telegram use the same configured model. Current route: ${esc(effective.label || 'not configured')} / ${esc(effective.chatModel || 'no chat model')}.`;
+  const rows = [
+    `<label>Provider<select name="LLM_PROVIDER">${providerOptions}</select></label>`,
+    settingRow('LLM_API_KEY', 'API key', 'password'),
+    settingRow('LLM_BASE_URL', 'Base URL'),
+    settingRow('LLM_MODEL', 'Extraction model'),
+    settingRow('LLM_CHAT_MODEL', 'Chat model'),
+  ];
+  const subtitle = `Web chat and Telegram use the same configured model. Current route: ${esc(effective.label || 'not configured')} / ${esc(effective.chatModel || 'no chat model')}.`;
   const formSection = settingsForm('Language model', subtitle, rows);
   const actions = formSection.querySelector('.row');
   const test = el('button', 'ghost');
   test.type = 'button';
   test.textContent = 'Test model';
   const status = el('span', 'message');
+  const providerSelect = formSection.querySelector('select[name="LLM_PROVIDER"]');
+  providerSelect.addEventListener('change', async () => {
+    const value = providerSelect.value;
+    if (value === effective.provider) return;
+    if (value === 'builtin') {
+      // Stage the built-in model without saving; its own card gates Save on a test.
+      state.pendingLlmProvider = 'builtin';
+      renderSettings();
+      return;
+    }
+    providerSelect.disabled = true;
+    status.textContent = 'Switching…';
+    status.classList.remove('error');
+    try {
+      state.pendingLlmProvider = null;
+      await saveSettings({ LLM_PROVIDER: value }, 'Provider updated.');
+      renderSettings();
+    } catch (error) {
+      status.textContent = error.message;
+      status.classList.add('error');
+      providerSelect.disabled = false;
+    }
+  });
   test.addEventListener('click', async () => {
     test.disabled = true;
-    status.textContent = 'Testing...';
+    status.textContent = 'Testing…';
     status.classList.remove('error');
     try {
       const result = await api('/v1/llm/test', { method: 'POST' });
@@ -3085,14 +3111,59 @@ function renderSettingsModels(view) {
   });
   actions.append(test, status);
   view.appendChild(formSection);
-  if (isBuiltin) renderBuiltinModelCard(view, state.llm?.builtin);
 }
 
-function renderBuiltinModelCard(view, initial) {
+// The built-in local-model path, in a single card: provider dropdown, model
+// download, a Test button that exercises the in-process engine directly, and a
+// Save that is gated on a successful test. Selecting built-in only STAGES it —
+// nothing is persisted until Save, matching "download → test → save". Switching
+// to another provider from here commits immediately. When the built-in model is
+// already the saved provider, there is nothing to gate, so no Save is shown.
+function renderBuiltinModelSettings(view, effective) {
+  const providers = state.llm?.providers || [];
+  const builtinActive = effective.provider === 'builtin';
   const sec = el('div', 'sec');
   view.appendChild(sec);
 
+  const providerOptions = providers.map((provider) =>
+    `<option value="${esc(provider.id)}"${provider.id === 'builtin' ? ' selected' : ''}>${esc(provider.label)}</option>`
+  ).join('');
+  const subtitle = builtinActive
+    ? 'Finora is using its built-in local model — no API key required. It runs fully on your computer.'
+    : 'Finora’s built-in local model runs fully on your computer — no API key. Download it once, test it, then Save to switch.';
+  sec.innerHTML = `
+    <div class="sechdr"><h3>Language model</h3></div>
+    <div class="cardsub">${subtitle}</div>
+    <form class="formgrid settingsform"><label>Provider<select name="LLM_PROVIDER">${providerOptions}</select></label></form>
+    <div data-status style="margin-top:10px"></div>
+    <div class="row" style="gap:8px;margin-top:10px" data-actions></div>
+    <div class="row" style="align-items:center;gap:8px;margin-top:8px"><span class="message" data-msg></span></div>`;
+
+  const providerSelect = sec.querySelector('select[name="LLM_PROVIDER"]');
+  const statusBox = sec.querySelector('[data-status]');
+  const actionRow = sec.querySelector('[data-actions]');
+  const msg = sec.querySelector('[data-msg]');
+  // No test gate when built-in is already active; otherwise Save unlocks on a pass.
+  let tested = builtinActive;
+
+  providerSelect.addEventListener('change', async () => {
+    const value = providerSelect.value;
+    if (value === 'builtin') return;
+    providerSelect.disabled = true;
+    try {
+      state.pendingLlmProvider = null;
+      await saveSettings({ LLM_PROVIDER: value }, 'Provider updated.');
+      renderSettings();
+    } catch (error) {
+      msg.textContent = error.message;
+      msg.classList.add('error');
+      providerSelect.disabled = false;
+    }
+  });
+
   const render = (model) => {
+    statusBox.innerHTML = '';
+    actionRow.innerHTML = '';
     if (!model) return;
     const download = model.download || {};
     const downloading = download.state === 'downloading';
@@ -3108,48 +3179,90 @@ function renderBuiltinModelCard(view, initial) {
     else if (downloading) statusLine = `<span class="message">Downloading… ${percent}% (${formatModelSize(done)} / ${formatModelSize(total)})</span>`;
     else if (errored) statusLine = `<span class="message error">Download failed: ${esc(download.error || 'unknown error')}</span>`;
     else statusLine = `<span class="message">Not downloaded yet — about ${formatModelSize(total)} to download once.</span>`;
-
     const bar = downloading
       ? `<div style="height:8px;border-radius:4px;background:rgba(127,127,127,0.2);overflow:hidden;margin:10px 0"><div style="height:100%;width:${percent}%;background:var(--accent,#4f8cff);transition:width .3s"></div></div>`
       : '';
+    statusBox.innerHTML = `<div class="cardsub"><code>${esc(model.label || 'Built-in model')}</code> — downloaded from a public model host to <code>~/.finora/models</code>. Your data never leaves your computer.</div>${bar}<div class="row" style="align-items:center;gap:8px;margin-top:8px">${statusLine}</div>`;
 
-    sec.innerHTML = `
-      <div class="sechdr"><h3>Built-in model</h3></div>
-      <div class="cardsub">${esc(model.label)} — a local open-source model, downloaded from a public model host to <code>~/.finora/models</code>. Your data never leaves your computer.</div>
-      ${bar}
-      <div class="row" style="align-items:center;gap:8px;margin-top:8px">${statusLine}</div>
-      <div class="row" style="gap:8px;margin-top:8px" data-actions></div>`;
-
-    const actions = sec.querySelector('[data-actions]');
     if (!model.engineAvailable) return;
+
     if (downloading) {
       const cancel = el('button', 'ghost');
       cancel.type = 'button';
       cancel.textContent = 'Cancel';
       cancel.addEventListener('click', () => act('/v1/llm/model/download', 'DELETE', cancel));
-      actions.append(cancel);
-    } else if (ready) {
-      const remove = el('button', 'ghost');
-      remove.type = 'button';
-      remove.textContent = 'Delete download';
-      remove.addEventListener('click', () => {
-        if (!confirm(`Delete the downloaded model (${formatModelSize(total)})? You can download it again later.`)) return;
-        act('/v1/llm/model', 'DELETE', remove);
-      });
-      actions.append(remove);
-    } else {
+      actionRow.append(cancel);
+      return;
+    }
+
+    if (!ready) {
       const start = el('button', 'primary');
       start.type = 'button';
       start.textContent = errored ? 'Retry download' : `Download model (${formatModelSize(total)})`;
       start.addEventListener('click', () => act('/v1/llm/model/download', 'POST', start));
-      actions.append(start);
+      actionRow.append(start);
+      return;
     }
+
+    // Ready: Test (+ Delete), and — when switching to built-in — a Save gated on
+    // a successful test.
+    const test = el('button', 'ghost');
+    test.type = 'button';
+    test.textContent = 'Test model';
+    let save = null;
+    if (!builtinActive) {
+      save = el('button', 'primary');
+      save.type = 'button';
+      save.textContent = 'Save';
+      save.disabled = !tested;
+      save.addEventListener('click', async () => {
+        save.disabled = true;
+        try {
+          state.pendingLlmProvider = null;
+          await saveSettings({ LLM_PROVIDER: 'builtin' }, 'Built-in model saved.');
+          renderSettings();
+        } catch (error) {
+          msg.textContent = error.message;
+          msg.classList.add('error');
+          save.disabled = false;
+        }
+      });
+    }
+    test.addEventListener('click', async () => {
+      test.disabled = true;
+      msg.textContent = 'Testing…';
+      msg.classList.remove('error');
+      try {
+        const result = await api('/v1/llm/model/test', { method: 'POST' });
+        msg.textContent = `Connected: ${result.provider} / ${result.model}`;
+        tested = true;
+        if (save) save.disabled = false;
+        toast('Model connection OK.');
+      } catch (error) {
+        msg.textContent = error.message;
+        msg.classList.add('error');
+      } finally {
+        test.disabled = false;
+      }
+    });
+    actionRow.append(test);
+    if (save) actionRow.append(save);
+    const remove = el('button', 'ghost');
+    remove.type = 'button';
+    remove.textContent = 'Delete download';
+    remove.addEventListener('click', () => {
+      if (!confirm(`Delete the downloaded model (${formatModelSize(total)})? You can download it again later.`)) return;
+      act('/v1/llm/model', 'DELETE', remove);
+    });
+    actionRow.append(remove);
   };
 
   const act = async (path, method, button) => {
     if (button) button.disabled = true;
     try {
       const model = await api(path, { method });
+      // Deleting the weights invalidates any prior successful test.
+      if (path === '/v1/llm/model' && method === 'DELETE') tested = builtinActive;
       render(model);
       poll();
     } catch (error) {
@@ -3168,12 +3281,12 @@ function renderBuiltinModelCard(view, initial) {
         render(model);
         if (model.download?.state === 'downloading') poll();
       } catch {
-        // Transient error — try again on the next tick.
         poll();
       }
     }, 1000);
   };
 
+  const initial = state.llm?.builtin;
   render(initial);
   if (initial?.download?.state === 'downloading') poll();
 }

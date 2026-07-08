@@ -1016,7 +1016,7 @@ export class SqliteFinanceRepository implements FinanceRepository {
           MAX(CASE WHEN rn_desc = 1 THEN amt END) AS latest_minor,
           median(CASE WHEN rn_desc > 1 THEN amt END) AS typical_minor,
           MIN(amt) AS min_minor, MAX(amt) AS max_minor,
-          MAX(1.0, MIN(52.0, 365.0 / (MAX(0.5, julianday(MAX(date)) - julianday(MIN(date))) / MAX(1, COUNT(*) - 1)))) AS periods_per_year,
+          MAX(1.0, MIN(365.0, 365.0 / (MAX(0.5, julianday(MAX(date)) - julianday(MIN(date))) / MAX(1, COUNT(*) - 1)))) AS periods_per_year,
           sqrt(MAX(0.0, AVG(1.0 * amt * amt) - AVG(1.0 * amt) * AVG(1.0 * amt))) / NULLIF(AVG(1.0 * amt), 0) AS amount_cv,
           CASE WHEN COUNT(gap_days) >= 2
             THEN sqrt(MAX(0.0, AVG(gap_days * gap_days) - AVG(gap_days) * AVG(gap_days))) / NULLIF(AVG(gap_days), 0)

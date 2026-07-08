@@ -81,7 +81,6 @@ export class LocalModelEngine {
   private totalSize = 0;
   private downloadError: string | undefined;
   private downloader: ModelDownloader | null = null;
-  private downloadPromise: Promise<void> | null = null;
   private loaded: LoadedModel | null = null;
   private loadPromise: Promise<LoadedModel> | null = null;
   private generateChain: Promise<unknown> = Promise.resolve();
@@ -131,7 +130,9 @@ export class LocalModelEngine {
     this.downloadedSize = 0;
     this.totalSize = BUILTIN_MODEL.approxSizeBytes;
 
-    this.downloadPromise = (async () => {
+    // Fire-and-forget: callers poll status via downloadState, so the promise is
+    // not retained.
+    void (async () => {
       try {
         await mkdir(this.modelsDir, { recursive: true });
         const { createModelDownloader } = await import('node-llama-cpp');
@@ -153,7 +154,6 @@ export class LocalModelEngine {
         this.downloadError = error instanceof Error ? error.message : String(error);
       } finally {
         this.downloader = null;
-        this.downloadPromise = null;
       }
     })();
 

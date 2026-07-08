@@ -44,7 +44,7 @@ import {
   normalizeCurrency,
   requireText,
 } from '../domain/invariants.js';
-import type { Account, AccountBalance, BrokerageTransaction, ChatSessionRecord, CreditReportRecord, FactExpectation, Finding, ImportRecord, MerchantCandidate, MerchantIdentity, QuestionRecord, RecurringCandidate, RecurringClassification, RecurringDirection, RuleFactNeed, RuleRecord, RuleSpec, Transaction, TransactionInput } from '../domain/models.js';
+import type { Account, ChatSessionRecord, CreditReportRecord, FactExpectation, Finding, ImportRecord, MerchantCandidate, RecurringCandidate, RecurringClassification, RecurringDirection, RuleFactNeed, RuleSpec, Transaction, TransactionInput } from '../domain/models.js';
 import { builtinRuleSpecs, evaluateRules, executionStrategy, inferRule } from './rules-engine.js';
 import type { EvaluationData, QuestionDraft } from './rules-engine.js';
 import { clampChatInput, generateChatReply, LLM_PROVIDERS, providerContextTokens, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
@@ -250,22 +250,6 @@ const ARTIFACT_SPECS: Record<string, ArtifactSpec> = {
       ARTIFACT_DRAFTER_PREAMBLE,
       'Write a short phone or chat retention script pushing back on a subscription price increase.',
       'Reference the previous vs new amount, ask to keep the prior rate or a retention offer, and end with a polite cancel-if-not fallback.',
-    ].join('\n'),
-  },
-  'recurring-subscriptions': {
-    artifactType: 'cancellation-request',
-    title: 'Cancellation request',
-    system: [
-      ARTIFACT_DRAFTER_PREAMBLE,
-      'Write a clear cancellation request for the named subscription, asking for written confirmation and the effective date.',
-    ].join('\n'),
-  },
-  'new-recurring-charge': {
-    artifactType: 'trial-cancellation',
-    title: 'Cancel & refund request',
-    system: [
-      ARTIFACT_DRAFTER_PREAMBLE,
-      'Write a request to cancel a recently converted free trial and ask for a refund of the most recent charge, citing its date and amount.',
     ].join('\n'),
   },
 };
@@ -1390,7 +1374,7 @@ export class FinanceService {
   }
 
   // The user facts each rule declares, with satisfaction, plus the deduped set of
-  // still-unanswered facts. Computed from rule_specs.facts ∪ the facts table so a
+  // still-unanswered facts. Computed from rules.facts ∪ the facts table so a
   // rule's needs show regardless of whether it is enabled — the UI uses byKind to
   // gate a rule and pending to prompt for the answers. Facts stay decoupled: a rule
   // references keys, and one answered key satisfies every rule that needs it.
@@ -1712,6 +1696,27 @@ export class FinanceService {
         provider: llm.provider,
         model: llm.chatModel,
       });
+    }
+  }
+
+  // Tests the built-in local model directly through the in-process engine, so the
+  // Settings flow can verify it works BEFORE the provider is saved (unlike
+  // testLocalModel, which tests whatever provider is currently persisted).
+  async testBuiltinModel() {
+    try {
+      const reply = await this.localModel.generateReply({
+        system: 'You are a connectivity test. Reply with a short OK.',
+        messages: [{ role: 'user', content: 'Confirm Finora can reach this model.' }],
+        timeoutMs: 60_000,
+        maxTokens: 24,
+      });
+      return { ok: true, provider: 'builtin', model: BUILTIN_MODEL.id, local: true, reply };
+    } catch (error) {
+      if (error instanceof ModelNotDownloadedError) {
+        throw new AppError('invalid_input', error.message, { provider: 'builtin', reason: 'needs_download' });
+      }
+      const message = error instanceof Error ? error.message : 'The built-in model request failed';
+      throw new AppError('external_service', `LLM connection failed: ${message}`, { provider: 'builtin', model: BUILTIN_MODEL.id });
     }
   }
 
@@ -2229,12 +2234,16 @@ export class FinanceService {
         const best = group.verdicts.slice().sort((a, b) => b.confidence - a.confidence)[0]!;
         const amounts = transactions.map((tx) => Math.abs(tx.amountMinor));
         const amountMinor = median(amounts);
-        const periodsPerYear = estimatePeriodsPerYear(transactions.map((tx) => tx.date));
+        const dates = transactions.map((tx) => tx.date);
+        const periodsPerYear = estimatePeriodsPerYear(dates);
+        // Cadence is derived from the observed gaps, not the model's guess: the
+        // model only decides whether a series is recurring (best.cadence is left
+        // in the classification cache but no longer drives the label).
         return {
           merchant: best.canonicalName || group.verdicts[0]!.merchant,
           direction: group.direction,
           kind: best.kind,
-          cadence: best.cadence,
+          cadence: deriveCadence(medianGapDays(dates)),
           category: group.category,
           count: transactions.length,
           amountMinor,
@@ -2606,8 +2615,34 @@ function estimatePeriodsPerYear(dates: string[]): number {
   const times = dates.map((date) => Date.parse(date)).filter((ms) => !Number.isNaN(ms)).sort((a, b) => a - b);
   if (times.length < 2) return 12;
   const spanDays = (times[times.length - 1]! - times[0]!) / 86_400_000;
-  if (spanDays <= 0) return 52;
-  return Math.max(1, Math.min(52, 365 / (spanDays / (times.length - 1))));
+  if (spanDays <= 0) return 365;
+  // Bound at daily (365/yr). The old 52/yr (weekly) ceiling made a daily series
+  // (e.g. a transit fare) annualize as weekly and read as "weekly" downstream.
+  return Math.max(1, Math.min(365, 365 / (spanDays / (times.length - 1))));
+}
+
+// Median number of days between consecutive charges — the factual basis for the
+// cadence label. Returns null when there are too few dates to measure a gap.
+function medianGapDays(dates: string[]): number | null {
+  const times = dates.map((date) => Date.parse(date)).filter((ms) => !Number.isNaN(ms)).sort((a, b) => a - b);
+  if (times.length < 2) return null;
+  const gaps: number[] = [];
+  for (let index = 1; index < times.length; index += 1) gaps.push((times[index]! - times[index - 1]!) / 86_400_000);
+  return median(gaps);
+}
+
+// Cadence is a computable fact — derive it from the observed median gap rather
+// than asking the model to name it. Buckets are centered on the common billing
+// rhythms with generous tolerances (a "monthly" bill drifts a few days).
+function deriveCadence(gapDays: number | null): string {
+  if (gapDays == null) return 'irregular';
+  if (gapDays <= 2) return 'daily';
+  if (gapDays <= 10) return 'weekly';
+  if (gapDays <= 20) return 'biweekly';
+  if (gapDays <= 45) return 'monthly';
+  if (gapDays <= 100) return 'quarterly';
+  if (gapDays <= 250) return 'semiannual';
+  return 'yearly';
 }
 
 // Bump when the classifier prompt or candidate shape changes so every cached

@@ -87,14 +87,18 @@ stays synchronous:
    as *features*, not gates.
 2. **Classification** (`FinanceService.classifyRecurringWithModel`) sends the
    candidates to the LLM in one batched call and stores the verdicts —
-   `is_recurring`, `kind`, `cadence`, `canonical_name`, `confidence` — in
+   `is_recurring`, `kind`, `canonical_name`, `confidence` — in
    `recurring_classifications`, keyed by merchant + direction. Only candidates
    whose shape *signature* changed are re-classified, so the model is called
    sparingly. There is no heuristic fallback: with no model configured the table
    returns `model_required` and the UI routes the user to model settings.
 3. **Consumption**: the recurring `D` rules and the `/v1/recurring` table just
    `JOIN recurring_classifications` and filter on `is_recurring` / `kind`. The
-   engine reads a table; the model ran out-of-band.
+   engine reads a table; the model ran out-of-band. **Cadence** (daily / weekly /
+   biweekly / monthly / …) is *not* the model's call — it is derived
+   deterministically from the observed median gap between charges (`deriveCadence`
+   in `finance-service.ts`), so a daily fare reads as daily rather than depending
+   on a model guess.
 
 ### Merchant identity (canonical vendors)
 
@@ -251,7 +255,7 @@ the tier the user has granted the rule:
 
 - **Observer** — surface only.
 - **Advisor** — surface plus a generated artifact or checklist (a draft letter, a
-  cancellation script, a step list).
+  negotiation script, a step list).
 - **Guardian** — execute after explicit one-tap approval.
 - **Navigator** — execute automatically within user-set limits.
 
@@ -263,7 +267,7 @@ and revocable.
 Detection, the tier/confidence capping, and the **Advisor** tier are implemented:
 `FinanceService.generateFindingArtifact()` drafts the document for a finding —
 a dispute letter (duplicate charge, cross-account double payment), a fee-waiver
-request, an APR-reduction or retention script, a cancellation — grounded strictly
+request, or an APR-reduction / retention script — grounded strictly
 in that finding's own transactions (see `ARTIFACT_SPECS`). The model only turns
 the finding's facts into prose; it never invents a figure, and **Finora never
 sends anything** — it drafts for the user to review and send themselves, so the

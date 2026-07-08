@@ -372,7 +372,7 @@ Date: 05/01/2026
 
   it('reports fact-gated rules and their unanswered facts via /v1/facts/needs', async () => {
     const { base } = await httpFixture();
-    // employer-match is alwaysOn, so its needs surface without creating any rule.
+    // employer-match ships active by default, so its needs surface without adopting any rule.
     const needs = await (await fetch(`${base}/v1/facts/needs`)).json() as {
       byKind: Record<string, { facts: Array<{ key: string; satisfied: boolean; expects: string }> }>;
       pending: Array<{ key: string; expects: string }>;

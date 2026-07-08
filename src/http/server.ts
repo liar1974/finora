@@ -345,6 +345,9 @@ async function route(
   if (url.pathname === '/v1/llm/model' && method === 'GET') {
     return sendJson(response, 200, await service.getBuiltinModelStatus());
   }
+  if (url.pathname === '/v1/llm/model/test' && method === 'POST') {
+    return sendJson(response, 200, await service.testBuiltinModel());
+  }
   if (url.pathname === '/v1/llm/model/download' && method === 'POST') {
     return sendJson(response, 200, await service.downloadBuiltinModel());
   }

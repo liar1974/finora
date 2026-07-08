@@ -96,8 +96,8 @@ interface FactNeed {
   expects?: 'currency' | 'percent' | 'number' | 'date' | 'text'; // value shape, for input normalization
 }
 
-// The built-in rule definitions, authored in code and seeded into rule_specs as
-// data (see docs/rules-design.md). keywords is a RegExp for readability; it is
+// The built-in rule definitions, authored in code and seeded into the `rules`
+// table as data (see docs/rules-design.md). keywords is a RegExp for readability; it is
 // stored as a source string. Every rule carries a SQL query that selects the
 // finding-draft columns.
 interface Evaluator {

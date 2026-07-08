@@ -410,7 +410,6 @@ describe('FinanceService', () => {
         actionTier: 'advisor',
         scope: 'banking',
         cadence: 'monthly',
-        alwaysOn: true,
         keywords: 'commute',
         sql: "SELECT 'commute' AS key, 'x' AS title, 'x' AS detail, 'x' AS value, 0.5 AS confidence, '' AS evidence_summary, '' AS evidence_records, :now_iso AS created_at WHERE 0",
         prompt: null,
@@ -696,6 +695,29 @@ describe('FinanceService', () => {
     expect(subs.some((t) => t.includes('NETFLIX'))).toBe(true);
     expect(subs.some((t) => t.includes('UBER'))).toBe(false);
     expect(subs.some((t) => t.includes('CLIPPER'))).toBe(false); // a bill, not a subscription
+
+    // Cadence is DERIVED from the observed gaps, not the classifier's label (the
+    // stub always returns 'monthly'): the paycheck's 14-day spacing reads as
+    // biweekly, while Netflix's ~30-day spacing reads as monthly.
+    expect(recurring.items.find((i) => i.merchant.toUpperCase() === 'CHASE PAYROLL')?.cadence).toBe('biweekly');
+    expect(recurring.items.find((i) => i.merchant.toUpperCase() === 'NETFLIX')?.cadence).toBe('monthly');
+
+    // Subscription-cancellation drafts were removed, so the finding advertises no
+    // artifactType (its "Cancel if you no longer use it" action remains).
+    const netflixSub = service.listFindings().find((f) => f.kind === 'recurring-subscriptions');
+    expect(netflixSub?.action?.artifactType ?? null).toBeNull();
+
+    service.close();
+  });
+
+  it('tests the built-in model directly and reports when it must be downloaded', async () => {
+    // The engine points at an empty models dir, so the built-in test surfaces a
+    // needs-download signal rather than testing whatever provider is saved.
+    const service = application();
+    await expect(service.testBuiltinModel()).rejects.toMatchObject({
+      code: 'invalid_input',
+      details: { reason: 'needs_download' },
+    });
     service.close();
   });
 
