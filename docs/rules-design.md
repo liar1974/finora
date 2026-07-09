@@ -18,8 +18,9 @@ money at stake." The ranking function, not any single rule, is the product.
   plus a **SQL query** (deterministic) or a prompt (LLM). Built-in rules ship as a
   seed loaded into that table on startup; new rules are added or changed as rows —
   no code, no redeploy. The engine is a generic interpreter that runs whatever
-  rows the table holds, so built-in and downloaded rules are identical to it. (A
-  future job can poll a versioned rule-definition file and upsert changed rows.)
+  rows the table holds, so built-in and downloaded rules are identical to it. A
+  shipped over-the-air feed adds new built-in rules to installed versions without a
+  release (see *Over-the-air rule updates*).
 - **One finding contract.** Every rule, regardless of how it is evaluated,
   emits the same `Finding` shape. Downstream ranking, delivery, and action never
   need to know which engine produced a finding.
@@ -338,11 +339,10 @@ into the `rules` table on startup, enabled and active by default:
   Pure-LLM summaries (weekly digest, spending narrative, suspicious-charge
   judgment) wait on it.
 - **Over-the-air refinements.** The rule feed is shipped (see "Over-the-air rule
-  updates" above). What is deferred: **periodic polling on a timer** (rule updates
-  are infrequent, so startup-once plus the manual button is enough); **auth-header
-  support** for private-repo feeds (public raw URLs work today); and **feed
-  signature verification**, deferred until rules are distributed beyond a trusted
-  first-party URL.
+  updates" above) and syncs shortly after boot and once a day. What is deferred:
+  **auth-header support** for private-repo feeds (public raw URLs work today); and
+  **feed signature verification**, deferred until rules are distributed beyond a
+  trusted first-party URL.
 - **Deeper data products.** Rules needing Plaid **Liabilities** (card APR and
   interest projection, payment-due, student-loan and mortgage tracking) — the
   account is entitled, but Liabilities is not yet ingested. **Income** rules need a

@@ -191,9 +191,10 @@ under **Delivery**, and create alert rules under **Rules & Facts**.
 Finora comes with a **built-in local model** and uses it by default, so you can
 start chatting right away — no API key and no separate install. The model's
 weights aren't part of the download; the first time you want to use chat, open
-**Settings → Models** and click **Download model** (about 2 GB, fetched once
-from a public open-source model host and saved to a file on your computer).
-After that, chat and Telegram/Slack replies run entirely on your machine.
+**Settings → Models**, click **Download model** (about 2 GB, fetched once from a
+public open-source model host and saved to a file on your computer), then **Test
+model** and **Save**. After that, chat and Telegram/Slack replies run entirely on
+your machine.
 
 Prefer a hosted model instead? Pick **Anthropic**, **OpenAI**, **Google**, or
 any OpenAI-compatible provider from the **Provider** dropdown and paste your
