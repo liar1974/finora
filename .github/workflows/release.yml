@@ -79,6 +79,14 @@ jobs:
           # and auto-update has nothing to verify against. The key was generated
           # without a password, so no password secret is needed.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # AppImage bundling shells out to linuxdeploy + appimagetool, which
+          # normally mount their payload through FUSE. GitHub-hosted runners have no
+          # FUSE device, so those tools abort and Tauri reports "failed to run
+          # linuxdeploy". APPIMAGE_EXTRACT_AND_RUN makes them self-extract instead of
+          # mounting; NO_STRIP skips the strip pass that fails on the AppRun binary
+          # linuxdeploy downloads. Both are no-ops on macOS/Windows.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          NO_STRIP: true
 
       - name: Disambiguate macOS updater bundle name
         # Both macOS architectures emit an identically named "Finora.app.tar.gz",
