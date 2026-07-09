@@ -1,2 +1,7 @@
 allowBuilds:
   esbuild: true
+  # Runs node-llama-cpp's postinstall so its prebuilt native binary is fetched into
+  # node_modules — the desktop release bundles it for local model inference. Without
+  # this, pnpm 10+ blocks the build script and `--frozen-lockfile` fails CI with
+  # ERR_PNPM_IGNORED_BUILDS.
+  node-llama-cpp: true
