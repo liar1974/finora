@@ -27,6 +27,17 @@ function runPnpm(args) {
   run('pnpm', args);
 }
 
+// npm ships as npm.cmd on Windows, which execFileSync cannot spawn directly
+// (ENOENT). Route through cmd.exe so PATHEXT resolves it, mirroring runPnpm.
+function runNpm(args) {
+  if (process.platform === 'win32') {
+    run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'npm', ...args]);
+    return;
+  }
+
+  run('npm', args);
+}
+
 await rm(desktop, { recursive: true, force: true });
 await rm(buildOutput, { recursive: true, force: true });
 runPnpm(['build']);
@@ -66,6 +77,6 @@ await writeFile(
     2,
   )}\n`,
 );
-run('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--prefix', backendDir]);
+runNpm(['install', '--omit=dev', '--no-audit', '--no-fund', '--prefix', backendDir]);
 
 console.log(`Desktop resources prepared at ${desktop}`);
