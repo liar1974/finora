@@ -2039,8 +2039,28 @@ function buildFeedItems() {
     value: findingImpactLabel(insight),
     amount: insight.dollarImpactMinor || 0,
     id: insight.id,
+    kind: insight.kind,
+    // evidence.records[0] for a connection finding is "provider:external_id" — the
+    // handle we use to jump to the right connection in Settings for re-auth.
+    connectionKey: insight.evidence?.records?.[0] || null,
     artifactType: insight.action?.artifactType || null,
   }));
+}
+
+// A connection finding (expiring soon, or already lapsed) that we can route to a
+// one-tap Plaid re-auth in Settings. Plaid-only: SnapTrade uses a different flow.
+function isReconnectItem(item) {
+  return (item.kind === 'connection-health' || item.kind === 'connection-consent-expiring')
+    && typeof item.connectionKey === 'string' && item.connectionKey.startsWith('plaid:');
+}
+
+// Send the user to Settings ▸ Bank/Brokerage with the target connection highlighted,
+// where the existing update-mode reconnect button lives.
+function openReconnectFromInsight(item) {
+  const key = item.connectionKey || '';
+  state.settingsTab = 'accounts';
+  state.highlightConnection = key.slice(key.indexOf(':') + 1) || null;
+  setSection('settings');
 }
 
 // Short label for the "draft this for me" button, by artifact type.
@@ -2096,8 +2116,12 @@ function renderFeedZone(panel, title, zone, items) {
       const draftBtn = item.artifactType
         ? `<button type="button" class="draftbtn" title="Draft a document you can review and send yourself">✎ ${esc(artifactLabel(item.artifactType))}</button>`
         : '';
-      row.innerHTML = `<div class="feedico ${esc(zone)}">${esc(item.icon)}</div><div class="feedcopy"><div class="t">${esc(item.title)}</div><div class="d">${esc(item.detail)}</div></div><div class="feedactions"><span class="valuechip ${item.amount < 0 ? 'neg' : item.amount > 0 ? 'pos' : ''}">${esc(item.value)}</span>${draftBtn}<button type="button" class="dismissbtn" title="Dismiss" aria-label="Dismiss insight">×</button></div>`;
+      const reconnectBtn = isReconnectItem(item)
+        ? `<button type="button" class="reconnectbtn" title="Reconnect this bank in Settings">↻ Reconnect</button>`
+        : '';
+      row.innerHTML = `<div class="feedico ${esc(zone)}">${esc(item.icon)}</div><div class="feedcopy"><div class="t">${esc(item.title)}</div><div class="d">${esc(item.detail)}</div></div><div class="feedactions"><span class="valuechip ${item.amount < 0 ? 'neg' : item.amount > 0 ? 'pos' : ''}">${esc(item.value)}</span>${reconnectBtn}${draftBtn}<button type="button" class="dismissbtn" title="Dismiss" aria-label="Dismiss insight">×</button></div>`;
       row.querySelector('.dismissbtn').addEventListener('click', () => dismissInsightRow(row, item));
+      if (reconnectBtn) row.querySelector('.reconnectbtn').addEventListener('click', () => openReconnectFromInsight(item));
       if (item.artifactType) row.querySelector('.draftbtn').addEventListener('click', (event) => generateArtifact(event.currentTarget, row, item));
       block.appendChild(row);
     }
@@ -3945,6 +3969,22 @@ function plaidAccountGroups(accounts) {
   return [...groups.values()].sort((a, b) => a.institution.localeCompare(b.institution));
 }
 
+// Whether a Plaid connection needs the user to re-authenticate — either it has
+// already lapsed (status login_required) or its OAuth consent expires within 3 days.
+// Returns null when the connection is healthy.
+function connectionReauthState(connection) {
+  if (!connection) return null;
+  if (connection.status === 'login_required') return { level: 'error', label: 'Reconnect needed' };
+  const expiresAt = connection.metadata?.consentExpiresAt;
+  if (expiresAt) {
+    const days = Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 86_400_000);
+    if (Number.isFinite(days) && days <= 3) {
+      return { level: 'warn', label: days <= 0 ? 'Expired — reconnect' : `Expires in ${days} day${days === 1 ? '' : 's'}` };
+    }
+  }
+  return null;
+}
+
 function renderAccountManager(view, provider, accounts) {
   const sec = el('div', 'sec');
   sec.innerHTML = '<div class="sechdr"><h3>Manage accounts</h3><button class="primary pageaction" type="button">Add Plaid account</button></div>';
@@ -3960,16 +4000,18 @@ function renderAccountManager(view, provider, accounts) {
   const list = el('div', 'accountlist');
   for (const group of plaidAccountGroups(accounts)) {
     const row = el('div', 'accountrow');
+    const reauth = connectionReauthState(group.connection);
     const accountsMarkup = group.accounts.map((item) => {
       const type = String(item.type || 'account').replaceAll('_', ' ');
       const profile = accountProfile(item);
       return `<div class="accountidentity accountmember"><div class="accticon ${esc(profile.cls)}" title="${esc(profile.label)}" aria-label="${esc(profile.label)}" role="img">${accountIcon(profile.icon)}</div><div><div class="nm">${esc(item.name)}</div><div class="sub">${esc(type)} - ${esc(item.currency)}</div></div></div>`;
     }).join('');
-    row.innerHTML = `<div class="accountgroup"><div class="nm">${esc(group.institution)}</div><div class="accountmembers">${accountsMarkup}</div></div>`;
+    const badge = reauth ? `<span class="reauthbadge ${esc(reauth.level)}">${esc(reauth.label)}</span>` : '';
+    row.innerHTML = `<div class="accountgroup"><div class="nm">${esc(group.institution)}${badge}</div><div class="accountmembers">${accountsMarkup}</div></div>`;
     const actions = el('div', 'row');
-    const edit = el('button', 'ghost');
+    const edit = el('button', reauth ? 'primary' : 'ghost');
     edit.type = 'button';
-    edit.textContent = 'Edit';
+    edit.textContent = reauth ? 'Reconnect' : 'Edit';
     edit.addEventListener('click', async () => {
       edit.disabled = true;
       try {
@@ -3982,8 +4024,14 @@ function renderAccountManager(view, provider, accounts) {
     });
     actions.append(edit);
     row.appendChild(actions);
+    // Landed here from an insight's Reconnect button: highlight the target row.
+    if (state.highlightConnection && group.connection?.externalId === state.highlightConnection) {
+      row.classList.add('highlight');
+      setTimeout(() => row.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50);
+    }
     list.appendChild(row);
   }
+  state.highlightConnection = null;
   sec.appendChild(list);
   view.appendChild(sec);
 }

@@ -249,6 +249,93 @@ describe('FinanceService', () => {
     service.close();
   });
 
+  it('parks a re-auth-required provider connection and surfaces a reconnect nudge to Telegram', async () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    repository.saveAppSettings({
+      TELEGRAM_BOT_TOKEN: 'test-token',
+      TELEGRAM_CHAT_ID: '123',
+      NOTIFICATION_CHANNEL: 'telegram',
+    });
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
+
+    // Mirror what syncPlaid does when Plaid returns ITEM_LOGIN_REQUIRED: the Item is
+    // parked (status flipped off 'active') with the error recorded, instead of the
+    // error bubbling up and aborting the whole sync pass. A parked Item is skipped by
+    // the sync loop's status === 'active' filter, so a dead token is not retried.
+    repository.saveProviderConnection({
+      provider: 'plaid',
+      externalId: 'item-chase',
+      institution: 'Chase',
+      status: 'login_required',
+      accessToken: 'access-chase',
+      cursor: 'cursor-chase',
+      metadata: { error: { code: 'ITEM_LOGIN_REQUIRED', message: 'login required', reauthRequired: true } },
+    });
+
+    // The connection-health rule turns the parked status into a high-severity finding.
+    const health = service.listFindings().find((finding) => finding.kind === 'connection-health');
+    expect(health).toBeDefined();
+    expect(health?.title).toContain('Chase');
+    // The finding carries a Reconnect action so the UI can offer a one-tap re-auth.
+    expect(health?.action?.label).toBe('Reconnect');
+
+    const sent: Record<string, unknown>[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      sent.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return Response.json({ ok: true, result: {} });
+    }));
+
+    await expect(service.deliverInsightsToIm()).resolves.toMatchObject({ sent: true });
+    expect(sent.some((message) => String(message.text).includes('Chase'))).toBe(true);
+    service.close();
+  });
+
+  it('warns 3 days before a Plaid consent expires, and stops once the expiry is far out', async () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    repository.saveAppSettings({
+      TELEGRAM_BOT_TOKEN: 'test-token',
+      TELEGRAM_CHAT_ID: '123',
+      NOTIFICATION_CHANNEL: 'telegram',
+    });
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
+
+    // An active Plaid connection whose OAuth consent lapses in 2 days — captured from
+    // item.consent_expiration_time during sync and stashed in the connection metadata.
+    const soon = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    repository.saveProviderConnection({
+      provider: 'plaid',
+      externalId: 'item-chase',
+      institution: 'Chase',
+      status: 'active',
+      accessToken: 'access-chase',
+      cursor: 'cursor-chase',
+      metadata: { consentExpiresAt: soon },
+    });
+
+    const expiring = service.listFindings().find((finding) => finding.kind === 'connection-consent-expiring');
+    expect(expiring).toBeDefined();
+    expect(expiring?.title).toContain('Chase');
+    expect(expiring?.action?.label).toBe('Reconnect');
+
+    // Delivered to Telegram like any other finding (the button is web/app-only).
+    const sent: Record<string, unknown>[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      sent.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return Response.json({ ok: true, result: {} });
+    }));
+    await expect(service.deliverInsightsToIm()).resolves.toMatchObject({ sent: true });
+    expect(sent.some((message) => String(message.text).includes('Chase'))).toBe(true);
+
+    // Push the expiry 30 days out (still active): outside the 3-day window, no warning.
+    repository.saveProviderConnection({
+      provider: 'plaid',
+      externalId: 'item-chase',
+      metadata: { consentExpiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString() },
+    });
+    expect(service.listFindings().some((finding) => finding.kind === 'connection-consent-expiring')).toBe(false);
+    service.close();
+  });
+
   it('reconcileProviderTransactions preserves the row id and deleteTransactionsByFingerprints removes rows', () => {
     const repository = new SqliteFinanceRepository(':memory:');
     const account = repository.createAccount({

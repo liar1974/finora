@@ -255,6 +255,12 @@ tbody tr.clickable:hover td { background: var(--card2); }
 .feedactions .draftbtn { padding: 4px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card2); color: var(--brandd); font-size: 12px; font-weight: 650; white-space: nowrap; cursor: pointer; }
 .feedactions .draftbtn:hover:not(:disabled) { border-color: var(--brand); color: var(--brand); }
 .feedactions .draftbtn:disabled { opacity: .6; cursor: default; }
+.feedactions .reconnectbtn { padding: 4px 10px; border-radius: 8px; border: 1px solid var(--red); background: var(--card); color: var(--red); font-size: 12px; font-weight: 650; white-space: nowrap; cursor: pointer; }
+.feedactions .reconnectbtn:hover:not(:disabled) { background: var(--red); color: #fff; }
+.reauthbadge { margin-left: 8px; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 650; vertical-align: middle; }
+.reauthbadge.error { background: rgba(220,38,38,.12); color: var(--red); }
+.reauthbadge.warn { background: rgba(180,83,9,.12); color: var(--amber); }
+.accountrow.highlight { background: rgba(176,90,56,.08); box-shadow: inset 3px 0 0 var(--brand); }
 .artifactbox { grid-column: 1 / -1; margin: 2px 0 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
 .artifacttitle { font-weight: 750; font-size: 12.5px; color: var(--fg); margin-bottom: 6px; }
 .artifacttext { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); }

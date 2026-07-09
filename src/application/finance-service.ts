@@ -95,6 +95,7 @@ interface ProviderSyncResult {
   modified: number;
   removed: number;
   skipped: number;
+  errors: number;
 }
 
 interface CreditTradeline {
@@ -595,6 +596,7 @@ export class FinanceService {
           accountIds,
           error: null,
           removedAt: null,
+          consentExpiresAt: accountsResponse.data.item.consent_expiration_time ?? null,
         },
       });
       return { ok: true, itemId, institution: institutionName, accounts: accountIds.length, connection };
@@ -634,7 +636,7 @@ export class FinanceService {
       throw new AppError('invalid_input', 'No saved Plaid access token is available for this Item.', { itemId: id });
     }
     try {
-      const accountMap = await this.refreshPlaidAccounts(this.plaidClient(), id, secret.accessToken, connection);
+      const { accounts: accountMap, consentExpiresAt } = await this.refreshPlaidAccounts(this.plaidClient(), id, secret.accessToken, connection);
       const liveProviderAccountIds = new Set(accountMap.keys());
       let removedAccounts = 0;
       for (const account of this.accountsForPlaidItem(id, connection)) {
@@ -654,6 +656,7 @@ export class FinanceService {
           accountIds: [...liveProviderAccountIds],
           error: null,
           removedAt: null,
+          consentExpiresAt,
           lastUpdateAt: new Date().toISOString(),
         },
       });
@@ -722,12 +725,22 @@ export class FinanceService {
 
   private async runProviderSync(): Promise<{ plaid?: ProviderSyncResult; snaptrade?: ProviderSyncResult; insights?: { count: number; sent: boolean; reason?: string } }> {
     const result: { plaid?: ProviderSyncResult; snaptrade?: ProviderSyncResult; insights?: { count: number; sent: boolean; reason?: string } } = {};
+    // Providers are isolated from one another: a hard failure in one (bad creds, a
+    // provider outage) must not skip the others or the insight delivery at the end.
     if (this.plaidConnectionsReady()) {
-      result.plaid = await this.syncPlaid();
+      try {
+        result.plaid = await this.syncPlaid();
+      } catch (error) {
+        console.warn('Finora Plaid sync failed:', error instanceof Error ? error.message : error);
+      }
     }
     if (this.snapTradeReady()) {
-      result.snaptrade = await this.syncSnapTrade();
-      this.repository.saveAppSettings({ SNAPTRADE_LAST_AUTO_SYNC_AT: new Date().toISOString() });
+      try {
+        result.snaptrade = await this.syncSnapTrade();
+        this.repository.saveAppSettings({ SNAPTRADE_LAST_AUTO_SYNC_AT: new Date().toISOString() });
+      } catch (error) {
+        console.warn('Finora SnapTrade sync failed:', error instanceof Error ? error.message : error);
+      }
     }
     result.insights = await this.deliverInsightsToIm();
     return result;
@@ -739,75 +752,102 @@ export class FinanceService {
     for (const connection of this.repository.listProviderConnections().filter((item) => item.provider === 'plaid' && item.status === 'active' && item.hasAccessToken)) {
       const secret = this.repository.getProviderConnectionSecret('plaid', connection.externalId);
       if (!secret?.accessToken) continue;
-      const accountMap = await this.refreshPlaidAccounts(client, connection.externalId, secret.accessToken, connection);
-      out.accounts += accountMap.size;
-      let nextCursor = secret.cursor || undefined;
-      let hasMore = true;
-      while (hasMore) {
-        const response = await client.transactionsSync({
-          access_token: secret.accessToken,
-          ...(nextCursor ? { cursor: nextCursor } : {}),
+      // Isolate each Item: one failing connection must not abort the pass and freeze
+      // every other provider. A re-auth-required Item (e.g. ITEM_LOGIN_REQUIRED) is
+      // parked by flipping its status off 'active' so the next sync skips it — the
+      // connection-health rule then surfaces a reconnect nudge, and completePlaidUpdate
+      // restores it. Transient errors leave the Item active so the next tick retries.
+      try {
+        await this.syncPlaidConnection(client, connection, { accessToken: secret.accessToken, cursor: secret.cursor, metadata: secret.metadata }, out);
+      } catch (error) {
+        out.errors += 1;
+        const info = plaidErrorInfo(error);
+        this.repository.saveProviderConnection({
+          provider: 'plaid',
+          externalId: connection.externalId,
+          institution: connection.institution,
+          ...(info.reauthRequired ? { status: 'login_required' } : {}),
+          metadata: { error: { code: info.code, message: info.message, at: new Date().toISOString(), reauthRequired: info.reauthRequired } },
         });
-        const data = response.data;
-        const transactions: ProviderTransactionInput[] = [];
-        for (const transaction of [...data.added, ...data.modified]) {
-          const account = accountMap.get(transaction.account_id);
-          if (!account || account.domain === 'brokerage') continue;
-          const pfc = transaction.personal_finance_category;
-          transactions.push({
-            accountId: account.id,
-            sourceId: transaction.transaction_id,
-            date: transaction.date,
-            description: transaction.name,
-            amountMinor: -toMinor(transaction.amount),
-            currency: transaction.iso_currency_code || transaction.unofficial_currency_code || account.currency,
-            category: pfc?.primary || (Array.isArray(transaction.category) ? transaction.category.join(' / ') : null),
-            pending: transaction.pending,
-            metadata: transaction as unknown as Record<string, unknown>,
-            fingerprint: `plaid:${transaction.transaction_id}`,
-            // A posted transaction supersedes its pending predecessor in place so
-            // the stable row id (and therefore the notification identity) survives.
-            supersedesFingerprint: transaction.pending_transaction_id
-              ? `plaid:${transaction.pending_transaction_id}`
-              : null,
-          });
-        }
-        const saved = this.repository.reconcileProviderTransactions(transactions);
-        out.transactions += saved.inserted;
-        out.skipped += saved.skipped;
-        out.modified += data.modified.length + saved.updated;
-        // Plaid lists the pending id in `removed` once a charge posts; delete those
-        // rows so the ledger keeps a single entry per purchase.
-        const removedByAccount = new Map<string, string[]>();
-        for (const removed of data.removed) {
-          const account = removed.account_id ? accountMap.get(removed.account_id) : undefined;
-          if (!account || !removed.transaction_id) continue;
-          const fingerprints = removedByAccount.get(account.id) ?? [];
-          fingerprints.push(`plaid:${removed.transaction_id}`);
-          removedByAccount.set(account.id, fingerprints);
-        }
-        for (const [accountId, fingerprints] of removedByAccount) {
-          out.removed += this.repository.deleteTransactionsByFingerprints(accountId, fingerprints);
-        }
-        nextCursor = data.next_cursor;
-        hasMore = data.has_more;
+        console.warn(`Finora Plaid sync failed for ${connection.institution ?? connection.externalId}:`, info.message);
       }
-      const investments = await this.syncPlaidInvestments(client, secret.accessToken, accountMap);
-      out.holdings += investments.holdings;
-      out.transactions += investments.transactions;
-      out.skipped += investments.skipped;
-      this.repository.saveProviderConnection({
-        provider: 'plaid',
-        externalId: connection.externalId,
-        institution: connection.institution,
-        status: 'active',
-        environment: connection.environment,
-        accessToken: secret.accessToken,
-        cursor: nextCursor,
-        metadata: { ...secret.metadata, cursor: nextCursor, lastSyncAt: new Date().toISOString() },
-      });
     }
     return out;
+  }
+
+  private async syncPlaidConnection(
+    client: PlaidApi,
+    connection: { externalId: string; institution: string | null; environment: string | null },
+    secret: { accessToken: string; cursor: string | null; metadata: Record<string, unknown> },
+    out: ProviderSyncResult,
+  ): Promise<void> {
+    const { accounts: accountMap, consentExpiresAt } = await this.refreshPlaidAccounts(client, connection.externalId, secret.accessToken, connection);
+    out.accounts += accountMap.size;
+    let nextCursor = secret.cursor || undefined;
+    let hasMore = true;
+    while (hasMore) {
+      const response = await client.transactionsSync({
+        access_token: secret.accessToken,
+        ...(nextCursor ? { cursor: nextCursor } : {}),
+      });
+      const data = response.data;
+      const transactions: ProviderTransactionInput[] = [];
+      for (const transaction of [...data.added, ...data.modified]) {
+        const account = accountMap.get(transaction.account_id);
+        if (!account || account.domain === 'brokerage') continue;
+        const pfc = transaction.personal_finance_category;
+        transactions.push({
+          accountId: account.id,
+          sourceId: transaction.transaction_id,
+          date: transaction.date,
+          description: transaction.name,
+          amountMinor: -toMinor(transaction.amount),
+          currency: transaction.iso_currency_code || transaction.unofficial_currency_code || account.currency,
+          category: pfc?.primary || (Array.isArray(transaction.category) ? transaction.category.join(' / ') : null),
+          pending: transaction.pending,
+          metadata: transaction as unknown as Record<string, unknown>,
+          fingerprint: `plaid:${transaction.transaction_id}`,
+          // A posted transaction supersedes its pending predecessor in place so
+          // the stable row id (and therefore the notification identity) survives.
+          supersedesFingerprint: transaction.pending_transaction_id
+            ? `plaid:${transaction.pending_transaction_id}`
+            : null,
+        });
+      }
+      const saved = this.repository.reconcileProviderTransactions(transactions);
+      out.transactions += saved.inserted;
+      out.skipped += saved.skipped;
+      out.modified += data.modified.length + saved.updated;
+      // Plaid lists the pending id in `removed` once a charge posts; delete those
+      // rows so the ledger keeps a single entry per purchase.
+      const removedByAccount = new Map<string, string[]>();
+      for (const removed of data.removed) {
+        const account = removed.account_id ? accountMap.get(removed.account_id) : undefined;
+        if (!account || !removed.transaction_id) continue;
+        const fingerprints = removedByAccount.get(account.id) ?? [];
+        fingerprints.push(`plaid:${removed.transaction_id}`);
+        removedByAccount.set(account.id, fingerprints);
+      }
+      for (const [accountId, fingerprints] of removedByAccount) {
+        out.removed += this.repository.deleteTransactionsByFingerprints(accountId, fingerprints);
+      }
+      nextCursor = data.next_cursor;
+      hasMore = data.has_more;
+    }
+    const investments = await this.syncPlaidInvestments(client, secret.accessToken, accountMap);
+    out.holdings += investments.holdings;
+    out.transactions += investments.transactions;
+    out.skipped += investments.skipped;
+    this.repository.saveProviderConnection({
+      provider: 'plaid',
+      externalId: connection.externalId,
+      institution: connection.institution,
+      status: 'active',
+      environment: connection.environment,
+      accessToken: secret.accessToken,
+      cursor: nextCursor,
+      metadata: { ...secret.metadata, cursor: nextCursor, lastSyncAt: new Date().toISOString(), error: null, consentExpiresAt },
+    });
   }
 
   private async refreshPlaidAccounts(
@@ -815,8 +855,11 @@ export class FinanceService {
     itemId: string,
     accessToken: string,
     connection: { institution: string | null; environment: string | null },
-  ): Promise<Map<string, { id: string; currency: string; domain: string }>> {
+  ): Promise<{ accounts: Map<string, { id: string; currency: string; domain: string }>; consentExpiresAt: string | null }> {
     const response = await client.accountsGet({ access_token: accessToken });
+    // OAuth institutions (e.g. Chase) report when the user's consent lapses; capture it so a
+    // rule can warn ahead of the hard ITEM_LOGIN_REQUIRED. Null for non-OAuth items.
+    const consentExpiresAt = response.data.item.consent_expiration_time ?? null;
     const map = new Map<string, { id: string; currency: string; domain: string }>();
     const asOfDate = new Date().toISOString().slice(0, 10);
     const institution = connection.institution || normalizeProviderInstitution('Plaid');
@@ -860,7 +903,7 @@ export class FinanceService {
       }
     }
     this.repository.saveProviderBalances(balances);
-    return map;
+    return { accounts: map, consentExpiresAt };
   }
 
   private async syncPlaidInvestments(
@@ -2887,7 +2930,27 @@ function emptyProviderSyncResult(): ProviderSyncResult {
     modified: 0,
     removed: 0,
     skipped: 0,
+    errors: 0,
   };
+}
+
+// Plaid Item errors that require the user to re-authenticate through Link update
+// mode. Retrying with the same token cannot recover these, so the connection is
+// parked until the user reconnects; every other error is treated as transient.
+const PLAID_REAUTH_CODES = new Set([
+  'ITEM_LOGIN_REQUIRED',
+  'PENDING_EXPIRATION',
+  'ITEM_LOCKED',
+  'USER_PERMISSION_REVOKED',
+  'USER_ACCOUNT_REVOKED',
+  'ACCESS_NOT_GRANTED',
+]);
+
+function plaidErrorInfo(error: unknown): { code: string | null; message: string; reauthRequired: boolean } {
+  const data = (error as { response?: { data?: { error_code?: string; error_message?: string } } })?.response?.data;
+  const code = data?.error_code ?? null;
+  const message = data?.error_message || (error instanceof Error ? error.message : String(error));
+  return { code, message, reauthRequired: code !== null && PLAID_REAUTH_CODES.has(code) };
 }
 
 function toMinor(value: number | string | null | undefined): number {

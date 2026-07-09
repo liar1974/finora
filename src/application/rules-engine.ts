@@ -382,6 +382,7 @@ const connectionHealth: Evaluator = {
         || '; token saved: ' || (CASE WHEN access_token IS NOT NULL THEN 'yes' ELSE 'no' END)
         || '; cursor saved: ' || (CASE WHEN cursor IS NOT NULL THEN 'yes' ELSE 'no' END) || '.' AS detail,
       'Review' AS value,
+      'Reconnect' AS action_label,
       0.95 AS confidence,
       'high' AS severity,
       'Provider connection is not fully healthy.' AS evidence_summary,
@@ -389,6 +390,40 @@ const connectionHealth: Evaluator = {
       updated_at AS created_at
     FROM provider_connections
     WHERE status <> 'active' OR access_token IS NULL OR (provider = 'plaid' AND cursor IS NULL)
+  `,
+};
+
+// Proactive companion to connection-health: Plaid OAuth banks (Chase, etc.) expire
+// the user's consent on a fixed schedule, after which the item returns
+// ITEM_LOGIN_REQUIRED and only a Link update-mode re-auth restores it. We capture
+// item.consent_expiration_time each sync (into the connection's metadata) and warn
+// while the item is still healthy, so the user reconnects before any data gap. The
+// status = 'active' guard hands an already-lapsed item over to connection-health.
+const connectionConsentExpiring: Evaluator = {
+  kind: 'connection-consent-expiring',
+  domain: 'connections',
+  executionClass: 'D',
+  defaultTier: 'observer',
+  scope: 'all',
+  keywords: /connection|consent|expire|reconnect|plaid|login/,
+  sql: `
+    SELECT
+      provider || ':' || external_id AS key,
+      COALESCE(institution, provider) || ' reconnect needed soon' AS title,
+      'This bank login expires on a schedule. Reconnect ' || COALESCE(institution, provider)
+        || ' by ' || date(json_extract(metadata, '$.consentExpiresAt')) || ' to avoid a data gap.' AS detail,
+      'Reconnect' AS value,
+      'Reconnect' AS action_label,
+      0.9 AS confidence,
+      'medium' AS severity,
+      'Plaid OAuth consent expires within 3 days.' AS evidence_summary,
+      provider || ':' || external_id AS evidence_records,
+      updated_at AS created_at
+    FROM provider_connections
+    WHERE provider = 'plaid'
+      AND status = 'active'
+      AND json_extract(metadata, '$.consentExpiresAt') IS NOT NULL
+      AND julianday(json_extract(metadata, '$.consentExpiresAt')) - julianday(:now_iso) BETWEEN 0 AND 3
   `,
 };
 
@@ -1272,6 +1307,7 @@ const cardTesting: Evaluator = {
 // large-transaction fallbacks.
 const EVALUATORS: Evaluator[] = [
   connectionHealth,
+  connectionConsentExpiring,
   staleData,
   creditUtilization,
   cardInterest,
