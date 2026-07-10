@@ -1,16 +1,11 @@
-# Finora
+# Finora(https://riffcash.com)
 
-**See all your money in one place — privately, on your own computer.**
+**Your personal financial assistant. All data are on your own computer.**
 
 Finora is a personal financial assistant that brings your bank accounts,
 investments, and credit reports together into one clear picture — then helps you
-make sense of it. It surfaces what needs your attention, and you can ask it
-questions about your own money in plain language. It runs on your own laptop and
-keeps everything in a single file on your machine. There is no Finora server:
-your ledger is never uploaded to us or to a finance company. The only things that
-ever leave your machine are ones you set up yourself — syncing a bank you
-connected, alerts you push to your own Telegram/Slack, and (if you choose a cloud
-AI provider instead of the built-in local model) the context for that AI request.
+make sense of it. It runs on your own laptop and
+keeps everything in a single file on your machine.
 
 Finora never moves your money, never stores your bank passwords anywhere online,
 and never gives financial advice. It helps you *see*, *understand*, and act on
@@ -23,16 +18,12 @@ your own numbers — every decision stays yours.
 - **Everything in one place.** Connect your bank and brokerage and add your
   credit report, then review all your accounts, spending, and investments
   together — without handing your full financial history to a website.
-- **Your data stays with you.** All of your information lives in one file on your
+- **Your data stays with you.** All of your information lives in your
   own computer. There is no Finora cloud account and no copy of your money kept
   online.
-- **No messy duplicates.** Finora keeps your data clean — re-syncing an account
-  or re-uploading the same credit report won't create duplicate entries.
 - **Know what actually needs your attention.** Finora surfaces things like
   unusual spending, high credit-card usage, idle cash, and out-of-date accounts,
   so you're not hunting for problems yourself.
-- **Alerts you can trust.** Before an alert is ever turned on, Finora shows you
-  exactly what it will watch for and when it will notify you.
 - **Get insights where you already are.** Have Finora send rule-triggered
   insights to your own **Telegram** chat or a **Slack** channel — great for a
   personal heads-up or a shared household or advisor channel. Your data still
@@ -42,8 +33,7 @@ your own numbers — every decision stays yours.
   AnnualCreditReport.com and review it on your own computer, without giving it to
   a third party.
 - **Ask questions locally.** Finora includes a built-in local AI model option:
-  pick a model in **Settings → Models** (a range of local models, roughly
-  0.8–7 GB depending on the one you choose), download it once, and chat about your
+  pick a model in **Settings → Models**, download it once, and chat about your
   finances with no API key, running entirely on your computer. Prefer a hosted
   model? Bring your own Anthropic, OpenAI, Google, or Ollama setup in the same
   place.
@@ -64,11 +54,6 @@ immediately — just open the file and follow the prompts to install.
 first version may not be published — check the
 [Releases page](https://github.com/liar1974/finora/releases).)*
 
-**Updates are automatic.** When a newer version is published, Finora shows an
-**Update available** button at the bottom of the sidebar — one click downloads
-the update, verifies it, installs it, and relaunches. You won't need to come
-back here to upgrade.
-
 ## Getting started
 
 Once Finora is installed, you're a few minutes away from your first overview:
@@ -79,10 +64,8 @@ Once Finora is installed, you're a few minutes away from your first overview:
    PDF you download from AnnualCreditReport.com.
 3. **Explore.** Browse your spending in **Banking**, see charts in
    **Dashboards**, and check **Insights** for anything that needs attention.
-4. **(Optional) Get notified.** In **Settings → Delivery**, connect **Telegram**
-   or **Slack** so rule-triggered insights come to you — see the
-   [onboarding guide](docs/onboarding.md#5-get-insights-in-telegram-or-slack)
-   for the step-by-step.
+4. **Get notified.** In **Settings → Delivery**, connect **Telegram**
+   or **Slack** so rule-triggered insights come to you.
 
 ![Settings → Delivery, connecting Telegram or Slack](docs/media/screenshots/delivery.png)
 
@@ -128,18 +111,12 @@ data only**. Each clip loops automatically — click it to open the full video.
   data — a dispute letter for a duplicate charge, a fee-waiver request, or a
   negotiation script — but only for you to review and send yourself; it never
   sends anything.
-- **Connections are optional.** If you connect a bank or brokerage, those
-  credentials are saved only on your computer and used only to talk to that
-  provider.
 - **AI runs where you choose.** Finora has no AI service of its own. Chat and
   AI-assisted insights run on the **built-in local model** (fully on your
   machine — nothing leaves), or, if you set up a cloud provider (Anthropic,
   OpenAI, Google, Ollama, or any OpenAI-compatible endpoint), Finora sends just
   that request's context to the provider *you* chose, under their terms. There is
   no Finora server in the middle either way.
-- **Upgrades keep a safety copy.** Before ever changing how your data is stored,
-  Finora writes a one-time backup file (`finora.db.backup-v…`) next to your data
-  so an update can't lose anything.
 
 ## Questions or problems
 
