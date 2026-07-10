@@ -74,6 +74,17 @@ jobs:
       - name: Stage desktop resources
         run: pnpm build:desktop-resources
 
+      - name: Set version from tag
+        # Make the release tag the single source of truth for the build version.
+        # Tauri bakes tauri.conf.json's version into every bundle filename, so
+        # without this a v0.1.1 release would still emit Finora_0.1.0_* files and
+        # a latest.json advertising 0.1.1 over a 0.1.0 bundle (update loop). This
+        # stamps the tag's version into all three manifests before building.
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: node scripts/set-version.mjs "${RELEASE_TAG#v}"
+
       - name: Build Tauri app
         run: pnpm exec tauri build ${{ matrix.tauri-args }} --verbose
         env:
