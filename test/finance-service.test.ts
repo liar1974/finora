@@ -1,27 +1,13 @@
 import { readFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FinanceService, enrichCreditExtractionWithLlm } from '../src/application/finance-service.js';
 import type { MerchantIdentifier, RecurringClassifier } from '../src/application/ports.js';
-import { LocalModelEngine } from '../src/infrastructure/local-model.js';
 import { CsvStatementParser } from '../src/infrastructure/parsers/csv-parser.js';
 import { OfxStatementParser } from '../src/infrastructure/parsers/ofx-parser.js';
 import { SqliteFinanceRepository } from '../src/infrastructure/sqlite-repository.js';
+import { daysAgo, missingModelEngine as localModel } from './helpers.js';
 
 afterEach(() => vi.unstubAllGlobals());
-
-// Recency-window rules (large-transaction, executed-trades, duplicate-charge, …)
-// filter on the transaction date against the real clock, so fixtures must be dated
-// relative to now — a hardcoded date would silently fall out of the window and rot
-// the test weeks later.
-const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
-
-// A models dir that will never contain weights, so the built-in engine reports
-// the model as absent without touching the native runtime.
-function localModel() {
-  return new LocalModelEngine(join(tmpdir(), 'finora-test-models-missing'));
-}
 
 // A deterministic stand-in for the LLM recurring classifier: recognizes a few
 // known recurring payees by name and rejects everything else (Uber, duty-free,
@@ -77,6 +63,23 @@ function application(classifier?: RecurringClassifier, identifier?: MerchantIden
 }
 
 describe('FinanceService', () => {
+  it('does not auto-sync SnapTrade even when its credentials are configured', async () => {
+    // SnapTrade auto-sync is intentionally parked behind SNAPTRADE_SYNC_ENABLED=false
+    // (it duplicated transactions for accounts also reachable another way, inflating
+    // realized P&L). Even with full credentials saved, a provider sync must not touch
+    // SnapTrade — this locks the gate so it can't be silently re-enabled.
+    const repository = new SqliteFinanceRepository(':memory:');
+    repository.saveAppSettings({
+      SNAPTRADE_CLIENT_ID: 'client',
+      SNAPTRADE_CONSUMER_KEY: 'consumer',
+      SNAPTRADE_USER_ID: 'user',
+      SNAPTRADE_USER_SECRET: 'secret',
+    });
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
+    const result = await service.syncProviders();
+    expect(result.snaptrade).toBeUndefined();
+  });
+
   it('delivers each active insight to Telegram once until it resolves', async () => {
     const repository = new SqliteFinanceRepository(':memory:');
     repository.saveAppSettings({

@@ -48,7 +48,7 @@ import type { Account, ChatSessionRecord, CreditReportRecord, FactExpectation, F
 import { builtinRuleSpecs, evaluateRules, executionStrategy, inferRule } from './rules-engine.js';
 import type { EvaluationData, QuestionDraft } from './rules-engine.js';
 import { clampChatInput, generateChatReply, LLM_PROVIDERS, providerContextTokens, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
-import { BUILTIN_MODEL, LocalModelEngine, ModelNotDownloadedError } from '../infrastructure/local-model.js';
+import { getBuiltinModel, LocalModelEngine, ModelNotDownloadedError } from '../infrastructure/local-model.js';
 import { TelegramGateway, sendTelegramMessage } from '../infrastructure/telegram-gateway.js';
 
 export interface ChatMessage {
@@ -255,6 +255,11 @@ const ARTIFACT_SPECS: Record<string, ArtifactSpec> = {
   },
 };
 
+// SnapTrade sync is intentionally off: it duplicated transactions for accounts also
+// imported elsewhere, inflating realized P&L. Flip to true to re-enable once
+// cross-provider transaction de-duplication exists.
+const SNAPTRADE_SYNC_ENABLED = false;
+
 export class FinanceService {
   private readonly telegramGateway: TelegramGateway;
   private backgroundServicesStarted = false;
@@ -452,7 +457,7 @@ export class FinanceService {
       clean[key] = String(value);
     }
     const nextProviderId = clean.LLM_PROVIDER?.toLowerCase();
-    const currentProviderId = (this.repository.getAppSetting('LLM_PROVIDER') || 'ollama').toLowerCase();
+    const currentProviderId = (this.repository.getAppSetting('LLM_PROVIDER') || 'builtin').toLowerCase();
     if (nextProviderId && nextProviderId !== currentProviderId) {
       const provider = LLM_PROVIDERS.find((candidate) => candidate.id === nextProviderId);
       if (provider) {
@@ -734,7 +739,10 @@ export class FinanceService {
         console.warn('Finora Plaid sync failed:', error instanceof Error ? error.message : error);
       }
     }
-    if (this.snapTradeReady()) {
+    // SnapTrade sync is disabled: for accounts also reachable another way it produced
+    // duplicate transactions (and inflated realized P&L). Re-enable by flipping
+    // SNAPTRADE_SYNC_ENABLED once cross-provider de-duplication is in place.
+    if (SNAPTRADE_SYNC_ENABLED && this.snapTradeReady()) {
       try {
         result.snaptrade = await this.syncSnapTrade();
         this.repository.saveAppSettings({ SNAPTRADE_LAST_AUTO_SYNC_AT: new Date().toISOString() });
@@ -1278,7 +1286,7 @@ export class FinanceService {
     if (!spec) return { status: 'unsupported' };
 
     const llm = this.llmConfig();
-    const modelReady = llm.provider === 'builtin' ? await this.localModel.weightsPresent() : llm.keySet;
+    const modelReady = llm.provider === 'builtin' ? await this.localModel.weightsPresent(llm.model) : llm.keySet;
     if (!modelReady) {
       return { status: 'model_required', provider: llm.provider, needsDownload: llm.provider === 'builtin' };
     }
@@ -1745,21 +1753,29 @@ export class FinanceService {
   // Tests the built-in local model directly through the in-process engine, so the
   // Settings flow can verify it works BEFORE the provider is saved (unlike
   // testLocalModel, which tests whatever provider is currently persisted).
-  async testBuiltinModel() {
+  async testBuiltinModel(modelId?: string) {
+    const model = getBuiltinModel(modelId);
     try {
-      const reply = await this.localModel.generateReply({
-        system: 'You are a connectivity test. Reply with a short OK.',
-        messages: [{ role: 'user', content: 'Confirm Finora can reach this model.' }],
-        timeoutMs: 60_000,
-        maxTokens: 24,
-      });
-      return { ok: true, provider: 'builtin', model: BUILTIN_MODEL.id, local: true, reply };
+      const reply = await this.localModel.generateReply(
+        {
+          system: 'You are a connectivity test. Reply with a short OK.',
+          messages: [{ role: 'user', content: 'Confirm Finora can reach this model.' }],
+          timeoutMs: 60_000,
+          maxTokens: 24,
+          // A connectivity check doesn't need reasoning; disabling it keeps the test
+          // fast and avoids a reasoning model spending the tiny budget inside <think>
+          // and returning an empty response.
+          disableThinking: true,
+        },
+        model.id,
+      );
+      return { ok: true, provider: 'builtin', model: model.id, local: true, reply };
     } catch (error) {
       if (error instanceof ModelNotDownloadedError) {
         throw new AppError('invalid_input', error.message, { provider: 'builtin', reason: 'needs_download' });
       }
       const message = error instanceof Error ? error.message : 'The built-in model request failed';
-      throw new AppError('external_service', `LLM connection failed: ${message}`, { provider: 'builtin', model: BUILTIN_MODEL.id });
+      throw new AppError('external_service', `LLM connection failed: ${message}`, { provider: 'builtin', model: model.id });
     }
   }
 
@@ -1785,24 +1801,31 @@ export class FinanceService {
         defaultChatModel: provider.defaultChatModel,
         local: Boolean(provider.local),
       })),
-      builtin: await this.localModel.status(),
+      builtinModels: await this.localModel.statusAll(),
     };
   }
 
-  getBuiltinModelStatus() {
-    return this.localModel.status();
+  getBuiltinModelStatus(modelId?: string) {
+    return this.localModel.status(modelId);
   }
 
-  downloadBuiltinModel() {
-    return this.localModel.startDownload();
+  downloadBuiltinModel(modelId?: string) {
+    return this.localModel.startDownload(modelId);
   }
 
-  cancelBuiltinModelDownload() {
-    return this.localModel.cancelDownload();
+  cancelBuiltinModelDownload(modelId?: string) {
+    return this.localModel.cancelDownload(modelId);
   }
 
-  deleteBuiltinModel() {
-    return this.localModel.deleteModel();
+  deleteBuiltinModel(modelId?: string) {
+    return this.localModel.deleteModel(modelId);
+  }
+
+  // Free disk by keeping only the chosen (just-saved) built-in model's weights.
+  // Returns the refreshed status of every model so the caller can re-render.
+  async pruneBuiltinModels(keepModelId?: string) {
+    await this.localModel.pruneOtherModels(keepModelId);
+    return { models: await this.localModel.statusAll() };
   }
 
   async importCreditReport(input: { filename: string; content: Uint8Array }) {
@@ -1828,7 +1851,7 @@ export class FinanceService {
     // before the empty-check so a fully-unrecognized report can still be salvaged.
     let aiReview: CreditAiReview | null = null;
     const llm = this.llmConfig();
-    const modelReady = llm.provider === 'builtin' ? await this.localModel.weightsPresent() : llm.keySet;
+    const modelReady = llm.provider === 'builtin' ? await this.localModel.weightsPresent(llm.model) : llm.keySet;
     if (modelReady) {
       const enriched = await enrichCreditExtractionWithLlm(
         extracted,
@@ -2070,14 +2093,14 @@ export class FinanceService {
   }): Promise<string> {
     // Single choke point for context sizing: clamp the prompt to the active provider's window
     // so no provider silently truncates (Ollama) or hard-errors (builtin) on oversized input.
-    const contextTokens = config.provider === 'builtin' ? BUILTIN_MODEL.contextSize : providerContextTokens(config);
+    const contextTokens = config.provider === 'builtin' ? getBuiltinModel(config.model).contextSize : providerContextTokens(config);
     const clamped = clampChatInput(input, contextTokens);
     if (clamped.truncated) {
       console.warn(`LLM input clamped to fit ${config.provider} context (~${contextTokens} tokens)`);
     }
     const request = { ...input, system: clamped.system, messages: clamped.messages };
     if (config.provider === 'builtin') {
-      return this.localModel.generateReply(request);
+      return this.localModel.generateReply(request, config.model);
     }
     return generateChatReply({ config, ...request });
   }
@@ -2119,7 +2142,7 @@ export class FinanceService {
     // Presence only — a cheap fs check, not the native-engine load status() does.
     // If weights exist but the engine can't run, the classifier call fails and is
     // caught, leaving prior verdicts untouched.
-    if (llm.provider === 'builtin') return this.localModel.weightsPresent();
+    if (llm.provider === 'builtin') return this.localModel.weightsPresent(llm.model);
     return llm.keySet;
   }
 
@@ -2163,7 +2186,7 @@ export class FinanceService {
   async merchantModelReady(): Promise<boolean> {
     if (this.merchantIdentifierInjected) return true;
     const llm = this.llmConfig();
-    if (llm.provider === 'builtin') return this.localModel.weightsPresent();
+    if (llm.provider === 'builtin') return this.localModel.weightsPresent(llm.model);
     return llm.keySet;
   }
 

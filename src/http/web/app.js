@@ -545,20 +545,6 @@ function resolveArtifactRows(artifact) {
     })).sort((a, b) => Number(b.value_cents || 0) - Number(a.value_cents || 0));
   }
 
-  if (name.includes('pnl') || name.includes('brokerage_realized')) {
-    return groupSum(
-      state.brokerageTransactions,
-      (txn) => `${monthKey(txn.date)}${params.groupBy === 'account' ? `|${accountLabel(txn.accountId)}` : ''}`,
-      (row, txn) => {
-        row.pnl_cents += Number(txn.amountMinor || 0);
-      },
-      (key) => {
-        const [period, accountName] = key.split('|');
-        return { period, account: accountName, pnl_cents: 0 };
-      },
-    ).sort((a, b) => `${a.period}${a.account || ''}`.localeCompare(`${b.period}${b.account || ''}`));
-  }
-
   if (name.includes('balance') || name.includes('account')) {
     return state.accounts.map((acct) => {
       const balance = state.balances.filter((item) => item.accountId === acct.id).sort((a, b) => b.asOfDate.localeCompare(a.asOfDate))[0];
@@ -1438,6 +1424,20 @@ function setSection(id) {
   render();
 }
 
+// Brokerage transactions are paged (server caps limit at 300). Load every page so
+// counts (the Activity card) and realized-P&L are computed over the full history,
+// not just the first page.
+async function fetchAllBrokerageTransactions() {
+  const items = [];
+  let cursor = null;
+  do {
+    const page = await api(`/v1/brokerage/transactions?limit=300${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+    items.push(...(page.items || []));
+    cursor = page.nextCursor || null;
+  } while (cursor);
+  return items;
+}
+
 async function loadData() {
   const [
     accounts,
@@ -1462,7 +1462,7 @@ async function loadData() {
     api('/v1/transactions?limit=100'),
     api('/v1/provider-connections'),
     api('/v1/brokerage/summary'),
-    api('/v1/brokerage/transactions?limit=100'),
+    fetchAllBrokerageTransactions(),
     api('/v1/brokerage/holdings'),
     api('/v1/account-balances'),
     api('/v1/dashboards'),
@@ -1481,7 +1481,7 @@ async function loadData() {
   state.nextCursor = txns.nextCursor;
   state.connections = connections.items;
   state.brokerageSummary = brokerageSummary.items;
-  state.brokerageTransactions = brokerageTxns.items;
+  state.brokerageTransactions = brokerageTxns;
   state.brokerageHoldings = brokerageHoldings.items;
   state.balances = balances.items;
   state.dashboards = dashboards.items;
@@ -1755,30 +1755,16 @@ function renderDataTable(headers, rows, options = {}) {
     contextAction.addEventListener('click', () => addTableContext(contextIdValue, contextTitle, headers, filtered, filtered.length));
   }
   if (key || contextAction) wrap.appendChild(tableControls(key, filtered, renderFn, options.itemLabel, contextAction));
-  const itemContext = Boolean(options.itemContext);
-  const textHeaders = itemContext ? headers.map(textFromHtml) : null;
   const table = document.createElement('table');
   const headerCells = headers.map((header, index) => `<th class="${index ? 'r' : ''}">${esc(header)}</th>`).join('');
-  table.innerHTML = `<thead><tr>${headerCells}${itemContext ? '<th class="r rowaction" aria-label="Add to context"></th>' : ''}</tr></thead>`;
+  table.innerHTML = `<thead><tr>${headerCells}</tr></thead>`;
   const body = document.createElement('tbody');
   if (!visibleRows.length) {
-    body.innerHTML = `<tr><td colspan="${headers.length + (itemContext ? 1 : 0)}" class="empty">${esc(options.emptyText || 'No rows match.')}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="${headers.length}" class="empty">${esc(options.emptyText || 'No rows match.')}</td></tr>`;
   }
   for (const row of visibleRows) {
     const tr = document.createElement('tr');
     tr.innerHTML = row.map((cell, index) => `<td class="${index ? 'r' : ''}">${cell}</td>`).join('');
-    if (itemContext) {
-      const values = row.map((cell) => textFromHtml(cell));
-      const id = stableItemId('item', [contextTitle, ...values]);
-      const title = values.filter(Boolean).slice(0, 2).join(' · ') || contextTitle;
-      const cell = el('td', 'r rowaction');
-      const button = chatContextButton('', 'Add this row to chat context');
-      setContextButtonState(button, id);
-      // Don't let the context button also trigger a row click.
-      button.addEventListener('click', (event) => { event.stopPropagation(); addItemContext(id, title, textHeaders, values, options.section); });
-      cell.appendChild(button);
-      tr.appendChild(cell);
-    }
     if (options.onRowClick && row.meta !== undefined) {
       tr.classList.add('clickable');
       tr.addEventListener('click', () => options.onRowClick(row.meta));
@@ -1903,7 +1889,7 @@ function renderBankSummary(view) {
       categoryCell(row.category),
       `<span class="pill">${row.count}</span>`,
       `<span class="num neg">${money(row.amount, row.currency)}</span>`,
-    ]), { pageKey: `bank-categories-${state.accountId || 'all'}-${state.from}-${state.to}`, itemContext: true })
+    ]), { pageKey: `bank-categories-${state.accountId || 'all'}-${state.from}-${state.to}` })
     : empty('No spending in this range.'));
   view.appendChild(categories);
 
@@ -1915,7 +1901,7 @@ function renderBankSummary(view) {
       esc(row.merchant),
       `<span class="pill">${row.count}</span>`,
       `<span class="num neg">${money(row.amount, row.currency)}</span>`,
-    ]), { pageKey: `bank-merchants-${state.accountId || 'all'}-${state.from}-${state.to}`, itemContext: true })
+    ]), { pageKey: `bank-merchants-${state.accountId || 'all'}-${state.from}-${state.to}` })
     : empty('No merchant spending in this range.'));
   view.appendChild(top);
 }
@@ -1932,7 +1918,7 @@ function renderBankTransactions(view) {
     esc(accountLabel(txn.accountId)),
     `<span class="num ${txn.amountMinor < 0 ? 'neg' : 'pos'}">${money(txn.amountMinor, txn.currency)}</span>`,
   ]);
-  sec.appendChild(renderDataTable(['Date', 'Description', 'Category', 'Account', 'Amount'], rows, { pageKey: key, render: renderBanks, emptyText: 'No transactions match.', itemContext: true }));
+  sec.appendChild(renderDataTable(['Date', 'Description', 'Category', 'Account', 'Amount'], rows, { pageKey: key, render: renderBanks, emptyText: 'No transactions match.' }));
   view.appendChild(sec);
 }
 
@@ -1958,7 +1944,7 @@ function renderBankCashflow(view) {
       `<span class="num pos">${money(row.income, row.currency)}</span>`,
       `<span class="num neg">${money(row.expense, row.currency)}</span>`,
       `<span class="num ${row.net < 0 ? 'neg' : 'pos'}">${money(row.net, row.currency)}</span>`,
-    ]), { pageKey: `bank-cashflow-${state.accountId || 'all'}`, itemContext: true }));
+    ]), { pageKey: `bank-cashflow-${state.accountId || 'all'}` }));
   }
   view.appendChild(sec);
 }
@@ -1988,7 +1974,7 @@ function renderBankRecurring(view) {
       ];
       row.meta = item; // carried through filter/pagination for the row click
       return row;
-    }), { pageKey: 'bank-recurring', itemContext: true, onRowClick: openRecurringDetail }));
+    }), { pageKey: 'bank-recurring', onRowClick: openRecurringDetail }));
   }
   view.appendChild(sec);
 }
@@ -2291,7 +2277,7 @@ function renderBrokerageSummary(view) {
         row.cashMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.cashMinor, row.currency)}</span>`,
         row.buyingPowerMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.buyingPowerMinor, row.currency)}</span>`,
       ]),
-      { pageKey: `brokerage-balances-${state.accountId || 'all'}`, itemLabel: 'balance', itemContext: true },
+      { pageKey: `brokerage-balances-${state.accountId || 'all'}`, itemLabel: 'balance' },
     ));
     view.appendChild(sec);
   }
@@ -2309,7 +2295,7 @@ function renderBrokerageSummary(view) {
       row.priceMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.priceMinor, row.currency)}</span>`,
       `<span class="num">${money(row.valueMinor, row.currency)}</span>`,
     ]),
-    { pageKey: `brokerage-holdings-${state.accountId || 'all'}`, itemLabel: 'holding', itemContext: true },
+    { pageKey: `brokerage-holdings-${state.accountId || 'all'}`, itemLabel: 'holding' },
   ));
   view.appendChild(holdings);
 }
@@ -2331,7 +2317,7 @@ function renderBrokerageTransactions(view) {
       row.priceMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.priceMinor, row.currency)}</span>`,
       `<span class="num ${row.amountMinor < 0 ? 'neg' : 'pos'}">${money(row.amountMinor, row.currency)}</span>`,
     ]),
-    { pageKey: `brokerage-transactions-${state.accountId || 'all'}-${state.from}-${state.to}`, itemContext: true },
+    { pageKey: `brokerage-transactions-${state.accountId || 'all'}-${state.from}-${state.to}` },
   ));
   view.appendChild(txns);
 }
@@ -3009,9 +2995,10 @@ function renderSettings() {
   return renderSettingsInsights(view);
 }
 
-function settingRow(key, label, type = 'text') {
+function settingRow(key, label, type = 'text', disabled = false) {
   const current = setting(key);
-  return `<label>${esc(label)}<input name="${esc(key)}" type="${esc(type)}" placeholder="${current.set ? esc(current.preview) : 'Not set'}" autocomplete="off"></label>`;
+  const placeholder = disabled ? 'Not required' : current.set ? current.preview : 'Not set';
+  return `<label>${esc(label)}<input name="${esc(key)}" type="${esc(type)}" placeholder="${esc(placeholder)}" autocomplete="off"${disabled ? ' disabled' : ''}></label>`;
 }
 
 async function saveSettings(entries, toastMessage = 'Settings saved.') {
@@ -3137,38 +3124,56 @@ function renderApiModelSettings(view, effective) {
   view.appendChild(formSection);
 }
 
-// The built-in local-model path, in a single card: provider dropdown, model
-// download, a Test button that exercises the in-process engine directly, and a
-// Save that is gated on a successful test. Selecting built-in only STAGES it —
-// nothing is persisted until Save, matching "download → test → save". Switching
-// to another provider from here commits immediately. When the built-in model is
-// already the saved provider, there is nothing to gate, so no Save is shown.
+// The built-in local-model path. It mirrors the API-provider form (Provider,
+// API key, Base URL, Model) so the layout is consistent — but API key and Base
+// URL are disabled (the local model needs neither), and Model is a dropdown of
+// the downloadable built-in models. Below the form sits the download flow: a
+// Download button, then Test + Save which both unlock once the selected model is
+// downloaded. Selecting built-in only STAGES it — nothing is persisted until
+// Save. Switching to another provider commits immediately.
 function renderBuiltinModelSettings(view, effective) {
   const providers = state.llm?.providers || [];
+  const models = state.llm?.builtinModels || [];
   const builtinActive = effective.provider === 'builtin';
   const sec = el('div', 'sec');
   view.appendChild(sec);
 
+  const defaultId = models[0]?.modelId || effective.model;
+  // Selection can be staged before Save (built-in only). Fall back to the saved
+  // model when already active, otherwise the first built-in model.
+  let selectedId = state.pendingBuiltinModel || (builtinActive ? effective.model : null) || defaultId;
+  if (!models.some((m) => m.modelId === selectedId)) selectedId = defaultId;
+
   const providerOptions = providers.map((provider) =>
     `<option value="${esc(provider.id)}"${provider.id === 'builtin' ? ' selected' : ''}>${esc(provider.label)}</option>`
   ).join('');
+  const modelOptions = models.map((m) =>
+    `<option value="${esc(m.modelId)}"${m.modelId === selectedId ? ' selected' : ''}>${esc(m.label)} — ${esc(formatModelSize(m.approxSizeBytes))}${m.present ? '' : ' (not downloaded)'}</option>`
+  ).join('');
   const subtitle = builtinActive
     ? 'Finora is using its built-in local model — no API key required. It runs fully on your computer.'
-    : 'Finora’s built-in local model runs fully on your computer — no API key. Download it once, test it, then Save to switch.';
+    : 'Finora’s built-in local model runs fully on your computer — no API key. Pick a model, download it once, then Save to switch.';
   sec.innerHTML = `
     <div class="sechdr"><h3>Language model</h3></div>
     <div class="cardsub">${subtitle}</div>
-    <form class="formgrid settingsform"><label>Provider<select name="LLM_PROVIDER">${providerOptions}</select></label></form>
+    <form class="formgrid settingsform">
+      <label>Provider<select name="LLM_PROVIDER">${providerOptions}</select></label>
+      ${settingRow('LLM_API_KEY', 'API key', 'password', true)}
+      ${settingRow('LLM_BASE_URL', 'Base URL', 'text', true)}
+      <label>Model<select name="LLM_MODEL">${modelOptions}</select></label>
+    </form>
     <div data-status style="margin-top:10px"></div>
     <div class="row" style="gap:8px;margin-top:10px" data-actions></div>
     <div class="row" style="align-items:center;gap:8px;margin-top:8px"><span class="message" data-msg></span></div>`;
 
   const providerSelect = sec.querySelector('select[name="LLM_PROVIDER"]');
+  const modelSelect = sec.querySelector('select[name="LLM_MODEL"]');
   const statusBox = sec.querySelector('[data-status]');
   const actionRow = sec.querySelector('[data-actions]');
   const msg = sec.querySelector('[data-msg]');
-  // No test gate when built-in is already active; otherwise Save unlocks on a pass.
-  let tested = builtinActive;
+
+  // Append the selected model id so every model route acts on the staged choice.
+  const withModel = (path) => `${path}${path.includes('?') ? '&' : '?'}modelId=${encodeURIComponent(selectedId)}`;
 
   providerSelect.addEventListener('change', async () => {
     const value = providerSelect.value;
@@ -3176,6 +3181,7 @@ function renderBuiltinModelSettings(view, effective) {
     providerSelect.disabled = true;
     try {
       state.pendingLlmProvider = null;
+      state.pendingBuiltinModel = null;
       await saveSettings({ LLM_PROVIDER: value }, 'Provider updated.');
       renderSettings();
     } catch (error) {
@@ -3183,6 +3189,15 @@ function renderBuiltinModelSettings(view, effective) {
       msg.classList.add('error');
       providerSelect.disabled = false;
     }
+  });
+
+  modelSelect.addEventListener('change', () => {
+    selectedId = modelSelect.value;
+    state.pendingBuiltinModel = selectedId;
+    msg.textContent = '';
+    msg.classList.remove('error');
+    // Fetch this model's fresh status, then render + resume polling if needed.
+    void refresh();
   });
 
   const render = (model) => {
@@ -3214,7 +3229,7 @@ function renderBuiltinModelSettings(view, effective) {
       const cancel = el('button', 'ghost');
       cancel.type = 'button';
       cancel.textContent = 'Cancel';
-      cancel.addEventListener('click', () => act('/v1/llm/model/download', 'DELETE', cancel));
+      cancel.addEventListener('click', () => act(withModel('/v1/llm/model/download'), 'DELETE', cancel));
       actionRow.append(cancel);
       return;
     }
@@ -3223,27 +3238,36 @@ function renderBuiltinModelSettings(view, effective) {
       const start = el('button', 'primary');
       start.type = 'button';
       start.textContent = errored ? 'Retry download' : `Download model (${formatModelSize(total)})`;
-      start.addEventListener('click', () => act('/v1/llm/model/download', 'POST', start));
+      start.addEventListener('click', () => act(withModel('/v1/llm/model/download'), 'POST', start));
       actionRow.append(start);
       return;
     }
 
-    // Ready: Test (+ Delete), and — when switching to built-in — a Save gated on
-    // a successful test.
+    // Ready: Test + (unless this model is already the saved one) Save — both
+    // clickable now that the download is complete. Plus Delete.
     const test = el('button', 'ghost');
     test.type = 'button';
     test.textContent = 'Test model';
+    const showSave = !(builtinActive && selectedId === effective.model);
     let save = null;
-    if (!builtinActive) {
+    if (showSave) {
       save = el('button', 'primary');
       save.type = 'button';
       save.textContent = 'Save';
-      save.disabled = !tested;
       save.addEventListener('click', async () => {
         save.disabled = true;
         try {
           state.pendingLlmProvider = null;
-          await saveSettings({ LLM_PROVIDER: 'builtin' }, 'Built-in model saved.');
+          state.pendingBuiltinModel = null;
+          await saveSettings(
+            { LLM_PROVIDER: 'builtin', LLM_MODEL: selectedId, LLM_CHAT_MODEL: selectedId },
+            'Built-in model saved.',
+          );
+          // Now that the new model is saved (its download succeeded), free disk by
+          // deleting every other built-in model. They stay in the dropdown as
+          // re-downloadable. Reload so their "(not downloaded)" state shows.
+          await api(withModel('/v1/llm/model/prune'), { method: 'POST' });
+          await loadData();
           renderSettings();
         } catch (error) {
           msg.textContent = error.message;
@@ -3257,10 +3281,8 @@ function renderBuiltinModelSettings(view, effective) {
       msg.textContent = 'Testing…';
       msg.classList.remove('error');
       try {
-        const result = await api('/v1/llm/model/test', { method: 'POST' });
+        const result = await api(withModel('/v1/llm/model/test'), { method: 'POST' });
         msg.textContent = `Connected: ${result.provider} / ${result.model}`;
-        tested = true;
-        if (save) save.disabled = false;
         toast('Model connection OK.');
       } catch (error) {
         msg.textContent = error.message;
@@ -3269,29 +3291,38 @@ function renderBuiltinModelSettings(view, effective) {
         test.disabled = false;
       }
     });
-    actionRow.append(test);
-    if (save) actionRow.append(save);
     const remove = el('button', 'ghost');
     remove.type = 'button';
     remove.textContent = 'Delete download';
     remove.addEventListener('click', () => {
       if (!confirm(`Delete the downloaded model (${formatModelSize(total)})? You can download it again later.`)) return;
-      act('/v1/llm/model', 'DELETE', remove);
+      act(withModel('/v1/llm/model'), 'DELETE', remove);
     });
-    actionRow.append(remove);
+    // Order: Test, Delete download, then Save on the right (the primary commit action).
+    actionRow.append(test, remove);
+    if (save) actionRow.append(save);
   };
 
   const act = async (path, method, button) => {
     if (button) button.disabled = true;
     try {
       const model = await api(path, { method });
-      // Deleting the weights invalidates any prior successful test.
-      if (path === '/v1/llm/model' && method === 'DELETE') tested = builtinActive;
       render(model);
       poll();
     } catch (error) {
       toast(error.message);
       if (button) button.disabled = false;
+    }
+  };
+
+  const refresh = async () => {
+    try {
+      const model = await api(withModel('/v1/llm/model'));
+      render(model);
+      if (model.download?.state === 'downloading') poll();
+    } catch (error) {
+      msg.textContent = error.message;
+      msg.classList.add('error');
     }
   };
 
@@ -3301,7 +3332,7 @@ function renderBuiltinModelSettings(view, effective) {
     setTimeout(async () => {
       if (!document.body.contains(sec)) return;
       try {
-        const model = await api('/v1/llm/model');
+        const model = await api(withModel('/v1/llm/model'));
         render(model);
         if (model.download?.state === 'downloading') poll();
       } catch {
@@ -3310,9 +3341,13 @@ function renderBuiltinModelSettings(view, effective) {
     }, 1000);
   };
 
-  const initial = state.llm?.builtin;
+  // Paint instantly from cached state, then reconcile with live status: a download
+  // started earlier keeps running server-side even after navigating away, so on
+  // return we re-fetch and resume the progress bar/polling instead of showing it as
+  // if it were cancelled.
+  const initial = models.find((m) => m.modelId === selectedId);
   render(initial);
-  if (initial?.download?.state === 'downloading') poll();
+  void refresh();
 }
 
 function renderSettingsAccounts(view) {

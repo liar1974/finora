@@ -36,7 +36,11 @@ jobs:
           - os: ubuntu-22.04
             label: linux-x64
             rust-target: ""
-            tauri-args: ""
+            # Only build the native bundles. AppImage is skipped: linuxdeploy
+            # cannot self-extract on FUSE-less GitHub-hosted runners and dies
+            # silently ("failed to run linuxdeploy") even with libfuse2 +
+            # APPIMAGE_EXTRACT_AND_RUN set. .deb/.rpm cover Linux users.
+            tauri-args: --bundles deb,rpm
 
     steps:
       - uses: actions/checkout@v7
@@ -62,12 +66,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # libfuse2: AppImage's runtime is built against libfuse2, but ubuntu-22.04
-          # runners ship only libfuse3. Without it linuxdeploy (and its nested
-          # appimage plugin) can't FUSE-mount and Tauri aborts with the generic
-          # "failed to run linuxdeploy". APPIMAGE_EXTRACT_AND_RUN alone is unreliable
-          # because the env doesn't reach every nested AppImage invocation.
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils libfuse2
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -78,20 +77,12 @@ jobs:
       - name: Build Tauri app
         run: pnpm exec tauri build ${{ matrix.tauri-args }} --verbose
         env:
-          # Signs the updater artifacts (.app.tar.gz / -setup.exe / .AppImage) with
-          # the minisign key whose public half is embedded in tauri.conf.json. Add
-          # it as a repository secret; without it the .sig files are not produced
-          # and auto-update has nothing to verify against. The key was generated
-          # without a password, so no password secret is needed.
+          # Signs the updater artifacts (.app.tar.gz / -setup.exe) with the minisign
+          # key whose public half is embedded in tauri.conf.json. Add it as a
+          # repository secret; without it the .sig files are not produced and
+          # auto-update has nothing to verify against. The key was generated without
+          # a password, so no password secret is needed.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          # AppImage bundling shells out to linuxdeploy + appimagetool, which
-          # normally mount their payload through FUSE. GitHub-hosted runners have no
-          # FUSE device, so those tools abort and Tauri reports "failed to run
-          # linuxdeploy". APPIMAGE_EXTRACT_AND_RUN makes them self-extract instead of
-          # mounting; NO_STRIP skips the strip pass that fails on the AppRun binary
-          # linuxdeploy downloads. Both are no-ops on macOS/Windows.
-          APPIMAGE_EXTRACT_AND_RUN: 1
-          NO_STRIP: true
 
       - name: Disambiguate macOS updater bundle name
         # Both macOS architectures emit an identically named "Finora.app.tar.gz",
@@ -121,7 +112,6 @@ jobs:
             src-tauri/target/**/release/bundle/macos/*.app.tar.gz
             src-tauri/target/**/release/bundle/msi/*.msi
             src-tauri/target/**/release/bundle/nsis/*.exe
-            src-tauri/target/**/release/bundle/appimage/*.AppImage
             src-tauri/target/**/release/bundle/deb/*.deb
             src-tauri/target/**/release/bundle/rpm/*.rpm
             src-tauri/target/**/release/bundle/**/*.sig
@@ -167,7 +157,7 @@ jobs:
           copy_first "artifacts/*_aarch64.dmg"   "Finora-macOS-AppleSilicon.dmg"
           copy_first "artifacts/*_x64.dmg"       "Finora-macOS-Intel.dmg"
           copy_first "artifacts/*-setup.exe"     "Finora-Windows-Setup.exe"
-          copy_first "artifacts/*.AppImage"      "Finora-Linux-x86_64.AppImage"
+          copy_first "artifacts/*_amd64.deb"     "Finora-Linux-x86_64.deb"
 
       - name: Generate updater manifest
         # Builds latest.json from the signed updater artifacts. The desktop app's
@@ -195,9 +185,9 @@ jobs:
             - macOS (Apple Silicon): [Finora-macOS-AppleSilicon.dmg](https://github.com/liar1974/finora/releases/latest/download/Finora-macOS-AppleSilicon.dmg)
             - macOS (Intel): [Finora-macOS-Intel.dmg](https://github.com/liar1974/finora/releases/latest/download/Finora-macOS-Intel.dmg)
             - Windows: [Finora-Windows-Setup.exe](https://github.com/liar1974/finora/releases/latest/download/Finora-Windows-Setup.exe)
-            - Linux: [Finora-Linux-x86_64.AppImage](https://github.com/liar1974/finora/releases/latest/download/Finora-Linux-x86_64.AppImage)
+            - Linux (Debian/Ubuntu): [Finora-Linux-x86_64.deb](https://github.com/liar1974/finora/releases/latest/download/Finora-Linux-x86_64.deb)
 
-            Versioned files and extra formats (.msi, .deb, .rpm) are attached below.
+            Versioned files and extra formats (.msi, .rpm) are attached below.
 
             macOS builds are unsigned. On first launch, use right-click Open if Gatekeeper blocks the app.
 

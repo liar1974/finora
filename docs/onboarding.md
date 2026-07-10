@@ -17,13 +17,15 @@ Download the version for your computer:
 | 🍎 macOS (Apple Silicon — M1/M2/M3/M4) | [Download for Mac](https://github.com/liar1974/finora/releases/latest/download/Finora-macOS-AppleSilicon.dmg) |
 | 🍎 macOS (Intel) | [Download for Mac (Intel)](https://github.com/liar1974/finora/releases/latest/download/Finora-macOS-Intel.dmg) |
 | 🪟 Windows | [Download for Windows](https://github.com/liar1974/finora/releases/latest/download/Finora-Windows-Setup.exe) |
-| 🐧 Linux | [Download for Linux](https://github.com/liar1974/finora/releases/latest/download/Finora-Linux-x86_64.AppImage) |
+| 🐧 Linux (Debian/Ubuntu) | [Download for Linux (.deb)](https://github.com/liar1974/finora/releases/latest/download/Finora-Linux-x86_64.deb) |
 
 Then open the downloaded file and follow the prompts:
 
 - **macOS:** open the `.dmg` and drag **Finora** into your Applications folder.
 - **Windows:** run the installer and click through it.
-- **Linux:** make the `.AppImage` file executable, then double-click it.
+- **Linux:** install the `.deb` with your package manager — double-click it in a
+  software center, or run `sudo apt install ./Finora-Linux-x86_64.deb`. (An `.rpm`
+  is also attached to each release for Fedora/RHEL-based distros.)
 
 ### Let the app run the first time
 
@@ -191,10 +193,11 @@ under **Delivery**, and create alert rules under **Rules & Facts**.
 Finora comes with a **built-in local model** and uses it by default, so you can
 start chatting right away — no API key and no separate install. The model's
 weights aren't part of the download; the first time you want to use chat, open
-**Settings → Models**, click **Download model** (about 2 GB, fetched once from a
-public open-source model host and saved to a file on your computer), then **Test
-model** and **Save**. After that, chat and Telegram/Slack replies run entirely on
-your machine.
+**Settings → Models** and pick a model from the dropdown. Finora offers a range
+of local models (roughly 0.8–7 GB — smaller ones are faster, larger ones are more
+capable). Click **Download model** (fetched once from a public open-source model
+host and saved to a file on your computer), then **Test model** and **Save**.
+After that, chat and Telegram/Slack replies run entirely on your machine.
 
 Prefer a hosted model instead? Pick **Anthropic**, **OpenAI**, **Google**, or
 any OpenAI-compatible provider from the **Provider** dropdown and paste your

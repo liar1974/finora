@@ -169,8 +169,6 @@ td.r, th.r { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo
 .tabletools select { min-width: 112px; }
 .tabletools .pginfo { color: var(--mut); font-size: 12px; font-variant-numeric: tabular-nums; }
 .contextsend { width: 32px; height: 32px; min-height: 32px; padding: 0; }
-td.rowaction { width: 1%; white-space: nowrap; text-align: right; }
-td.rowaction .contextsend { width: 28px; height: 28px; min-height: 28px; }
 tbody tr.clickable { cursor: pointer; }
 tbody tr.clickable:hover td { background: var(--card2); }
 .sechdr .contextsend { margin-left: auto; flex: none; }

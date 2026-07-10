@@ -343,19 +343,22 @@ async function route(
     return sendJson(response, 200, await service.testLocalModel());
   }
   if (url.pathname === '/v1/llm/model' && method === 'GET') {
-    return sendJson(response, 200, await service.getBuiltinModelStatus());
+    return sendJson(response, 200, await service.getBuiltinModelStatus(modelIdParam(url)));
   }
   if (url.pathname === '/v1/llm/model/test' && method === 'POST') {
-    return sendJson(response, 200, await service.testBuiltinModel());
+    return sendJson(response, 200, await service.testBuiltinModel(modelIdParam(url)));
   }
   if (url.pathname === '/v1/llm/model/download' && method === 'POST') {
-    return sendJson(response, 200, await service.downloadBuiltinModel());
+    return sendJson(response, 200, await service.downloadBuiltinModel(modelIdParam(url)));
+  }
+  if (url.pathname === '/v1/llm/model/prune' && method === 'POST') {
+    return sendJson(response, 200, await service.pruneBuiltinModels(modelIdParam(url)));
   }
   if (url.pathname === '/v1/llm/model/download' && method === 'DELETE') {
-    return sendJson(response, 200, await service.cancelBuiltinModelDownload());
+    return sendJson(response, 200, await service.cancelBuiltinModelDownload(modelIdParam(url)));
   }
   if (url.pathname === '/v1/llm/model' && method === 'DELETE') {
-    return sendJson(response, 200, await service.deleteBuiltinModel());
+    return sendJson(response, 200, await service.deleteBuiltinModel(modelIdParam(url)));
   }
   if (url.pathname === '/v1/findings' && method === 'GET') {
     return sendJson(response, 200, { items: service.listFindings() });
@@ -443,6 +446,12 @@ class HttpError extends Error {
   constructor(public readonly status: number, public readonly code: string, message: string) {
     super(message);
   }
+}
+
+// Optional built-in model selector, read from the query string so the model
+// routes work with an empty body. Absent ⇒ the engine's default model.
+function modelIdParam(url: URL): string | undefined {
+  return url.searchParams.get('modelId') || undefined;
 }
 
 function parseSchema<S extends z.ZodTypeAny>(schema: S, input: unknown): z.output<S> {

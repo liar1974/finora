@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clampChatInput, estimateOllamaNumCtx, generateChatReply, LLM_PROVIDERS, providerContextTokens, resolveLlmConfig } from '../src/infrastructure/llm-gateway.js';
+import { BUILTIN_MODEL } from '../src/infrastructure/local-model.js';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -11,7 +12,7 @@ describe('LLM gateway', () => {
       needsKey: false,
       keySet: true,
       local: true,
-      chatModel: 'qwen2.5-3b-instruct',
+      chatModel: BUILTIN_MODEL.id,
     });
     expect(LLM_PROVIDERS.some((provider) => provider.id === 'builtin' && !provider.needsKey && provider.local)).toBe(true);
   });

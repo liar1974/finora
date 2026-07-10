@@ -2,18 +2,19 @@
 
 **See all your money in one place — privately, on your own computer.**
 
-Finora is a personal finance app that brings your bank accounts, investments,
-and credit reports together into one clear picture. It runs on your own laptop
-and keeps everything in a single file on your machine. There is no Finora
-server: your ledger is never uploaded to us or to a finance company. The only
-things that ever leave your machine are ones you set up yourself — syncing a bank
-you connected, alerts you push to your own Telegram/Slack, and (if you choose a
-cloud AI provider instead of the built-in local model) the context for that AI
-request.
+Finora is a personal financial assistant that brings your bank accounts,
+investments, and credit reports together into one clear picture — then helps you
+make sense of it. It surfaces what needs your attention, and you can ask it
+questions about your own money in plain language. It runs on your own laptop and
+keeps everything in a single file on your machine. There is no Finora server:
+your ledger is never uploaded to us or to a finance company. The only things that
+ever leave your machine are ones you set up yourself — syncing a bank you
+connected, alerts you push to your own Telegram/Slack, and (if you choose a cloud
+AI provider instead of the built-in local model) the context for that AI request.
 
 Finora never moves your money, never stores your bank passwords anywhere online,
-and never gives financial advice. It just helps you *see* and *understand* your
-money.
+and never gives financial advice. It helps you *see*, *understand*, and act on
+your own numbers — every decision stays yours.
 
 ![Finora banking overview](docs/media/screenshots/banking.png)
 
@@ -41,10 +42,11 @@ money.
   AnnualCreditReport.com and review it on your own computer, without giving it to
   a third party.
 - **Ask questions locally.** Finora includes a built-in local AI model option:
-  after a one-time ~2 GB download in **Settings → Models**, you can chat about
-  your finances with no API key, running entirely on your computer. Prefer a
-  hosted model? Bring your own Anthropic, OpenAI, Google, or Ollama setup in the
-  same place.
+  pick a model in **Settings → Models** (a range of local models, roughly
+  0.8–7 GB depending on the one you choose), download it once, and chat about your
+  finances with no API key, running entirely on your computer. Prefer a hosted
+  model? Bring your own Anthropic, OpenAI, Google, or Ollama setup in the same
+  place.
 
 ## Download
 
@@ -56,7 +58,7 @@ immediately — just open the file and follow the prompts to install.
 | 🍎 **macOS** (Apple Silicon — M1/M2/M3/M4) | [Download for Mac](https://github.com/liar1974/finora/releases/latest/download/Finora-macOS-AppleSilicon.dmg) |
 | 🍎 **macOS** (Intel) | [Download for Mac (Intel)](https://github.com/liar1974/finora/releases/latest/download/Finora-macOS-Intel.dmg) |
 | 🪟 **Windows** | [Download for Windows](https://github.com/liar1974/finora/releases/latest/download/Finora-Windows-Setup.exe) |
-| 🐧 **Linux** | [Download for Linux](https://github.com/liar1974/finora/releases/latest/download/Finora-Linux-x86_64.AppImage) |
+| 🐧 **Linux** (Debian/Ubuntu) | [Download for Linux (.deb)](https://github.com/liar1974/finora/releases/latest/download/Finora-Linux-x86_64.deb) |
 
 *(Download links point at the newest release. If a link doesn't work yet, the
 first version may not be published — check the

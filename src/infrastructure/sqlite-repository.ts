@@ -1791,12 +1791,14 @@ export class SqliteFinanceRepository implements FinanceRepository {
 
       ${RULES_ENGINE_SCHEMA}
 
+      -- Seed only the built-in provider as the default. The model id is left unset
+      -- on purpose: resolveLlmConfig falls back to the built-in provider's
+      -- defaultModel (BUILTIN_MODEL.id), which stays the single source of truth for
+      -- the default model instead of a hardcoded id that rots when the model changes.
       INSERT OR IGNORE INTO app_settings(key, value, updated_at)
       VALUES
         ('LLM_PROVIDER', 'builtin', datetime('now')),
-        ('LLM_BASE_URL', '', datetime('now')),
-        ('LLM_MODEL', 'qwen2.5-3b-instruct', datetime('now')),
-        ('LLM_CHAT_MODEL', 'qwen2.5-3b-instruct', datetime('now'));
+        ('LLM_BASE_URL', '', datetime('now'));
     `);
   }
 

@@ -165,7 +165,12 @@ Regression checks:
 
 > SnapTrade is an experimental brokerage adapter reachable through the HTTP API
 > only; the shipping desktop UI connects brokerage accounts through Plaid Link.
-> The rules below apply if and when SnapTrade is exposed in a client.
+> Its automatic sync is currently disabled (behind `SNAPTRADE_SYNC_ENABLED` in
+> `finance-service.ts`): for accounts also reachable through Plaid it produced
+> duplicate transactions and inflated realized P&L, so the connect/remove routes
+> remain but the background sync is parked until cross-provider de-duplication
+> exists. The rules below apply if and when SnapTrade sync is re-enabled or
+> exposed in a client.
 
 SnapTrade brokerage accounts are managed through SnapTrade authorizations. A
 SnapTrade remove flow may remove the brokerage authorization when the user

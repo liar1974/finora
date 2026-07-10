@@ -1,27 +1,22 @@
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FinanceService } from '../src/application/finance-service.js';
 import { startHttpServer } from '../src/http/server.js';
-import { LocalModelEngine } from '../src/infrastructure/local-model.js';
 import { CsvStatementParser } from '../src/infrastructure/parsers/csv-parser.js';
 import { OfxStatementParser } from '../src/infrastructure/parsers/ofx-parser.js';
 import { SqliteFinanceRepository } from '../src/infrastructure/sqlite-repository.js';
+import { BUILTIN_MODEL, BUILTIN_MODELS } from '../src/infrastructure/local-model.js';
+import { daysAgo, missingModelEngine } from './helpers.js';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => Promise.all(cleanups.splice(0).map((cleanup) => cleanup())));
-
-// Recency-window rules match on the transaction date against the real clock, so
-// fixtures for them are dated relative to now rather than hardcoded (which would rot).
-const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
 
 async function httpFixture(options: { desktopToken?: string; onDesktopShutdown?: () => void } = {}) {
   const service = new FinanceService(
     new SqliteFinanceRepository(':memory:'),
     [new OfxStatementParser(), new CsvStatementParser()],
-    new LocalModelEngine(join(tmpdir(), 'finora-test-models-missing')),
+    missingModelEngine(),
   );
   const server = startHttpServer(service, { host: '127.0.0.1', port: 0, ...options });
   await once(server, 'listening');
@@ -441,5 +436,32 @@ Date: 05/01/2026
     expect(shutdown.status).toBe(204);
     await new Promise((resolve) => setImmediate(resolve));
     expect(shutdownRequested).toBe(true);
+  });
+});
+
+describe('built-in model routes', () => {
+  it('routes the model endpoints to the model named by ?modelId=, falling back to the default', async () => {
+    const { base } = await httpFixture();
+
+    // Explicit model id is honored; nothing is downloaded in the test dir so it reports absent.
+    const gemma = await (await fetch(`${base}/v1/llm/model?modelId=gemma3-1b`)).json() as { modelId: string; present: boolean };
+    expect(gemma.modelId).toBe('gemma3-1b');
+    expect(gemma.present).toBe(false);
+
+    // An unknown id falls back to the default model rather than erroring.
+    const fallback = await (await fetch(`${base}/v1/llm/model?modelId=does-not-exist`)).json() as { modelId: string };
+    expect(fallback.modelId).toBe(BUILTIN_MODEL.id);
+
+    // No id at all also resolves to the default.
+    const dflt = await (await fetch(`${base}/v1/llm/model`)).json() as { modelId: string };
+    expect(dflt.modelId).toBe(BUILTIN_MODEL.id);
+  });
+
+  it('prunes to a kept model and returns the full catalog status', async () => {
+    const { base } = await httpFixture();
+    const response = await fetch(`${base}/v1/llm/model/prune?modelId=${BUILTIN_MODEL.id}`, { method: 'POST' });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { models: Array<{ modelId: string }> };
+    expect(body.models.map((model) => model.modelId)).toEqual(BUILTIN_MODELS.map((model) => model.id));
   });
 });

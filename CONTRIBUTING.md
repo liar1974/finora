@@ -115,12 +115,14 @@ git push origin v0.1.0
 
 The [`Release` workflow](.github/workflows/release.yml) builds installers for
 macOS (arm64/x64), Windows x64, and Linux x64, then publishes them to a GitHub
-release. Alongside the versioned Tauri outputs it also uploads version-less
-copies (`Finora-macOS-AppleSilicon.dmg`, `Finora-macOS-Intel.dmg`,
-`Finora-Windows-Setup.exe`, `Finora-Linux-x86_64.AppImage`) so the README's
-"latest build" download links keep working across releases. If you change the
-product name or bundle targets, update the copy step's globs to match the new
-Tauri output filenames.
+release. The Linux job builds only the native `.deb`/`.rpm` bundles (`--bundles
+deb,rpm`); AppImage is skipped because `linuxdeploy` cannot self-extract on the
+FUSE-less GitHub-hosted runners and aborts. Alongside the versioned Tauri outputs
+it also uploads version-less copies (`Finora-macOS-AppleSilicon.dmg`,
+`Finora-macOS-Intel.dmg`, `Finora-Windows-Setup.exe`, `Finora-Linux-x86_64.deb`)
+so the README's "latest build" download links keep working across releases. If
+you change the product name or bundle targets, update the copy step's globs to
+match the new Tauri output filenames.
 
 ### Auto-update signing
 

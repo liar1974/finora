@@ -25,18 +25,74 @@ export interface BuiltinModelInfo {
   /** Approximate download size in bytes, shown before the real size is known. */
   approxSizeBytes: number;
   contextSize: number;
+  /**
+   * Whether this is a reasoning model that emits a <think> block (Qwen3.5). When
+   * true, chain-of-thought is kept on for real generation (planning can improve
+   * answers/extraction); when false the model answers directly (Gemma 3). The
+   * connectivity test always turns thinking off regardless — see generateReply.
+   */
+  thinking: boolean;
 }
 
-// Qwen2.5-3B-Instruct Q4_K_M — a ~2GB single-file GGUF that runs comfortably on
-// 8GB machines. Sourced from a common community GGUF CDN on Hugging Face.
-export const BUILTIN_MODEL: BuiltinModelInfo = {
-  id: 'qwen2.5-3b-instruct',
-  label: 'Qwen2.5 3B Instruct (Q4)',
-  uri: 'hf:bartowski/Qwen2.5-3B-Instruct-GGUF:Q4_K_M',
-  filePattern: /qwen2\.5-3b-instruct.*q4_k_m.*\.gguf$/i,
-  approxSizeBytes: 2_020_000_000,
-  contextSize: 4096,
-};
+// The selectable built-in models. All are single-file Q4_K_M GGUFs from a common
+// community CDN on Hugging Face. The first entry is the default (smallest, runs
+// comfortably on 8GB machines); larger entries trade memory for quality.
+export const BUILTIN_MODELS: readonly BuiltinModelInfo[] = [
+  {
+    id: 'qwen3.5-4b',
+    label: 'Qwen3.5 4B (Q4)',
+    uri: 'hf:bartowski/Qwen_Qwen3.5-4B-GGUF:Q4_K_M',
+    filePattern: /qwen3\.5-4b.*q4_k_m.*\.gguf$/i,
+    approxSizeBytes: 3_010_000_000,
+    contextSize: 4096,
+    thinking: true,
+  },
+  {
+    id: 'qwen3.5-9b',
+    label: 'Qwen3.5 9B (Q4)',
+    uri: 'hf:bartowski/Qwen_Qwen3.5-9B-GGUF:Q4_K_M',
+    filePattern: /qwen3\.5-9b.*q4_k_m.*\.gguf$/i,
+    approxSizeBytes: 6_170_000_000,
+    contextSize: 4096,
+    thinking: true,
+  },
+  {
+    id: 'gemma3-1b',
+    label: 'Gemma 3 1B (Q4)',
+    uri: 'hf:bartowski/google_gemma-3-1b-it-GGUF:Q4_K_M',
+    filePattern: /gemma-3-1b-it.*q4_k_m.*\.gguf$/i,
+    approxSizeBytes: 810_000_000,
+    contextSize: 4096,
+    thinking: false,
+  },
+  {
+    id: 'gemma3-4b',
+    label: 'Gemma 3 4B (Q4)',
+    uri: 'hf:bartowski/google_gemma-3-4b-it-GGUF:Q4_K_M',
+    filePattern: /gemma-3-4b-it.*q4_k_m.*\.gguf$/i,
+    approxSizeBytes: 2_490_000_000,
+    contextSize: 4096,
+    thinking: false,
+  },
+  {
+    id: 'gemma3-12b',
+    label: 'Gemma 3 12B (Q4)',
+    uri: 'hf:bartowski/google_gemma-3-12b-it-GGUF:Q4_K_M',
+    filePattern: /gemma-3-12b-it.*q4_k_m.*\.gguf$/i,
+    approxSizeBytes: 7_300_000_000,
+    contextSize: 4096,
+    thinking: false,
+  },
+] as const;
+
+// The default built-in model (used by the gateway when no model is configured).
+export const BUILTIN_MODEL: BuiltinModelInfo = BUILTIN_MODELS[0]!;
+
+/** Resolve a built-in model descriptor by id, falling back to the default. */
+export function getBuiltinModel(id?: string | null): BuiltinModelInfo {
+  if (!id) return BUILTIN_MODEL;
+  return BUILTIN_MODELS.find((model) => model.id === id) ?? BUILTIN_MODEL;
+}
 
 export type DownloadState = 'absent' | 'downloading' | 'ready' | 'error';
 
@@ -70,65 +126,81 @@ interface LoadedModel {
   context: LlamaContext;
   session: LlamaChatSessionType;
   filePath: string;
+  modelId: string;
 }
 
 export class LocalModelEngine {
   private readonly modelsDir: string;
   private engineAvailable: boolean | null = null;
   private engineError: string | undefined;
+  // Only one download runs at a time; these track that single active download and
+  // which model it belongs to. Presence of any other model is read from disk.
   private downloadState: DownloadState = 'absent';
   private downloadedSize = 0;
   private totalSize = 0;
   private downloadError: string | undefined;
+  private downloadingModelId: string | null = null;
   private downloader: ModelDownloader | null = null;
   private loaded: LoadedModel | null = null;
   private loadPromise: Promise<LoadedModel> | null = null;
+  private loadPromiseModelId: string | null = null;
   private generateChain: Promise<unknown> = Promise.resolve();
 
   constructor(modelsDir: string) {
     this.modelsDir = modelsDir;
   }
 
-  async status(): Promise<BuiltinModelStatus> {
-    const filePath = await this.findModelFile();
+  async status(modelId?: string): Promise<BuiltinModelStatus> {
+    const model = getBuiltinModel(modelId);
+    const filePath = await this.findModelFile(model);
     const present = filePath !== null;
-    if (present && this.downloadState !== 'downloading') this.downloadState = 'ready';
-    else if (!present && this.downloadState === 'ready') this.downloadState = 'absent';
+    const active = this.downloadingModelId === model.id;
+
+    let state: DownloadState;
+    if (active && this.downloadState === 'downloading') state = 'downloading';
+    else if (present) state = 'ready';
+    else if (active && this.downloadState === 'error') state = 'error';
+    else state = 'absent';
+
     return {
-      modelId: BUILTIN_MODEL.id,
-      label: BUILTIN_MODEL.label,
-      approxSizeBytes: BUILTIN_MODEL.approxSizeBytes,
+      modelId: model.id,
+      label: model.label,
+      approxSizeBytes: model.approxSizeBytes,
       engineAvailable: await this.checkEngine(),
       ...(this.engineError ? { engineError: this.engineError } : {}),
       present,
       ...(filePath ? { filePath } : {}),
       download: {
-        state: this.downloadState,
-        downloadedSize: this.downloadedSize,
-        totalSize: this.totalSize || BUILTIN_MODEL.approxSizeBytes,
-        ...(this.downloadError ? { error: this.downloadError } : {}),
+        state,
+        downloadedSize: active ? this.downloadedSize : present ? model.approxSizeBytes : 0,
+        totalSize: active && this.totalSize ? this.totalSize : model.approxSizeBytes,
+        ...(active && this.downloadError ? { error: this.downloadError } : {}),
       },
     };
   }
 
+  /** Status of every selectable built-in model (drives the Settings dropdown). */
+  async statusAll(): Promise<BuiltinModelStatus[]> {
+    return Promise.all(BUILTIN_MODELS.map((model) => this.status(model.id)));
+  }
+
   /**
-   * Start (or resume) the model download. Returns immediately with the current
+   * Start (or resume) a model download. Returns immediately with the current
    * status; progress is polled via {@link status}. Safe to call repeatedly.
    */
-  async startDownload(): Promise<BuiltinModelStatus> {
-    if (this.downloadState === 'downloading') return this.status();
-    if (await this.findModelFile()) {
-      this.downloadState = 'ready';
-      return this.status();
-    }
+  async startDownload(modelId?: string): Promise<BuiltinModelStatus> {
+    const model = getBuiltinModel(modelId);
+    if (this.downloadState === 'downloading' && this.downloadingModelId === model.id) return this.status(model.id);
+    if (await this.findModelFile(model)) return this.status(model.id);
     if (!(await this.checkEngine())) {
       throw new Error(this.engineError || 'The local model engine is not available on this platform');
     }
 
+    this.downloadingModelId = model.id;
     this.downloadState = 'downloading';
     this.downloadError = undefined;
     this.downloadedSize = 0;
-    this.totalSize = BUILTIN_MODEL.approxSizeBytes;
+    this.totalSize = model.approxSizeBytes;
 
     // Fire-and-forget: callers poll status via downloadState, so the promise is
     // not retained.
@@ -137,7 +209,7 @@ export class LocalModelEngine {
         await mkdir(this.modelsDir, { recursive: true });
         const { createModelDownloader } = await import('node-llama-cpp');
         this.downloader = await createModelDownloader({
-          modelUri: BUILTIN_MODEL.uri,
+          modelUri: model.uri,
           dirPath: this.modelsDir,
           skipExisting: true,
           onProgress: ({ totalSize, downloadedSize }) => {
@@ -157,25 +229,47 @@ export class LocalModelEngine {
       }
     })();
 
-    return this.status();
+    return this.status(model.id);
   }
 
-  async cancelDownload(): Promise<BuiltinModelStatus> {
+  async cancelDownload(modelId?: string): Promise<BuiltinModelStatus> {
     if (this.downloader) {
       await this.downloader.cancel().catch(() => {});
     }
     if (this.downloadState === 'downloading') this.downloadState = 'absent';
-    return this.status();
+    this.downloadingModelId = null;
+    return this.status(modelId);
   }
 
-  async deleteModel(): Promise<BuiltinModelStatus> {
-    await this.cancelDownload();
-    await this.unload();
-    const filePath = await this.findModelFile();
+  async deleteModel(modelId?: string): Promise<BuiltinModelStatus> {
+    const model = getBuiltinModel(modelId);
+    if (this.downloadingModelId === model.id) await this.cancelDownload(model.id);
+    if (this.loaded?.modelId === model.id) await this.unload();
+    const filePath = await this.findModelFile(model);
     if (filePath) await rm(filePath, { force: true });
-    this.downloadState = 'absent';
-    this.downloadedSize = 0;
-    return this.status();
+    if (this.downloadingModelId === model.id) {
+      this.downloadState = 'absent';
+      this.downloadedSize = 0;
+      this.downloadingModelId = null;
+    }
+    return this.status(model.id);
+  }
+
+  /**
+   * Keep only the given model on disk: delete every other built-in model's
+   * weights (and cancel any stray download). Called after a model is SAVED as the
+   * active one (a successful download), so at most one large GGUF is retained while
+   * still letting the user download a second model to try before committing.
+   * The dropdown still lists the deleted models (they just show as re-downloadable).
+   */
+  async pruneOtherModels(keepModelId?: string): Promise<void> {
+    const keep = getBuiltinModel(keepModelId).id;
+    for (const model of BUILTIN_MODELS) {
+      if (model.id === keep) continue;
+      if (this.downloadingModelId === model.id || (await this.weightsPresent(model.id))) {
+        await this.deleteModel(model.id);
+      }
+    }
   }
 
   /**
@@ -183,13 +277,17 @@ export class LocalModelEngine {
    * replayed on each call (the caller is stateless); generation is serialized
    * because a single context sequence cannot handle concurrent prompts.
    */
-  async generateReply(input: {
-    system: string;
-    messages: Array<{ role: 'user' | 'assistant'; content: string }>;
-    timeoutMs?: number;
-    maxTokens?: number;
-  }): Promise<string> {
-    const run = this.generateChain.then(() => this.generateReplyNow(input));
+  async generateReply(
+    input: {
+      system: string;
+      messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+      timeoutMs?: number;
+      maxTokens?: number;
+      disableThinking?: boolean;
+    },
+    modelId?: string,
+  ): Promise<string> {
+    const run = this.generateChain.then(() => this.generateReplyNow(input, modelId));
     // Keep the chain alive regardless of this call's outcome.
     this.generateChain = run.then(
       () => undefined,
@@ -198,13 +296,18 @@ export class LocalModelEngine {
     return run;
   }
 
-  private async generateReplyNow(input: {
-    system: string;
-    messages: Array<{ role: 'user' | 'assistant'; content: string }>;
-    timeoutMs?: number;
-    maxTokens?: number;
-  }): Promise<string> {
-    const loaded = await this.ensureLoaded();
+  private async generateReplyNow(
+    input: {
+      system: string;
+      messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+      timeoutMs?: number;
+      maxTokens?: number;
+      disableThinking?: boolean;
+    },
+    modelId?: string,
+  ): Promise<string> {
+    const model = getBuiltinModel(modelId);
+    const loaded = await this.ensureLoaded(model);
     const messages = input.messages;
     const lastUserIndex = findLastUserIndex(messages);
     if (lastUserIndex === -1) throw new Error('A user message is required to generate a reply');
@@ -226,6 +329,13 @@ export class LocalModelEngine {
         await loaded.session.prompt(prompt, {
           maxTokens: input.maxTokens ?? 768,
           temperature: 0.2,
+          // Reasoning models (Qwen3.5, thinking: true) emit a <think> block before
+          // answering; keep it ON for real generation, where planning can improve
+          // answers/extraction. Turn it off (thoughtTokens: 0) when the model isn't a
+          // reasoning model, or when the caller asks — e.g. the connectivity test,
+          // where a small maxTokens would otherwise be spent entirely inside <think>
+          // and yield an empty response.
+          ...(input.disableThinking || !model.thinking ? { budgets: { thoughtTokens: 0 } } : {}),
           signal,
         })
       ).trim();
@@ -241,19 +351,22 @@ export class LocalModelEngine {
     }
   }
 
-  private async ensureLoaded(): Promise<LoadedModel> {
-    if (this.loaded) return this.loaded;
-    if (this.loadPromise) return this.loadPromise;
+  private async ensureLoaded(model: BuiltinModelInfo): Promise<LoadedModel> {
+    if (this.loaded && this.loaded.modelId === model.id) return this.loaded;
+    // A different model is already loaded — free it before loading the new one.
+    if (this.loaded && this.loaded.modelId !== model.id) await this.unload();
+    if (this.loadPromise && this.loadPromiseModelId === model.id) return this.loadPromise;
 
+    this.loadPromiseModelId = model.id;
     this.loadPromise = (async () => {
-      const filePath = await this.findModelFile();
-      if (!filePath) throw new ModelNotDownloadedError(BUILTIN_MODEL.label);
+      const filePath = await this.findModelFile(model);
+      if (!filePath) throw new ModelNotDownloadedError(model.label);
       const { getLlama, LlamaChatSession } = await import('node-llama-cpp');
       const llama = await getLlama();
-      const model = await llama.loadModel({ modelPath: filePath });
-      const context = await model.createContext({ contextSize: BUILTIN_MODEL.contextSize });
+      const loadedModel = await llama.loadModel({ modelPath: filePath });
+      const context = await loadedModel.createContext({ contextSize: model.contextSize });
       const session = new LlamaChatSession({ contextSequence: context.getSequence() });
-      const loaded: LoadedModel = { llama, model, context, session, filePath };
+      const loaded: LoadedModel = { llama, model: loadedModel, context, session, filePath, modelId: model.id };
       this.loaded = loaded;
       return loaded;
     })();
@@ -262,10 +375,14 @@ export class LocalModelEngine {
       return await this.loadPromise;
     } catch (error) {
       this.loadPromise = null;
+      this.loadPromiseModelId = null;
       throw error;
     } finally {
       // Clear the in-flight promise once settled so a failed load can be retried.
-      if (this.loaded) this.loadPromise = null;
+      if (this.loaded) {
+        this.loadPromise = null;
+        this.loadPromiseModelId = null;
+      }
     }
   }
 
@@ -273,6 +390,7 @@ export class LocalModelEngine {
     const loaded = this.loaded;
     this.loaded = null;
     this.loadPromise = null;
+    this.loadPromiseModelId = null;
     if (!loaded) return;
     await loaded.context.dispose().catch(() => {});
     await loaded.model.dispose().catch(() => {});
@@ -295,11 +413,11 @@ export class LocalModelEngine {
   // native engine (which status() does via checkEngine, and which is expensive to
   // import on a hot path). Callers that only need "can we try to run the model"
   // should use this rather than status().
-  async weightsPresent(): Promise<boolean> {
-    return (await this.findModelFile()) !== null;
+  async weightsPresent(modelId?: string): Promise<boolean> {
+    return (await this.findModelFile(getBuiltinModel(modelId))) !== null;
   }
 
-  private async findModelFile(): Promise<string | null> {
+  private async findModelFile(model: BuiltinModelInfo): Promise<string | null> {
     let entries: string[];
     try {
       entries = await readdir(this.modelsDir);
@@ -307,7 +425,7 @@ export class LocalModelEngine {
       return null;
     }
     for (const entry of entries) {
-      if (!BUILTIN_MODEL.filePattern.test(entry)) continue;
+      if (!model.filePattern.test(entry)) continue;
       const filePath = join(this.modelsDir, entry);
       try {
         const info = await stat(filePath);
