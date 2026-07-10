@@ -62,7 +62,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          # libfuse2: AppImage's runtime is built against libfuse2, but ubuntu-22.04
+          # runners ship only libfuse3. Without it linuxdeploy (and its nested
+          # appimage plugin) can't FUSE-mount and Tauri aborts with the generic
+          # "failed to run linuxdeploy". APPIMAGE_EXTRACT_AND_RUN alone is unreliable
+          # because the env doesn't reach every nested AppImage invocation.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils libfuse2
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -71,7 +76,7 @@ jobs:
         run: pnpm build:desktop-resources
 
       - name: Build Tauri app
-        run: pnpm exec tauri build ${{ matrix.tauri-args }}
+        run: pnpm exec tauri build ${{ matrix.tauri-args }} --verbose
         env:
           # Signs the updater artifacts (.app.tar.gz / -setup.exe / .AppImage) with
           # the minisign key whose public half is embedded in tauri.conf.json. Add
