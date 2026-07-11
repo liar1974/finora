@@ -336,7 +336,7 @@ const portfolioConcentration: Evaluator = {
 
 const creditUtilization: Evaluator = {
   kind: 'credit-utilization',
-  domain: 'credit',
+  domain: 'credit-report',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'credit',
@@ -854,7 +854,7 @@ const unfamiliarMerchantCharge: Evaluator = {
 // Credit: interest charged on a card — the cost of carrying a balance.
 const cardInterest: Evaluator = {
   kind: 'card-interest',
-  domain: 'credit',
+  domain: 'credit-report',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'credit',

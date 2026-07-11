@@ -128,8 +128,8 @@ describe('clampChatInput', () => {
     expect(content).toContain('truncated to fit context');
     expect(content.startsWith('A')).toBe(true); // head kept
     expect(content.endsWith('A')).toBe(true);    // tail kept
-    // Total estimate now within the 4096-token budget (~ (4096-768-256)*3.5 chars).
-    expect(out.system.length + content.length).toBeLessThanOrEqual(Math.floor((4096 - 768 - 256) * 3.5));
+    // Total estimate now within the 4096-token budget (~ (4096-768-256)*3.0 chars, conservative).
+    expect(out.system.length + content.length).toBeLessThanOrEqual(Math.floor((4096 - 768 - 256) * 3.0));
   });
 
   it('does not trim under a large cloud window', () => {

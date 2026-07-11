@@ -24,7 +24,14 @@ export interface BuiltinModelInfo {
   filePattern: RegExp;
   /** Approximate download size in bytes, shown before the real size is known. */
   approxSizeBytes: number;
-  contextSize: number;
+  /**
+   * Default ceiling for the context window (tokens). The engine does NOT allocate
+   * this up front — it sizes the KV cache to each prompt (bucketed) and grows only
+   * when a bigger prompt arrives (see estimateBuiltinContextSize / ensureContextSize).
+   * This bounds worst-case KV-cache RAM; the FINORA_BUILTIN_CONTEXT env var overrides
+   * it (up to CONTEXT_HARD_MAX, then further bounded by the model's trained context).
+   */
+  maxContextSize: number;
   /**
    * Whether this is a reasoning model that emits a <think> block (Qwen3.5). When
    * true, chain-of-thought is kept on for real generation (planning can improve
@@ -44,7 +51,7 @@ export const BUILTIN_MODELS: readonly BuiltinModelInfo[] = [
     uri: 'hf:bartowski/Qwen_Qwen3.5-4B-GGUF:Q4_K_M',
     filePattern: /qwen3\.5-4b.*q4_k_m.*\.gguf$/i,
     approxSizeBytes: 3_010_000_000,
-    contextSize: 4096,
+    maxContextSize: 32768,
     thinking: true,
   },
   {
@@ -53,7 +60,7 @@ export const BUILTIN_MODELS: readonly BuiltinModelInfo[] = [
     uri: 'hf:bartowski/Qwen_Qwen3.5-9B-GGUF:Q4_K_M',
     filePattern: /qwen3\.5-9b.*q4_k_m.*\.gguf$/i,
     approxSizeBytes: 6_170_000_000,
-    contextSize: 4096,
+    maxContextSize: 32768,
     thinking: true,
   },
   {
@@ -62,7 +69,7 @@ export const BUILTIN_MODELS: readonly BuiltinModelInfo[] = [
     uri: 'hf:bartowski/google_gemma-3-1b-it-GGUF:Q4_K_M',
     filePattern: /gemma-3-1b-it.*q4_k_m.*\.gguf$/i,
     approxSizeBytes: 810_000_000,
-    contextSize: 4096,
+    maxContextSize: 32768,
     thinking: false,
   },
   {
@@ -71,7 +78,7 @@ export const BUILTIN_MODELS: readonly BuiltinModelInfo[] = [
     uri: 'hf:bartowski/google_gemma-3-4b-it-GGUF:Q4_K_M',
     filePattern: /gemma-3-4b-it.*q4_k_m.*\.gguf$/i,
     approxSizeBytes: 2_490_000_000,
-    contextSize: 4096,
+    maxContextSize: 32768,
     thinking: false,
   },
   {
@@ -80,7 +87,7 @@ export const BUILTIN_MODELS: readonly BuiltinModelInfo[] = [
     uri: 'hf:bartowski/google_gemma-3-12b-it-GGUF:Q4_K_M',
     filePattern: /gemma-3-12b-it.*q4_k_m.*\.gguf$/i,
     approxSizeBytes: 7_300_000_000,
-    contextSize: 4096,
+    maxContextSize: 32768,
     thinking: false,
   },
 ] as const;
@@ -92,6 +99,56 @@ export const BUILTIN_MODEL: BuiltinModelInfo = BUILTIN_MODELS[0]!;
 export function getBuiltinModel(id?: string | null): BuiltinModelInfo {
   if (!id) return BUILTIN_MODEL;
   return BUILTIN_MODELS.find((model) => model.id === id) ?? BUILTIN_MODEL;
+}
+
+// KV-cache RAM scales linearly with the allocated context and is reserved at load
+// time whether or not the prompt fills it, so allocating each model's full trained
+// window (32k–128k → multiple GB) would punish modest machines for context the app
+// almost never uses. Instead the engine sizes the context to the actual prompt,
+// bucketed, and grows only when a larger prompt arrives. These bound that sizing.
+const CONTEXT_MIN = 2048;
+const CONTEXT_HARD_MAX = 131072;
+const CONTEXT_BUCKETS = [2048, 4096, 8192, 16384, 32768, 65536, 131072];
+// Chars/token ratio used ONLY as a fallback when a live tokenizer isn't available
+// (see sizeContextForPrompt, the primary path, which tokenizes for real). It must be
+// LOW: JSON-dense chat prompts tokenize at ~2.2-2.5 chars/token, so a higher ratio
+// UNDER-counts tokens and under-allocates the context, overflowing the pinned system
+// message on context shift. Under-estimating chars/token over-allocates — the safe bias.
+const CONTEXT_CHARS_PER_TOKEN = 2.0;
+// Headroom added to a prompt's real token count when sizing: the generation budget is
+// added separately, this covers the chat-template framing tokens (per-message role
+// markers, BOS) that raw tokenization of the concatenated text does not include.
+const CONTEXT_TEMPLATE_MARGIN = 768;
+
+// The configured ceiling for a model's context: the FINORA_BUILTIN_CONTEXT override
+// if set, else the model's default, clamped to [CONTEXT_MIN, CONTEXT_HARD_MAX]. This
+// is a static upper bound; the engine additionally caps allocation at the model's
+// trained context (known only after load).
+export function contextCeiling(model: BuiltinModelInfo, env: NodeJS.ProcessEnv = process.env): number {
+  const override = Number(env.FINORA_BUILTIN_CONTEXT);
+  const requested = Number.isInteger(override) && override > 0 ? override : model.maxContextSize;
+  return Math.min(Math.max(CONTEXT_MIN, requested), CONTEXT_HARD_MAX);
+}
+
+// Round a token target UP to a stable bucket (so similar prompts reuse one context
+// size, avoiding needless re-creation) and cap it at the ceiling.
+function bucketContextSize(target: number, ceiling: number): number {
+  const bucketed = CONTEXT_BUCKETS.find((b) => b >= target) ?? target;
+  return Math.min(Math.max(CONTEXT_MIN, bucketed), ceiling);
+}
+
+// Fallback context sizing from a character estimate, for when no live tokenizer is
+// available. The primary path (sizeContextForPrompt) uses real token counts; this
+// only guards the no-model case and is kept exported for tests.
+export function estimateBuiltinContextSize(
+  system: string,
+  messages: Array<{ content: string }>,
+  maxTokens: number | undefined,
+  ceiling: number,
+): number {
+  const chars = system.length + messages.reduce((sum, m) => sum + m.content.length, 0);
+  const target = Math.ceil(chars / CONTEXT_CHARS_PER_TOKEN) + (maxTokens ?? 768) + 512;
+  return bucketContextSize(target, ceiling);
 }
 
 export type DownloadState = 'absent' | 'downloading' | 'ready' | 'error';
@@ -127,6 +184,7 @@ interface LoadedModel {
   session: LlamaChatSessionType;
   filePath: string;
   modelId: string;
+  contextSize: number; // current KV-cache allocation; grown on demand
 }
 
 export class LocalModelEngine {
@@ -312,6 +370,14 @@ export class LocalModelEngine {
     const lastUserIndex = findLastUserIndex(messages);
     if (lastUserIndex === -1) throw new Error('A user message is required to generate a reply');
 
+    // Size the KV cache to this prompt (system + history + current turn + output),
+    // bucketed and capped, before replaying the history. The caller has already
+    // clamped the input to contextBudget(), so this fits within the model's window.
+    const promptMessages = messages.slice(0, lastUserIndex + 1);
+    const ceiling = Math.min(contextCeiling(model), loaded.model.trainContextSize);
+    const needed = this.sizeContextForPrompt(loaded, input.system, promptMessages, input.maxTokens, ceiling);
+    await this.ensureContextSize(loaded, needed);
+
     const history: ChatHistoryItem[] = [];
     if (input.system.trim()) history.push({ type: 'system', text: input.system });
     for (let i = 0; i < lastUserIndex; i += 1) {
@@ -364,9 +430,13 @@ export class LocalModelEngine {
       const { getLlama, LlamaChatSession } = await import('node-llama-cpp');
       const llama = await getLlama();
       const loadedModel = await llama.loadModel({ modelPath: filePath });
-      const context = await loadedModel.createContext({ contextSize: model.contextSize });
+      // Start with a modest context sized to typical prompts (grown on demand per
+      // request via ensureContextSize), never exceeding the model's trained window.
+      const ceiling = Math.min(contextCeiling(model), loadedModel.trainContextSize);
+      const initial = Math.min(8192, ceiling);
+      const context = await loadedModel.createContext({ contextSize: initial });
       const session = new LlamaChatSession({ contextSequence: context.getSequence() });
-      const loaded: LoadedModel = { llama, model: loadedModel, context, session, filePath, modelId: model.id };
+      const loaded: LoadedModel = { llama, model: loadedModel, context, session, filePath, modelId: model.id, contextSize: initial };
       this.loaded = loaded;
       return loaded;
     })();
@@ -383,6 +453,60 @@ export class LocalModelEngine {
         this.loadPromise = null;
         this.loadPromiseModelId = null;
       }
+    }
+  }
+
+  // Size the KV cache from the prompt's REAL token count. A character estimate
+  // under-counts JSON-dense prompts (~2.3 chars/token) and under-allocates the
+  // context, so the pinned system message overflows on context shift (the reported
+  // "Failed to compress chat history" error). The model's own tokenizer is exact;
+  // add the generation budget plus a margin for chat-template framing tokens, bucket
+  // up, and cap at the window. Falls back to the char estimate only if tokenize throws.
+  private sizeContextForPrompt(
+    loaded: LoadedModel,
+    system: string,
+    messages: Array<{ content: string }>,
+    maxTokens: number | undefined,
+    ceiling: number,
+  ): number {
+    try {
+      const text = [system, ...messages.map((m) => m.content)].join('\n');
+      const promptTokens = loaded.model.tokenize(text).length;
+      const target = promptTokens + (maxTokens ?? 768) + CONTEXT_TEMPLATE_MARGIN;
+      return bucketContextSize(target, ceiling);
+    } catch {
+      return estimateBuiltinContextSize(system, messages, maxTokens, ceiling);
+    }
+  }
+
+  // Grow the KV cache to hold `needed` tokens if the current allocation is smaller.
+  // Grow-only: a smaller prompt reuses a larger context (recreating to shrink would
+  // churn on alternating prompt sizes and free nothing until the model unloads). The
+  // target is bounded by the ceiling and the model's trained window.
+  private async ensureContextSize(loaded: LoadedModel, needed: number): Promise<void> {
+    const ceiling = Math.min(contextCeiling(getBuiltinModel(loaded.modelId)), loaded.model.trainContextSize);
+    const target = Math.min(Math.max(CONTEXT_MIN, needed), ceiling);
+    if (target <= loaded.contextSize) return;
+    const { LlamaChatSession } = await import('node-llama-cpp');
+    await loaded.context.dispose().catch(() => {});
+    const context = await loaded.model.createContext({ contextSize: target });
+    loaded.context = context;
+    loaded.session = new LlamaChatSession({ contextSequence: context.getSequence() });
+    loaded.contextSize = target;
+  }
+
+  // The token budget the caller should clamp chat input to before generating: the
+  // configured ceiling, bounded by the model's trained context. Loads the model to
+  // read its trained window; on failure (e.g. not downloaded) falls back to the
+  // static ceiling — generateReply then surfaces the real download error.
+  async contextBudget(modelId?: string): Promise<number> {
+    const model = getBuiltinModel(modelId);
+    const ceiling = contextCeiling(model);
+    try {
+      const loaded = await this.ensureLoaded(model);
+      return Math.min(ceiling, loaded.model.trainContextSize);
+    } catch {
+      return ceiling;
     }
   }
 

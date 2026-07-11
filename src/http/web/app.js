@@ -163,6 +163,9 @@ const state = {
   brokerageSummary: [],
   brokerageTransactions: [],
   brokerageHoldings: [],
+  brokerageValueSeries: [],
+  brokerageValueSeriesByScope: {},
+  brokerageValueLoading: new Set(),
   balances: [],
   dashboards: [],
   settings: [],
@@ -245,7 +248,7 @@ function prettyKind(kind) {
 const ruleDomains = [
   ['cash-flow', 'Cash flow', 'Income timing, bill runway, idle cash, low balance.'],
   ['spending', 'Spending', 'Large charges, duplicates, subscriptions, fees.'],
-  ['credit', 'Credit', 'Utilization, card interest, report review, payment timing.'],
+  ['credit-report', 'Credit report', 'Credit-report health: utilization, card interest.'],
   ['investments', 'Investments', 'Cash drag, concentration, allocation, executed orders.'],
   ['connections', 'Connections', 'Provider status, tokens, cursors, sync freshness.'],
 ];
@@ -594,7 +597,12 @@ function vegaRows(rows, series, format) {
   return rows.map((row) => {
     const next = { ...row };
     for (const item of series) {
-      next[`__${item.field}`] = cents ? Number(row[item.field] || 0) / 100 : Number(row[item.field] || 0);
+      const raw = row[item.field];
+      // Preserve null/undefined as null so Vega treats it as invalid (a gap in a
+      // line/area, e.g. axis-anchor points) rather than a real 0.
+      next[`__${item.field}`] = raw === null || raw === undefined
+        ? null
+        : (cents ? Number(raw) / 100 : Number(raw));
     }
     return next;
   });
@@ -633,6 +641,10 @@ function buildVegaSpec(artifact, rows, x, series, format) {
       arc: { stroke: '#fefdfa', strokeWidth: 2 },
     },
   };
+  const xEncoding = (extra = {}) => ({
+    field: x, type: vegaType(x), title: chartLabel(x), axis: { labelAngle: -25 },
+    ...extra,
+  });
   const tooltip = [{ field: x, type: vegaType(x), title: chartLabel(x) }];
   if (type === 'donut') {
     return {
@@ -653,7 +665,7 @@ function buildVegaSpec(artifact, rows, x, series, format) {
       transform: [{ fold: fields, as: ['__series', '__value'] }, { calculate: `${labelExpr}:datum.__series`, as: '__series_label' }],
       mark: type === 'line' ? { type: 'line', point: { filled: true, size: 50 } } : type === 'area' ? { type: 'area', line: true, point: { filled: true, size: 42 } } : { type: 'bar' },
       encoding: {
-        x: { field: x, type: vegaType(x), title: chartLabel(x), axis: { labelAngle: -25 } },
+        x: xEncoding(),
         y: { field: '__value', type: 'quantitative', title: 'Value', axis: { format: vegaFormat(format) } },
         color: { field: '__series_label', type: 'nominal', title: null, scale: { domain: series.map((item) => item.label), range: series.map((item) => item.color) } },
         tooltip: [...tooltip, { field: '__series_label', type: 'nominal', title: 'Series' }, { field: '__value', type: 'quantitative', title: 'Value', format: vegaFormat(format) }],
@@ -664,7 +676,7 @@ function buildVegaSpec(artifact, rows, x, series, format) {
     ...base,
     mark: type === 'line' ? { type: 'line', point: { filled: true, size: 50 } } : type === 'area' ? { type: 'area', line: true, point: { filled: true, size: 42 } } : { type: 'bar' },
     encoding: {
-      x: { field: x, type: vegaType(x), title: chartLabel(x), axis: { labelAngle: -25 } },
+      x: xEncoding(),
       y: { field: valueField, type: 'quantitative', title: series[0].label, axis: { format: vegaFormat(format) }, stack: type === 'stacked_bar' ? 'zero' : null },
       color: artifact.render?.colorBy ? { field: artifact.render.colorBy, type: 'nominal', title: chartLabel(artifact.render.colorBy), scale: { range: chartPalette } } : { value: series[0].color },
       tooltip: [...tooltip, artifact.render?.colorBy ? { field: artifact.render.colorBy, type: 'nominal', title: chartLabel(artifact.render.colorBy) } : null, { field: valueField, type: 'quantitative', title: series[0].label, format: vegaFormat(format) }].filter(Boolean),
@@ -1416,9 +1428,20 @@ function openDashboardActionMenu(actions, saved) {
   actions.appendChild(menu);
 }
 
+// Account selection is per-section. Entering a section defaults to "All
+// accounts" unless a still-valid account for that section is already selected,
+// so a bank account id never leaks into Brokerage (and vice versa) — which
+// would leave neither a card nor the All-accounts card active.
+function normalizeAccountSelection() {
+  const sectionAccounts = state.section === 'brokerage' ? brokerageAccounts()
+    : state.section === 'banks' ? bankAccounts()
+      : [];
+  if (!sectionAccounts.some((item) => item.id === state.accountId)) state.accountId = null;
+}
+
 function setSection(id) {
   state.section = id;
-  if (id !== 'banks' && id !== 'brokerage') state.accountId = null;
+  normalizeAccountSelection();
   closeDrawers();
   history.replaceState(null, '', `#${id}${id === 'banks' ? `/${state.bankTab}` : ''}`);
   render();
@@ -1447,6 +1470,7 @@ async function loadData() {
     brokerageSummary,
     brokerageTxns,
     brokerageHoldings,
+    brokerageValueSeries,
     balances,
     dashboards,
     settings,
@@ -1464,6 +1488,7 @@ async function loadData() {
     api('/v1/brokerage/summary'),
     fetchAllBrokerageTransactions(),
     api('/v1/brokerage/holdings'),
+    api('/v1/brokerage/value-series'),
     api('/v1/account-balances'),
     api('/v1/dashboards'),
     api('/v1/settings'),
@@ -1483,6 +1508,13 @@ async function loadData() {
   state.brokerageSummary = brokerageSummary.items;
   state.brokerageTransactions = brokerageTxns;
   state.brokerageHoldings = brokerageHoldings.items;
+  state.brokerageValueSeries = brokerageValueSeries.items;
+  // The equity curve is server-computed per scope (needs full snapshot history,
+  // which the holdings endpoint doesn't return). Seed the portfolio-wide scope
+  // here; per-account scopes are fetched lazily on selection. Reset on reload so
+  // a resync doesn't leave stale per-account curves cached.
+  state.brokerageValueSeriesByScope = { all: brokerageValueSeries.items };
+  state.brokerageValueLoading = new Set();
   state.balances = balances.items;
   state.dashboards = dashboards.items;
   state.settings = settings.items;
@@ -1572,8 +1604,9 @@ function manageAccountsButton(tab) {
 
 function accountCards(accounts = selectedAccounts(), label = 'accounts') {
   const grid = el('div', 'acctgrid');
+  const balancesByAccount = allLatestBalances();
   const accountAmount = (item) => {
-    const bal = latestBalances().find((row) => row.accountId === item.id);
+    const bal = balancesByAccount.find((row) => row.accountId === item.id);
     if (bal) {
       const minor = accountDisplayMinor(item, bal.currentMinor);
       return { label: item.domain === 'brokerage' ? 'Current value' : 'Balance', minor, value: money(minor, bal.currency) };
@@ -1587,7 +1620,7 @@ function accountCards(accounts = selectedAccounts(), label = 'accounts') {
     return { label: 'Net activity', minor: net, value: money(net, txns[0]?.currency || item.currency) };
   };
   const allTotal = accounts.reduce((sum, item) => {
-    const bal = latestBalances().find((row) => row.accountId === item.id);
+    const bal = balancesByAccount.find((row) => row.accountId === item.id);
     if (bal) return sum + accountDisplayMinor(item, bal.currentMinor);
     if (item.domain === 'brokerage') return sum + state.brokerageHoldings.filter((holding) => holding.accountId === item.id).reduce((inner, holding) => inner + Number(holding.valueMinor || 0), 0);
     return sum + state.transactions.filter((txn) => txn.accountId === item.id).reduce((inner, txn) => inner + Number(txn.amountMinor || 0), 0);
@@ -2207,33 +2240,65 @@ function selectedBrokerageTransactions() {
   });
 }
 
+// A crypto exchange has no cash concept: Plaid reports the whole balance as a
+// single CUR:USD cash-equivalent line, but that is the crypto's market value, not
+// spendable cash. So a cash-type line on such an account is treated as a position.
+function isCryptoAccount(item) {
+  return (item?.type || '').toLowerCase().includes('crypto');
+}
+
+// Providers report uninvested cash as a pseudo-security holding (Plaid marks it
+// security type 'cash', ticker CUR:USD). It is the account's cash, not a
+// position, so callers separate it from real holdings — except on crypto
+// exchanges (see isCryptoAccount), where that line is the crypto's market value.
+function isCashHolding(holding) {
+  if ((holding.securityType || '').toLowerCase() !== 'cash') return false;
+  return !isCryptoAccount(account(holding.accountId));
+}
+
 function selectedBrokerageHoldings() {
-  const latest = new Map();
-  for (const item of state.brokerageHoldings) {
-    if (state.accountId && item.accountId !== state.accountId) continue;
-    const key = [item.accountId, item.securityId || item.symbol || item.name || item.securityType || '', item.currency].join('|');
-    const current = latest.get(key);
-    if (!current
-      || item.asOfDate > current.asOfDate
-      || (item.asOfDate === current.asOfDate && item.createdAt > current.createdAt)
-      || (item.asOfDate === current.asOfDate && item.createdAt === current.createdAt && item.id > current.id)) {
-      latest.set(key, item);
-    }
+  // Match the server's snapshot semantics (summarizeBrokerage / brokerageValueSeries):
+  // an account's holdings are those from its most recent snapshot date. Providers
+  // send a full snapshot each sync, so a position sold before the latest sync must
+  // not linger from an older snapshot — otherwise Market value / Cash / P&L (all
+  // derived from this list) overcount by resurrecting closed positions. The
+  // holdings endpoint already returns one row per (account, security) at its
+  // latest-seen date, so keeping only rows on the account's max date yields
+  // exactly that account's current snapshot.
+  const scoped = state.brokerageHoldings.filter((item) => !state.accountId || item.accountId === state.accountId);
+  const latestDate = new Map();
+  for (const item of scoped) {
+    const current = latestDate.get(item.accountId);
+    if (!current || item.asOfDate > current) latestDate.set(item.accountId, item.asOfDate);
   }
-  return [...latest.values()].sort((a, b) => Number(b.valueMinor || 0) - Number(a.valueMinor || 0));
+  return scoped
+    .filter((item) => item.asOfDate === latestDate.get(item.accountId))
+    .sort((a, b) => Number(b.valueMinor || 0) - Number(a.valueMinor || 0));
 }
 
 function selectedBalances() {
   return state.balances.filter((item) => !state.accountId || item.accountId === state.accountId);
 }
 
-function latestBalances() {
+function latestBalancesFrom(rows) {
   const byAccount = new Map();
-  for (const item of selectedBalances()) {
+  for (const item of rows) {
     const current = byAccount.get(item.accountId);
     if (!current || item.asOfDate > current.asOfDate) byAccount.set(item.accountId, item);
   }
   return [...byAccount.values()];
+}
+
+function latestBalances() {
+  return latestBalancesFrom(selectedBalances());
+}
+
+// Every account card shows its own real balance regardless of which account is
+// selected, so it must read from the full balance set — not the account-scoped
+// selectedBalances(), which would leave the other cards to fall back to a
+// transaction-net figure and appear to change when a selection is made.
+function allLatestBalances() {
+  return latestBalancesFrom(state.balances);
 }
 
 function renderBrokerage() {
@@ -2263,6 +2328,7 @@ function renderBrokerage() {
 
 function renderBrokerageSummary(view) {
   view.appendChild(brokerageSummaryCards());
+  view.appendChild(brokerageValueChart());
 
   const balances = latestBalances();
   if (balances.length) {
@@ -2284,17 +2350,26 @@ function renderBrokerageSummary(view) {
 
   const holdings = el('div', 'sec');
   holdings.innerHTML = '<div class="sechdr"><h3>Holdings</h3></div>';
-  const holdingRows = selectedBrokerageHoldings().slice(0, 80);
+  // Cash pseudo-holdings surface in the Cash tile, not this positions table.
+  const holdingRows = selectedBrokerageHoldings().filter((row) => !isCashHolding(row)).slice(0, 80);
   if (!holdingRows.length) holdings.appendChild(empty('No holdings in this scope.'));
   else holdings.appendChild(transactionLikeTable(
-    ['Symbol', 'Name', 'Quantity', 'Price', 'Value'],
-    holdingRows.map((row) => [
-      esc(row.symbol || '-'),
-      esc(row.name || row.securityType || '-'),
-      esc(row.quantity || '-'),
-      row.priceMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.priceMinor, row.currency)}</span>`,
-      `<span class="num">${money(row.valueMinor, row.currency)}</span>`,
-    ]),
+    ['Symbol', 'Name', 'Quantity', 'Price', 'Value', 'Cost basis', 'Unrealized P&L', 'P&L %'],
+    holdingRows.map((row) => {
+      const hasCost = row.costBasisMinor !== null && row.costBasisMinor !== undefined;
+      const pnl = hasCost ? Number(row.valueMinor || 0) - Number(row.costBasisMinor || 0) : null;
+      const pnlPct = hasCost && Number(row.costBasisMinor) ? (pnl / Number(row.costBasisMinor)) * 100 : null;
+      return [
+        esc(row.symbol || '-'),
+        esc(row.name || row.securityType || '-'),
+        esc(row.quantity || '-'),
+        row.priceMinor === null ? '<span class="mut">-</span>' : `<span class="num">${money(row.priceMinor, row.currency)}</span>`,
+        `<span class="num">${money(row.valueMinor, row.currency)}</span>`,
+        hasCost ? `<span class="num">${money(row.costBasisMinor, row.currency)}</span>` : '<span class="mut">-</span>',
+        hasCost ? `<span class="num ${pnl < 0 ? 'neg' : 'pos'}">${money(pnl, row.currency)}</span>` : '<span class="mut">-</span>',
+        pnlPct === null ? '<span class="mut">-</span>' : `<span class="num ${pnlPct < 0 ? 'neg' : 'pos'}">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%</span>`,
+      ];
+    }),
     { pageKey: `brokerage-holdings-${state.accountId || 'all'}`, itemLabel: 'holding' },
   ));
   view.appendChild(holdings);
@@ -2327,17 +2402,105 @@ function brokerageSummaryCards() {
   const txns = selectedBrokerageTransactions();
   const balances = latestBalances();
   const currency = holdings[0]?.currency || balances[0]?.currency || selectedAccounts()[0]?.currency || 'USD';
-  const value = holdings.reduce((sum, item) => sum + Number(item.valueMinor || 0), 0);
-  const cash = balances.reduce((sum, item) => sum + Number(item.cashMinor || 0), 0);
-  const buyingPower = balances.reduce((sum, item) => sum + Number(item.buyingPowerMinor || 0), 0);
+  // Providers report uninvested cash as a pseudo-security holding (Plaid: type
+  // 'cash', ticker CUR:USD). Treat it as cash, not an investment: keep it out of
+  // Market value and fold it into the Cash tile.
+  const positions = holdings.filter((item) => !isCashHolding(item));
+  const value = positions.reduce((sum, item) => sum + Number(item.valueMinor || 0), 0);
+  // Cash = cash-type holdings + balance cash for accounts without one (so an
+  // account is never counted through both paths). SnapTrade sets cashMinor on the
+  // balance directly and has no cash holding; Plaid does the reverse.
+  const cashHoldings = holdings.filter((item) => isCashHolding(item));
+  const accountsWithCashHoldings = new Set(cashHoldings.map((item) => item.accountId));
+  const cashFromHoldings = cashHoldings.reduce((sum, item) => sum + Number(item.valueMinor || 0), 0);
+  const cashFromBalances = balances
+    .filter((item) => !accountsWithCashHoldings.has(item.accountId))
+    .reduce((sum, item) => sum + Number(item.cashMinor || 0), 0);
+  const cash = cashFromHoldings + cashFromBalances;
+  // Buying power is a margin figure most providers (e.g. Plaid) never report;
+  // show a dash rather than a misleading total when no account exposes one.
+  const bpBalances = balances.filter((item) => item.buyingPowerMinor !== null && item.buyingPowerMinor !== undefined);
+  const buyingPower = bpBalances.length
+    ? bpBalances.reduce((sum, item) => sum + Number(item.buyingPowerMinor || 0), 0)
+    : null;
+  // Unrealized P&L is only defined where the provider gave us a cost basis;
+  // holdings without one are excluded from both the gain and the cost base so
+  // the percentage stays honest. Note partial coverage on the card itself.
+  const withCost = positions.filter((item) => item.costBasisMinor !== null && item.costBasisMinor !== undefined);
+  const costBasis = withCost.reduce((sum, item) => sum + Number(item.costBasisMinor || 0), 0);
+  const unrealized = withCost.reduce((sum, item) => sum + (Number(item.valueMinor || 0) - Number(item.costBasisMinor || 0)), 0);
+  const pnlPct = costBasis ? (unrealized / costBasis) * 100 : null;
+  const pnlLabel = withCost.length
+    ? `Unrealized P&L${pnlPct === null ? '' : ` (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`}`
+    : 'Unrealized P&L';
+  const coverageNote = withCost.length && withCost.length < positions.length
+    ? ` title="Based on ${withCost.length} of ${positions.length} holdings with a known cost basis"`
+    : '';
+  const pnlValue = withCost.length
+    ? `<div class="big num ${unrealized < 0 ? 'neg' : 'pos'}">${money(unrealized, currency)}</div>`
+    : '<div class="big num mut">-</div>';
   const cards = el('div', 'cards');
   cards.innerHTML = `
     <div class="card"><div class="lab">Market value</div><div class="big num">${money(value, currency)}</div></div>
+    <div class="card"${coverageNote}><div class="lab">${pnlLabel}</div>${pnlValue}</div>
     <div class="card"><div class="lab">Cash</div><div class="big num">${money(cash, currency)}</div></div>
-    <div class="card"><div class="lab">Buying power</div><div class="big num">${money(buyingPower, currency)}</div></div>
+    <div class="card"><div class="lab">Buying power</div>${buyingPower === null ? '<div class="big num mut">-</div>' : `<div class="big num">${money(buyingPower, currency)}</div>`}</div>
     <div class="card"><div class="lab">Activity</div><div class="big num">${txns.length}</div></div>
   `;
   return cards;
+}
+
+// Lazily load the equity curve for a scope ('all' or an accountId). The series is
+// server-computed (it needs full snapshot history, which the holdings endpoint
+// collapses to the latest per security), so scoping to an account means fetching
+// that account's curve rather than filtering client-side.
+async function fetchBrokerageValueSeries(scope) {
+  if (state.brokerageValueLoading.has(scope)) return;
+  state.brokerageValueLoading.add(scope);
+  try {
+    const query = scope === 'all' ? '' : `?accountId=${encodeURIComponent(scope)}`;
+    const res = await api(`/v1/brokerage/value-series${query}`);
+    state.brokerageValueSeriesByScope[scope] = res.items || [];
+  } catch (error) {
+    console.warn('Failed to load value series for', scope, error);
+    state.brokerageValueSeriesByScope[scope] = [];
+  } finally {
+    state.brokerageValueLoading.delete(scope);
+    if (state.section === 'brokerage' && state.brokerageTab === 'summary') renderBrokerage();
+  }
+}
+
+function brokerageValueChart() {
+  const sec = el('div', 'sec');
+  sec.innerHTML = '<div class="sechdr"><h3>Value over time</h3></div>';
+  const scope = state.accountId || 'all';
+  const series = state.brokerageValueSeriesByScope[scope];
+  if (series === undefined) {
+    fetchBrokerageValueSeries(scope);
+    sec.appendChild(empty('Loading value history…'));
+    return sec;
+  }
+  // Plot a single currency (the most recent point's), matching the single-currency
+  // convention used across the brokerage summary.
+  const currency = series.length ? series[series.length - 1].currency : (selectedBrokerageHoldings()[0]?.currency || 'USD');
+  const points = series.filter((point) => point.currency === currency);
+  if (points.length < 2) {
+    sec.appendChild(empty('Not enough history yet — the value curve builds up as the app syncs each day.'));
+    return sec;
+  }
+  const host = el('div');
+  sec.appendChild(host);
+  renderArtifactChart(host, {
+    name: 'Value over time',
+    artifact: {
+      title: 'Value over time',
+      description: `Holdings market value · ${currency}`,
+      render: { type: 'area', x: 'date', y: 'value' },
+      style: { numberFormat: 'currency' },
+      data: points.map((point) => ({ date: point.date, value: point.valueMinor })),
+    },
+  }, { contextAction: false });
+  return sec;
 }
 
 function renderCredit() {
@@ -3504,15 +3667,18 @@ function renderSettingsInsights(view) {
   const sec = el('div', 'sec');
   sec.innerHTML = '<div class="sechdr"><h3>Rules</h3></div><div class="cardsub">Rules can run on events or on a schedule. Use the switch to pause delivery without changing the rule.</div>';
   const box = el('div', 'rulelist');
-  // Every rule is a built-in definition from the backend; show them all with a
-  // real (server-persisted) on/off switch, keyed by kind. `active` is the switch.
+  // Rules come from the backend with a real (server-persisted) on/off switch, keyed
+  // by kind. `active` is the switch. `source` drives the permission matrix: built-in
+  // and downloaded rules can be toggled and rescheduled but not edited or deleted;
+  // custom (source='user') rules can be edited (their SQL regenerated) and deleted.
   const rules = state.rules.map((rule) => {
     const meta = RULE_META[rule.kind] || {};
+    const builtIn = rule.source !== 'user';
     return {
       ...rule,
-      builtIn: true,
-      title: meta.title || prettyKind(rule.kind),
-      description: rule.sourceText || meta.detail || '',
+      builtIn,
+      title: builtIn ? (meta.title || prettyKind(rule.kind)) : (rule.sourceText || prettyKind(rule.kind)),
+      description: builtIn ? (rule.sourceText || meta.detail || '') : '',
       enabled: rule.active,
       editable: true,
       toggle: async () => {
@@ -3522,6 +3688,17 @@ function renderSettingsInsights(view) {
           body: JSON.stringify({ kind: rule.kind, enabled: !rule.active }),
         });
         await loadData();
+        renderSettings();
+      },
+      remove: builtIn ? null : async () => {
+        if (!confirm(`Delete this custom rule? This can't be undone.`)) return;
+        await api('/v1/rules/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kind: rule.kind }),
+        });
+        await loadData();
+        toast('Rule deleted.');
         renderSettings();
       },
     };
@@ -3623,9 +3800,17 @@ function ruleRow(rule) {
   if (rule.editable) {
     const edit = el('button', 'ghost');
     edit.type = 'button';
-    edit.textContent = 'Edit';
+    // Built-in: edit the schedule only. Custom: edit the content (regenerate SQL).
+    edit.textContent = rule.builtIn ? 'Edit' : 'Edit content';
     edit.addEventListener('click', () => openRuleModal(rule));
     actions.appendChild(edit);
+  }
+  if (rule.remove) {
+    const del = el('button', 'ghost danger');
+    del.type = 'button';
+    del.textContent = 'Delete';
+    del.addEventListener('click', rule.remove);
+    actions.appendChild(del);
   }
   row.append(copy, actions);
   return row;
@@ -4261,6 +4446,7 @@ function applyHash() {
   if (sections.some((item) => item.id === section)) state.section = section;
   if (section === 'banks' && bankTabs.some(([id]) => id === sub)) state.bankTab = sub;
   if (section === 'brokerage' && brokerageTabs.some(([id]) => id === sub)) state.brokerageTab = sub;
+  normalizeAccountSelection();
 }
 
 $('#threadsBtn').addEventListener('click', () => {

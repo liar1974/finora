@@ -129,6 +129,16 @@ export interface BrokerageSummary {
   transactions: number;
 }
 
+// One point on the portfolio equity curve: the summed market value of held
+// positions across brokerage accounts as of a snapshot date, in integer minor
+// units (excludes cash; matches the Market value tile). Grouped per currency to
+// match BrokerageSummary; ordered by date ascending.
+export interface BrokerageValuePoint {
+  date: string;
+  valueMinor: number;
+  currency: string;
+}
+
 export interface DashboardRecord {
   id: string;
   publicId: string | null;
@@ -196,7 +206,7 @@ export type RuleExecutionClass = 'D' | 'L' | 'L+';
 // tier is additionally capped by finding confidence at run time.
 export type RuleActionTier = 'observer' | 'advisor' | 'guardian' | 'navigator';
 
-export type RuleDomain = 'cash-flow' | 'spending' | 'credit' | 'investments' | 'connections';
+export type RuleDomain = 'cash-flow' | 'spending' | 'credit-report' | 'investments' | 'connections';
 
 // One rule = one row in the single `rules` table (see docs/rules-design.md). The
 // row carries BOTH the definition (code/feed-owned: sql, keywords, facts…, kept
@@ -261,6 +271,17 @@ export interface RuleSpec {
   enabled: boolean;
   source: string; // builtin | downloaded | user
   version: number;
+}
+
+// The definition an LLM authors for a user's natural-language custom rule: a
+// deterministic (D) SQL query plus the classifying metadata the engine needs. The
+// service validates the SQL and mints the kind; the model never owns identity.
+export interface RuleSqlDraft {
+  sql: string;
+  domain: RuleDomain;
+  scope: string;
+  keywords: string;
+  title: string;
 }
 
 // Recurrence is a merchant-level property (direction distinguishes a paycheck

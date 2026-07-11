@@ -13,6 +13,7 @@ import type {
   ProviderHoldingInput,
   ProviderTransactionInput,
   RuleAdoption,
+  RuleContentEdit,
   SaveImportInput,
   SummaryQuery,
   TransactionQuery,
@@ -25,6 +26,7 @@ import type {
   AppSettingPreview,
   BrokerageHolding,
   BrokerageSummary,
+  BrokerageValuePoint,
   BrokerageTransaction,
   ChartArtifact,
   ChatSessionRecord,
@@ -446,27 +448,37 @@ interface ImportRow extends Record<string, unknown> {
 
 export class SqliteFinanceRepository implements FinanceRepository {
   private readonly database: DatabaseSync;
+  private readonly path: string;
+  // Lazily-opened read-only handle used only to run rule SQL. It cannot write at
+  // the driver level, so LLM-authored or downloaded rule queries can never mutate
+  // the DB regardless of how the SQL is shaped. Null until first use; for a
+  // :memory: DB (tests) a second connection would be a separate empty database, so
+  // we fall back to the main connection there.
+  private ruleDb: DatabaseSync | null = null;
 
   constructor(path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
+    this.path = path;
     this.database = new DatabaseSync(path);
     this.database.exec('PRAGMA journal_mode = WAL;');
-    this.registerRuleFunctions();
+    this.registerRuleFunctions(this.database);
     this.migrate(path);
   }
 
   // SQL scalar/aggregate primitives used by data-driven rule specs (see
   // docs/rules-design.md). Registered before migrate so shipped views may use them.
-  private registerRuleFunctions(): void {
+  // Functions are per-connection, so the read-only rule connection registers them
+  // too (via ruleConnection).
+  private registerRuleFunctions(db: DatabaseSync): void {
     // Varargs so money(minor) and money(minor, currency) both work.
-    this.database.function('money', { varargs: true }, (...args: unknown[]) => moneyValue(args[0], args[1]));
-    this.database.function('normalize_merchant', { deterministic: true }, (description: unknown) => normalizeMerchantValue(description));
+    db.function('money', { varargs: true }, (...args: unknown[]) => moneyValue(args[0], args[1]));
+    db.function('normalize_merchant', { deterministic: true }, (description: unknown) => normalizeMerchantValue(description));
     // Word-boundary fee/interest match (SQLite has no REGEXP; LIKE '%fee%' would
     // match "coffee"). Returns 1/0.
-    this.database.function('fee_like', { deterministic: true }, (description: unknown) => (FEE_TOKEN_PATTERN.test(String(description ?? '')) ? 1 : 0));
+    db.function('fee_like', { deterministic: true }, (description: unknown) => (FEE_TOKEN_PATTERN.test(String(description ?? '')) ? 1 : 0));
     // Accumulator is a JSON string so the type stays a SQL value; node:sqlite's
     // types disallow a raw array accumulator.
-    this.database.aggregate('median', {
+    db.aggregate('median', {
       start: () => '[]',
       step: (acc: string, value: unknown) => {
         const values = JSON.parse(acc) as number[];
@@ -483,9 +495,22 @@ export class SqliteFinanceRepository implements FinanceRepository {
     });
   }
 
-  // Execute a rule spec's read-only query. Only SELECT/WITH is allowed, and only
-  // the named params the query actually references are bound (node:sqlite rejects
-  // unknown params), so callers can pass a shared superset.
+  // The connection rule SQL runs on: a cached read-only handle for a file DB (so a
+  // rule query physically cannot write), or the main connection for :memory:.
+  private ruleConnection(): DatabaseSync {
+    if (this.path === ':memory:') return this.database;
+    if (!this.ruleDb) {
+      const db = new DatabaseSync(this.path, { readOnly: true });
+      this.registerRuleFunctions(db);
+      this.ruleDb = db;
+    }
+    return this.ruleDb;
+  }
+
+  // Execute a rule spec's read-only query. Runs on the read-only connection (writes
+  // fail at the driver level); the SELECT/WITH prefix check stays as a fast,
+  // defense-in-depth guard. Only the named params the query actually references are
+  // bound (node:sqlite rejects unknown params), so callers can pass a shared superset.
   runRuleQuery(sql: string, params: Record<string, unknown>): Record<string, unknown>[] {
     if (!/^\s*(select|with)\b/i.test(sql)) {
       throw new Error('rule query must be a read-only SELECT or WITH');
@@ -495,7 +520,7 @@ export class SqliteFinanceRepository implements FinanceRepository {
     for (const key of referenced) {
       if (key in params) bound[key] = params[key] as SQLInputValue;
     }
-    return this.database.prepare(sql).all(bound) as unknown as Record<string, unknown>[];
+    return this.ruleConnection().prepare(sql).all(bound) as unknown as Record<string, unknown>[];
   }
 
   createAccount(input: AccountCreate): Account {
@@ -767,40 +792,58 @@ export class SqliteFinanceRepository implements FinanceRepository {
   }
 
   summarizeBrokerage(): BrokerageSummary[] {
+    // Providers (notably Plaid) report uninvested cash as a pseudo-security
+    // holding with security_type='cash' (ticker CUR:USD). Those are the account's
+    // cash, not an investment: exclude them from market value and the holdings
+    // count, and fold them into the cash figure. Per account we prefer the
+    // cash-type holding total when present, otherwise the balance's cash_minor
+    // (SnapTrade populates cash_minor directly and has no cash holding) — the
+    // NOT IN guard keeps an account from being counted through both paths.
     const rows = this.database.prepare(`
-      SELECT currency,
-        COALESCE(SUM(value_minor), 0) AS market_value,
-        COALESCE((SELECT SUM(cash_minor) FROM (
-          SELECT account_id, currency, cash_minor
-          FROM account_balances b
-          WHERE b.cash_minor IS NOT NULL
-            AND b.as_of_date = (
-              SELECT MAX(b2.as_of_date)
-              FROM account_balances b2
-              WHERE b2.account_id = b.account_id
-            )
-        ) latest WHERE latest.currency = brokerage_holdings.currency), 0) AS cash,
-        COALESCE((SELECT SUM(buying_power_minor) FROM (
-          SELECT account_id, currency, buying_power_minor
-          FROM account_balances b
-          WHERE b.buying_power_minor IS NOT NULL
-            AND b.as_of_date = (
-              SELECT MAX(b2.as_of_date)
-              FROM account_balances b2
-              WHERE b2.account_id = b.account_id
-            )
-        ) latest WHERE latest.currency = brokerage_holdings.currency), 0) AS buying_power,
-        COUNT(*) AS holdings,
-        COALESCE((SELECT COUNT(*) FROM brokerage_transactions tx
-          WHERE tx.currency = brokerage_holdings.currency), 0) AS transactions
-      FROM brokerage_holdings
-      WHERE as_of_date = (
-        SELECT MAX(h2.as_of_date)
-        FROM brokerage_holdings h2
-        WHERE h2.account_id = brokerage_holdings.account_id
+      WITH latest_holdings AS (
+        SELECT h.*,
+          -- A cash-equivalent line counts as cash unless it sits on a crypto
+          -- exchange, where it is the account's (crypto) market value instead.
+          (COALESCE(h.security_type, '') = 'cash' AND LOWER(COALESCE(a.type, '')) NOT LIKE '%crypto%') AS is_cash
+        FROM brokerage_holdings h
+        JOIN accounts a ON a.id = h.account_id
+        WHERE h.as_of_date = (
+          SELECT MAX(h2.as_of_date) FROM brokerage_holdings h2
+          WHERE h2.account_id = h.account_id
+        )
+      ),
+      cash_holdings AS (
+        SELECT account_id, currency, SUM(value_minor) AS cash_minor
+        FROM latest_holdings
+        WHERE is_cash
+        GROUP BY account_id, currency
+      ),
+      latest_balances AS (
+        SELECT b.account_id, b.currency, b.cash_minor, b.buying_power_minor
+        FROM account_balances b
+        WHERE b.as_of_date = (
+          SELECT MAX(b2.as_of_date) FROM account_balances b2
+          WHERE b2.account_id = b.account_id
+        )
+      ),
+      account_cash AS (
+        SELECT account_id, currency, cash_minor FROM cash_holdings
+        UNION ALL
+        SELECT account_id, currency, cash_minor FROM latest_balances
+        WHERE cash_minor IS NOT NULL
+          AND account_id NOT IN (SELECT account_id FROM cash_holdings)
       )
-      GROUP BY currency
-      ORDER BY currency
+      SELECT lh.currency,
+        COALESCE(SUM(CASE WHEN lh.is_cash THEN 0 ELSE lh.value_minor END), 0) AS market_value,
+        COALESCE((SELECT SUM(ac.cash_minor) FROM account_cash ac WHERE ac.currency = lh.currency), 0) AS cash,
+        COALESCE((SELECT SUM(lb.buying_power_minor) FROM latest_balances lb
+          WHERE lb.buying_power_minor IS NOT NULL AND lb.currency = lh.currency), 0) AS buying_power,
+        SUM(CASE WHEN lh.is_cash THEN 0 ELSE 1 END) AS holdings,
+        COALESCE((SELECT COUNT(*) FROM brokerage_transactions tx
+          WHERE tx.currency = lh.currency), 0) AS transactions
+      FROM latest_holdings lh
+      GROUP BY lh.currency
+      ORDER BY lh.currency
     `).all() as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       currency: String(row.currency),
@@ -809,6 +852,54 @@ export class SqliteFinanceRepository implements FinanceRepository {
       buyingPowerMinor: Number(row.buying_power),
       holdings: Number(row.holdings),
       transactions: Number(row.transactions),
+    }));
+  }
+
+  brokerageValueSeries(accountId?: string): BrokerageValuePoint[] {
+    // The equity curve: summed market value of held positions across brokerage
+    // accounts per snapshot date (matches the Market value tile; excludes cash).
+    // Each account's holdings are first collapsed to one total per snapshot date,
+    // then carried forward to every later date (correlated subquery; SQLite has no
+    // LATERAL) before summing — a full account snapshot replaces the prior one on
+    // its next sync, so carrying the account total forward (rather than each
+    // security) avoids both cross-account day gaps and sold positions lingering.
+    const values: string[] = [];
+    let scope = '';
+    if (accountId) {
+      scope = 'AND h.account_id = ?';
+      values.push(accountId);
+    }
+    const rows = this.database.prepare(`
+      WITH account_values AS (
+        SELECT h.account_id, h.as_of_date, h.currency, SUM(h.value_minor) AS value_minor
+        FROM brokerage_holdings h
+        JOIN accounts a ON a.id = h.account_id
+        -- Exclude cash-equivalent lines from the equity curve, except on crypto
+        -- exchanges where that line is the account's (crypto) market value.
+        WHERE a.domain = 'brokerage'
+          AND (COALESCE(h.security_type, '') <> 'cash' OR LOWER(COALESCE(a.type, '')) LIKE '%crypto%') ${scope}
+        GROUP BY h.account_id, h.as_of_date, h.currency
+      ),
+      acct AS (SELECT DISTINCT account_id, currency FROM account_values),
+      dates AS (SELECT DISTINCT as_of_date FROM account_values),
+      grid AS (
+        SELECT d.as_of_date, ac.currency,
+          (SELECT av.value_minor FROM account_values av
+           WHERE av.account_id = ac.account_id AND av.currency = ac.currency
+             AND av.as_of_date <= d.as_of_date
+           ORDER BY av.as_of_date DESC LIMIT 1) AS value_minor
+        FROM dates d CROSS JOIN acct ac
+      )
+      SELECT as_of_date AS date, currency, SUM(value_minor) AS value_minor
+      FROM grid
+      WHERE value_minor IS NOT NULL
+      GROUP BY as_of_date, currency
+      ORDER BY as_of_date ASC, currency
+    `).all(...values) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      date: String(row.date),
+      valueMinor: Number(row.value_minor),
+      currency: String(row.currency),
     }));
   }
 
@@ -916,7 +1007,7 @@ export class SqliteFinanceRepository implements FinanceRepository {
     return rows.map(mapRule);
   }
 
-  private getRule(kind: string): RuleRecord | null {
+  getRule(kind: string): RuleRecord | null {
     const row = this.database.prepare(`SELECT ${this.ruleColumns} FROM rules WHERE kind = ?`).get(kind) as RuleRow | undefined;
     return row ? mapRule(row) : null;
   }
@@ -944,6 +1035,38 @@ export class SqliteFinanceRepository implements FinanceRepository {
       UPDATE rules SET cadence = ?, scheduled_hour = ?, scheduled_day = ?, updated_at = ? WHERE kind = ?
     `).run(schedule.cadence, schedule.scheduledHour, schedule.scheduledDay, new Date().toISOString(), kind);
     return result.changes > 0 ? this.getRule(kind) : null;
+  }
+
+  // Insert a user-authored custom rule as its own row (source = 'user'), active by
+  // default. The service mints a unique kind and validates the SQL first.
+  createUserRule(spec: RuleSpec, schedule: RuleAdoption): RuleRecord {
+    const now = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO rules (kind, domain, execution_class, action_tier, scope, cadence, keywords, sql, prompt, facts, enabled, version, source, active, source_text, channel, scheduled_hour, scheduled_day, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+    `).run(spec.kind, spec.domain, spec.executionClass, spec.actionTier, spec.scope, schedule.cadence,
+      spec.keywords, spec.sql, spec.prompt, JSON.stringify(spec.facts), spec.enabled ? 1 : 0, spec.version, spec.source,
+      schedule.sourceText, schedule.channel, schedule.scheduledHour, schedule.scheduledDay, now, now);
+    const created = this.getRule(spec.kind);
+    if (!created) throw new Error('failed to create custom rule');
+    return created;
+  }
+
+  // Rewrite a custom rule's definition columns (LLM-authored SQL + classification).
+  // Guarded to source = 'user' so a built-in/downloaded rule can never be edited.
+  updateUserRuleContent(kind: string, content: RuleContentEdit): RuleRecord | null {
+    const result = this.database.prepare(`
+      UPDATE rules SET sql = ?, keywords = ?, domain = ?, scope = ?, source_text = ?, updated_at = ?
+      WHERE kind = ? AND source = 'user'
+    `).run(content.sql, content.keywords, content.domain, content.scope, content.sourceText, new Date().toISOString(), kind);
+    return result.changes > 0 ? this.getRule(kind) : null;
+  }
+
+  // Delete a custom rule. Guarded to source = 'user' so built-in/downloaded rules
+  // are never removed. Returns whether a row was deleted.
+  deleteRule(kind: string): boolean {
+    const result = this.database.prepare(`DELETE FROM rules WHERE kind = ? AND source = 'user'`).run(kind);
+    return result.changes > 0;
   }
 
   // The definition view over the single table (used by rule inference, the facts
@@ -1482,7 +1605,20 @@ export class SqliteFinanceRepository implements FinanceRepository {
     ).changes === 1);
   }
 
+  setBrokerageCashMinor(accountId: string, asOfDate: string, cashMinor: number): void {
+    // The Plaid balance row is written (INSERT OR IGNORE) before investment
+    // holdings are fetched, so cash discovered in the holdings feed is patched
+    // onto the existing balance for that snapshot date rather than re-inserted.
+    this.database.prepare(
+      `UPDATE account_balances SET cash_minor = ? WHERE account_id = ? AND as_of_date = ?`,
+    ).run(cashMinor, accountId, asOfDate);
+  }
+
   close(): void {
+    if (this.ruleDb) {
+      this.ruleDb.close();
+      this.ruleDb = null;
+    }
     this.database.close();
   }
 

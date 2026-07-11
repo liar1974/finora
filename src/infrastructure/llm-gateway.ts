@@ -186,11 +186,11 @@ export function estimateOllamaNumCtx(
 // Rough token budget for providers with a large context window (cloud models). We don't know
 // each model's exact limit, so this is a generous floor that no normal prompt reaches; the
 // clamp only bites pathological inputs. Ollama uses its own num_ctx cap; builtin passes its
-// small contextSize in explicitly.
+// per-prompt context budget in explicitly.
 export const CLOUD_CONTEXT_TOKENS = 128_000;
 
 // Tokens of context the active provider can accept for input+output. Builtin isn't handled
-// here (it never reaches the gateway) — its caller passes contextSize directly to clampChatInput.
+// here (it never reaches the gateway) — its caller passes its context budget directly to clampChatInput.
 export function providerContextTokens(config: EffectiveLlmConfig): number {
   if (config.provider === 'ollama') return config.numCtxMax && config.numCtxMax > 0 ? config.numCtxMax : 32768;
   return CLOUD_CONTEXT_TOKENS;
@@ -207,12 +207,19 @@ function middleTruncate(text: string, target: number, marker: string): string {
 // provider silently truncates (Ollama) or hard-errors (builtin) on an oversized prompt. Trims
 // the largest content field via a middle ellipsis (preserving head + tail — instructions and
 // closing text, or first + last records) until the estimate fits the budget. Pure and testable;
-// `truncated` lets the caller log when it fired. Char/token ratio matches estimateOllamaNumCtx.
+// `truncated` lets the caller log when it fired.
+//
+// The chat system prompt embeds the local ledger as pretty-printed JSON, which tokenizes DENSER
+// than prose (~3 chars/token, sometimes less), so this clamp is deliberately conservative: it
+// assumes 3 chars/token. Overestimating tokens is the safe bias here — it trims a little early
+// rather than letting a dense prompt overflow the window and hard-error the built-in model on the
+// pinned (uncompressible) system message. (estimateOllamaNumCtx keeps its own looser 3.5 ratio,
+// where the opposite bias — a slightly larger num_ctx — is the safe one.)
 export function clampChatInput(
   input: { system: string; messages: Array<{ role: 'user' | 'assistant'; content: string }>; maxTokens?: number },
   contextTokens: number,
 ): { system: string; messages: Array<{ role: 'user' | 'assistant'; content: string }>; truncated: boolean } {
-  const CHARS_PER_TOKEN = 3.5;
+  const CHARS_PER_TOKEN = 3.0;
   const budgetChars = Math.max(1024, Math.floor((contextTokens - (input.maxTokens ?? 768) - 256) * CHARS_PER_TOKEN));
   const fields = [input.system, ...input.messages.map((m) => m.content)];
   const total = () => fields.reduce((sum, text) => sum + text.length, 0);

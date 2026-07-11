@@ -22,6 +22,7 @@ import type {
   RecurringClassifier,
   RecurringVerdict,
   RuleFeedClient,
+  RuleSqlAuthor,
   StatementParser,
   SummaryQuery,
   TransactionQuery,
@@ -44,7 +45,7 @@ import {
   normalizeCurrency,
   requireText,
 } from '../domain/invariants.js';
-import type { Account, ChatSessionRecord, CreditReportRecord, FactExpectation, Finding, ImportRecord, MerchantCandidate, RecurringCandidate, RecurringClassification, RecurringDirection, RuleFactNeed, RuleSpec, Transaction, TransactionInput } from '../domain/models.js';
+import type { Account, ChatSessionRecord, CreditReportRecord, FactExpectation, Finding, ImportRecord, MerchantCandidate, RecurringCandidate, RecurringClassification, RecurringDirection, RuleDomain, RuleFactNeed, RuleSpec, RuleSqlDraft, Transaction, TransactionInput } from '../domain/models.js';
 import { builtinRuleSpecs, evaluateRules, executionStrategy, inferRule } from './rules-engine.js';
 import type { EvaluationData, QuestionDraft } from './rules-engine.js';
 import { clampChatInput, generateChatReply, LLM_PROVIDERS, providerContextTokens, resolveLlmConfig } from '../infrastructure/llm-gateway.js';
@@ -280,6 +281,7 @@ export class FinanceService {
   private readonly recurringClassifierInjected: boolean;
   private readonly merchantIdentifier: MerchantIdentifier;
   private readonly merchantIdentifierInjected: boolean;
+  private readonly ruleSqlAuthor: RuleSqlAuthor;
 
   constructor(
     private readonly repository: FinanceRepository,
@@ -288,11 +290,13 @@ export class FinanceService {
     private readonly ruleFeed?: RuleFeedClient,
     recurringClassifier?: RecurringClassifier,
     merchantIdentifier?: MerchantIdentifier,
+    ruleSqlAuthor?: RuleSqlAuthor,
   ) {
     this.recurringClassifierInjected = Boolean(recurringClassifier);
     this.recurringClassifier = recurringClassifier ?? ((candidates) => this.classifyRecurringWithModel(candidates));
     this.merchantIdentifierInjected = Boolean(merchantIdentifier);
     this.merchantIdentifier = merchantIdentifier ?? ((candidates) => this.identifyMerchantsWithModel(candidates));
+    this.ruleSqlAuthor = ruleSqlAuthor ?? ((input) => this.authorRuleSqlWithModel(input));
     this.telegramGateway = new TelegramGateway({
       getToken: () => this.telegramToken(),
       getChatId: () => this.repository.getAppSetting('TELEGRAM_CHAT_ID'),
@@ -403,6 +407,10 @@ export class FinanceService {
 
   summarizeBrokerage() {
     return this.repository.summarizeBrokerage();
+  }
+
+  brokerageValueSeries(accountId?: string) {
+    return this.repository.brokerageValueSeries(accountId);
   }
 
   listDashboards() {
@@ -863,12 +871,12 @@ export class FinanceService {
     itemId: string,
     accessToken: string,
     connection: { institution: string | null; environment: string | null },
-  ): Promise<{ accounts: Map<string, { id: string; currency: string; domain: string }>; consentExpiresAt: string | null }> {
+  ): Promise<{ accounts: Map<string, { id: string; currency: string; domain: string; type: string }>; consentExpiresAt: string | null }> {
     const response = await client.accountsGet({ access_token: accessToken });
     // OAuth institutions (e.g. Chase) report when the user's consent lapses; capture it so a
     // rule can warn ahead of the hard ITEM_LOGIN_REQUIRED. Null for non-OAuth items.
     const consentExpiresAt = response.data.item.consent_expiration_time ?? null;
-    const map = new Map<string, { id: string; currency: string; domain: string }>();
+    const map = new Map<string, { id: string; currency: string; domain: string; type: string }>();
     const asOfDate = new Date().toISOString().slice(0, 10);
     const institution = connection.institution || normalizeProviderInstitution('Plaid');
     const balances: ProviderBalanceInput[] = [];
@@ -894,7 +902,7 @@ export class FinanceService {
       });
       const account = this.repository.listAccounts().find((item) => item.source === 'plaid' && item.providerAccountId === plaidAccount.account_id);
       if (!account) continue;
-      map.set(plaidAccount.account_id, { id: account.id, currency: account.currency, domain });
+      map.set(plaidAccount.account_id, { id: account.id, currency: account.currency, domain, type: account.type });
       const current = plaidAccount.balances?.current;
       const available = plaidAccount.balances?.available;
       if (current !== null || available !== null) {
@@ -917,7 +925,7 @@ export class FinanceService {
   private async syncPlaidInvestments(
     client: PlaidApi,
     accessToken: string,
-    accountMap: Map<string, { id: string; currency: string; domain: string }>,
+    accountMap: Map<string, { id: string; currency: string; domain: string; type: string }>,
   ): Promise<Pick<ProviderSyncResult, 'holdings' | 'transactions' | 'skipped'>> {
     const out = { holdings: 0, transactions: 0, skipped: 0 };
     const investmentAccountIds = [...accountMap]
@@ -932,6 +940,10 @@ export class FinanceService {
         options: { account_ids: investmentAccountIds },
       });
       const securities = new Map((response.data.securities || []).map((security: any) => [String(security.security_id), security]));
+      // Plaid reports uninvested cash as a pseudo-security holding (security type
+      // 'cash', ticker CUR:USD). That is the account's cash, not a position, so we
+      // divert it to the balance's cash_minor instead of storing it as a holding.
+      const cashByAccount = new Map<string, number>();
       const holdings: ProviderHoldingInput[] = (response.data.holdings || []).flatMap((holding: any) => {
         const account = accountMap.get(String(holding.account_id));
         if (!account) return [];
@@ -940,6 +952,14 @@ export class FinanceService {
         const price = numberOrNull(holding.institution_price ?? security.close_price);
         const value = numberOrNull(holding.institution_value);
         if (value === null) return [];
+        // Divert cash-equivalent lines to the balance's cash — except on crypto
+        // exchanges, which have no cash: there the CUR:USD line is the account's
+        // (crypto) market value, so keep it as a holding.
+        const isCrypto = (account.type || '').toLowerCase().includes('crypto');
+        if (!isCrypto && (security.type === 'cash' || security.ticker_symbol === 'CUR:USD')) {
+          cashByAccount.set(account.id, (cashByAccount.get(account.id) ?? 0) + toMinor(value));
+          return [];
+        }
         const securityId = holding.security_id ? String(holding.security_id) : null;
         const symbol = security.ticker_symbol || security.proxy_security_id || null;
         return [{
@@ -961,6 +981,9 @@ export class FinanceService {
       const saved = this.repository.saveProviderHoldings(holdings);
       out.holdings += saved.inserted;
       out.skipped += saved.skipped;
+      for (const [accountId, cashMinor] of cashByAccount) {
+        this.repository.setBrokerageCashMinor(accountId, asOfDate, cashMinor);
+      }
     } catch (error) {
       console.warn('Finora Plaid investments holdings sync failed:', error instanceof Error ? error.message : error);
     }
@@ -1389,6 +1412,165 @@ export class FinanceService {
     return rule;
   }
 
+  // --- Custom (user-authored) rules -----------------------------------------
+  // A custom rule is authored from natural language: the configured model turns
+  // the description into a deterministic (D) SQL query, which the engine then runs
+  // exactly like a built-in. Unlike createRule (which adopts an existing built-in
+  // definition), these are new rows with source = 'user' — the only rules the user
+  // may edit the content of or delete. See docs/rules-design.md.
+
+  // Author + validate a custom rule's SQL without persisting, so the UI can show
+  // the generated query and inferred settings before the user commits.
+  async previewCustomRule(input: { text: string; cadence?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
+    const text = requireText(input.text, 'text');
+    const draft = await this.authorCustomRule(text);
+    const cadence = normalizeChoice(input.cadence ?? 'event', RULE_CADENCES, 'event');
+    return {
+      text,
+      kind: null,
+      domain: draft.domain,
+      scope: draft.scope,
+      executionClass: 'D' as const,
+      cadence,
+      scheduledHour: input.scheduledHour ?? suggestedRuleHour(cadence),
+      scheduledDay: input.scheduledDay ?? null,
+      sql: draft.sql,
+      title: draft.title,
+      strategy: executionStrategy('D'),
+    };
+  }
+
+  // Author + validate + persist a new custom rule (source = 'user'), active by
+  // default. The kind is minted here — the model never owns identity.
+  async createCustomRule(input: { text: string; cadence?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
+    const text = requireText(input.text, 'text');
+    const draft = await this.authorCustomRule(text);
+    const cadence = normalizeChoice(input.cadence ?? 'event', RULE_CADENCES, 'event');
+    const kind = this.mintUserRuleKind(text);
+    const spec: RuleSpec = {
+      kind,
+      domain: draft.domain,
+      executionClass: 'D',
+      actionTier: 'observer',
+      scope: draft.scope,
+      cadence,
+      keywords: draft.keywords,
+      sql: draft.sql,
+      prompt: null,
+      facts: [],
+      enabled: true,
+      source: 'user',
+      version: 1,
+    };
+    return this.repository.createUserRule(spec, {
+      sourceText: text,
+      cadence,
+      channel: 'auto',
+      scheduledHour: input.scheduledHour ?? suggestedRuleHour(cadence),
+      scheduledDay: input.scheduledDay ?? null,
+    });
+  }
+
+  // Rewrite a custom rule's content by regenerating its SQL from new natural
+  // language. Only user rules may be edited; built-in/downloaded content is fixed.
+  async updateCustomRuleContent(input: { kind: string; text: string }) {
+    const kind = requireText(input.kind, 'kind');
+    const text = requireText(input.text, 'text');
+    const existing = this.repository.getRule(kind);
+    if (!existing) throw new AppError('not_found', 'Rule not found', { kind });
+    if (existing.source !== 'user') {
+      throw new AppError('invalid_input', 'Only custom rules can be edited; built-in rules have fixed content.', { kind, source: existing.source });
+    }
+    const draft = await this.authorCustomRule(text);
+    const rule = this.repository.updateUserRuleContent(kind, {
+      sql: draft.sql,
+      keywords: draft.keywords,
+      domain: draft.domain,
+      scope: draft.scope,
+      sourceText: text,
+    });
+    if (!rule) throw new AppError('not_found', 'Rule not found', { kind });
+    return rule;
+  }
+
+  // Delete a rule. Only custom (source = 'user') rules may be deleted; built-in and
+  // downloaded rules are protected (disable them with toggleRule instead).
+  deleteRule(kind: string) {
+    const key = requireText(kind, 'kind');
+    const existing = this.repository.getRule(key);
+    if (!existing) throw new AppError('not_found', 'Rule not found', { kind: key });
+    if (existing.source !== 'user') {
+      throw new AppError('invalid_input', 'Built-in and downloaded rules cannot be deleted; disable them instead.', { kind: key, source: existing.source });
+    }
+    const removed = this.repository.deleteRule(key);
+    if (!removed) throw new AppError('not_found', 'Rule not found', { kind: key });
+    return { kind: key, deleted: true };
+  }
+
+  // Run the injected author, then validate the generated SQL against the live DB on
+  // the read-only connection before it is ever persisted or scheduled.
+  private async authorCustomRule(text: string): Promise<RuleSqlDraft> {
+    const draft = await this.ruleSqlAuthor({ text });
+    this.validateRuleSql(draft.sql);
+    return {
+      sql: draft.sql,
+      title: draft.title || 'Custom rule',
+      keywords: draft.keywords || text.toLowerCase().slice(0, 120),
+      domain: normalizeChoice(draft.domain, RULE_DOMAINS, 'spending') as RuleDomain,
+      scope: normalizeChoice(draft.scope, RULE_SCOPES, 'banking'),
+    };
+  }
+
+  // Execute the candidate SQL once on the read-only connection with the engine's
+  // param superset. A driver error (write attempt, bad SQL) or a result row missing
+  // the required finding-draft columns rejects the rule before it can be saved.
+  private validateRuleSql(sql: string) {
+    let rows: Record<string, unknown>[];
+    try {
+      rows = this.repository.runRuleQuery(sql, RULE_SQL_VALIDATION_PARAMS);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'query failed';
+      throw new AppError('invalid_input', `Generated rule query was invalid: ${message}`, { sql });
+    }
+    const first = rows[0];
+    if (first) {
+      const missing = REQUIRED_RULE_COLUMNS.filter((column) => !(column in first));
+      if (missing.length > 0) {
+        throw new AppError('invalid_input', `Generated rule query is missing required columns: ${missing.join(', ')}`, { sql, missing });
+      }
+    }
+  }
+
+  // Production NL→SQL author (default RuleSqlAuthor). Asks the configured model for
+  // a deterministic query over the local schema, returning strict JSON.
+  private async authorRuleSqlWithModel({ text }: { text: string }): Promise<RuleSqlDraft> {
+    const llm = this.llmConfig();
+    try {
+      const reply = await this.llmReply(llm, {
+        system: RULE_SQL_AUTHOR_SYSTEM,
+        messages: [{ role: 'user', content: text }],
+        timeoutMs: 120_000,
+        maxTokens: 1_200,
+      });
+      const parsed = parseRuleSqlDraft(reply);
+      if (!parsed) throw new Error('the model did not return a SQL rule');
+      return parsed;
+    } catch (error) {
+      if (error instanceof ModelNotDownloadedError) {
+        throw new AppError('invalid_input', error.message, { provider: llm.provider, reason: 'needs_download' });
+      }
+      const message = error instanceof Error ? error.message : 'authoring failed';
+      throw new AppError('invalid_input', `Could not author a rule from that description: ${message}`);
+    }
+  }
+
+  // user:<slug>-<8 hex>. The random suffix keeps the primary key unique even when
+  // two rules slug to the same words.
+  private mintUserRuleKind(text: string): string {
+    const slug = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'rule';
+    return `user:${slug}-${randomUUID().slice(0, 8)}`;
+  }
+
   // --- Facts and questions --------------------------------------------------
   // Facts are values the user knows but the account stream does not expose. A
   // rule blocked on a missing required fact produces a ranked question instead of
@@ -1698,14 +1880,24 @@ export class FinanceService {
       memoryContext(memory),
       '',
       'Local context:',
-      JSON.stringify(context, null, 2),
+      // Compact (no indentation): a local CPU model must prefill this whole system
+      // prompt, and pretty-printing spends 30-50% of the tokens on whitespace for zero
+      // information gain — a direct hit to prefill latency (the cause of chat timeouts).
+      JSON.stringify(context),
     ].join('\n');
     try {
       const reply = await this.llmReply(llm, {
         system,
         messages: messages.slice(-8),
-        timeoutMs: 120_000,
+        // A local model prefilling a full ledger snapshot on CPU can take minutes; allow
+        // 5 minutes before giving up (the built-in path honors this signal). The HTTP
+        // server's requestTimeout is raised past this so it never races (see server.ts).
+        timeoutMs: 300_000,
         maxTokens: 768,
+        // Reasoning models (Qwen3.5) otherwise spend the whole 768-token budget inside
+        // <think> and return an empty answer. Chat wants the answer, not the reasoning,
+        // and skipping <think> is also much faster on a CPU-bound local model.
+        disableThinking: true,
       });
       this.recordAgentEvent({ turnId, eventType: 'assistant_message', role: 'assistant', content: reply });
       return { provider: llm.provider, model: llm.chatModel, local: llm.local, reply };
@@ -2090,10 +2282,14 @@ export class FinanceService {
     messages: Array<{ role: 'user' | 'assistant'; content: string }>;
     timeoutMs?: number;
     maxTokens?: number;
+    // Only honored by the built-in engine (reasoning models); ignored by HTTP providers.
+    disableThinking?: boolean;
   }): Promise<string> {
     // Single choke point for context sizing: clamp the prompt to the active provider's window
     // so no provider silently truncates (Ollama) or hard-errors (builtin) on oversized input.
-    const contextTokens = config.provider === 'builtin' ? getBuiltinModel(config.model).contextSize : providerContextTokens(config);
+    const contextTokens = config.provider === 'builtin'
+      ? await this.localModel.contextBudget(config.model)
+      : providerContextTokens(config);
     const clamped = clampChatInput(input, contextTokens);
     if (clamped.truncated) {
       console.warn(`LLM input clamped to fit ${config.provider} context (~${contextTokens} tokens)`);
@@ -2600,6 +2796,81 @@ export class FinanceService {
 
 }
 
+// Allowed classification values for a rule, mirrored from rules-engine so custom
+// rules validate against the same taxonomy.
+const RULE_SCOPES = ['banking', 'brokerage', 'credit', 'all'];
+const RULE_CADENCES = ['event', 'hourly', 'daily', 'weekly', 'monthly'];
+const RULE_DOMAINS = ['cash-flow', 'spending', 'credit-report', 'investments', 'connections'];
+
+// The columns every rule's SQL must SELECT to produce a finding draft (see
+// rowToDraft in rules-engine). Optional columns (dollar_impact_minor, currency,
+// urgency, effort, severity, action_label, account_id) are not required.
+const REQUIRED_RULE_COLUMNS = ['key', 'title', 'detail', 'value', 'confidence', 'evidence_summary', 'evidence_records'];
+
+// The engine's bound-param superset, used to dry-run a candidate rule query during
+// validation. Mirrors evaluateRules in rules-engine (values are representative).
+const RULE_SQL_VALIDATION_PARAMS: Record<string, unknown> = {
+  rule_id: 'preview',
+  rule_created_at: '2000-01-01T00:00:00.000Z',
+  now_iso: '2000-01-01T00:00:00.000Z',
+  now_ms: 946_684_800_000,
+  prior_30d_iso: '1999-12-02T00:00:00.000Z',
+  hysa_apr: 0.048,
+  checking_apr: 0.0001,
+};
+
+// System prompt for the default NL→SQL author. Describes the read-only schema, the
+// shared UDFs/params, and the finding-draft output contract, and demands raw SQL
+// as strict JSON. The query runs on a read-only connection, so it can only read.
+const RULE_SQL_AUTHOR_SYSTEM = [
+  'You author a single deterministic SQLite query for a Finora rule from the user\'s description.',
+  'Return ONLY compact JSON: {"sql": string, "domain": string, "scope": string, "keywords": string, "title": string}. No prose, no markdown fences.',
+  '',
+  'The sql MUST be a single read-only SELECT or WITH statement (it runs on a read-only connection; writes fail). No semicolons, no PRAGMA, no attached databases.',
+  'It MUST select these columns (a "finding draft"): key (stable unique id per row, TEXT), title, detail, value, confidence (0..1 REAL), evidence_summary, evidence_records (comma-joined record ids, may be \'\').',
+  'It MAY also select: dollar_impact_minor (signed integer minor units), currency, urgency (>=1), effort (>=1), severity (\'high\'|\'medium\'|\'low\'), action_label, account_id, created_at.',
+  'Amounts are integer minor units (cents); outflows are negative amount_minor. Annualize recurring impact to a 12-month horizon.',
+  '',
+  'Readable tables/columns:',
+  '- accounts(id, institution, name, type, currency, domain, source)',
+  '- transactions(id, account_id, date, description, amount_minor, currency, category, pending)',
+  '- account_balances(id, account_id, as_of_date, current_minor, available_minor, limit_minor, cash_minor, currency) — use the latest per account via ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC)',
+  '- brokerage_holdings(id, account_id, as_of_date, symbol, name, security_type, quantity, value_minor, currency)',
+  '- brokerage_transactions(id, account_id, date, description, amount_minor, currency, symbol, investment_type)',
+  '- facts(key, value, source, confidence)',
+  '- recurring_series view(account_id, merchant, direction, currency, count, latest_minor, typical_minor, label, first_date, last_date, periods_per_year, record_ids) joined to recurring_classifications(merchant, direction, is_recurring, kind, canonical_name, confidence)',
+  '- merchant_identities(merchant, canonical_name, canonical_slug)',
+  '',
+  'UDFs/aggregates: money(minor[, currency]) -> display string, normalize_merchant(description), fee_like(description) -> 1/0, median(x).',
+  'Bound params you may reference: :now_iso, :now_ms, :prior_30d_iso, :hysa_apr, :checking_apr, :rule_created_at. Use julianday(:now_iso) - julianday(date) for day math.',
+  '',
+  'domain must be one of: cash-flow, spending, credit-report, investments, connections. scope one of: banking, brokerage, credit, all. keywords is a short lowercase regex-ish phrase for matching. Always add a LIMIT.',
+].join('\n');
+
+// Parse the author's JSON reply into a RuleSqlDraft. Returns null when the reply
+// has no JSON object or lacks a usable sql string.
+function parseRuleSqlDraft(reply: string): RuleSqlDraft | null {
+  const match = reply.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  let value: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(match[0]);
+    if (!parsed || typeof parsed !== 'object') return null;
+    value = parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const sql = typeof value.sql === 'string' ? value.sql.trim() : '';
+  if (!sql) return null;
+  return {
+    sql,
+    domain: String(value.domain ?? 'spending') as RuleDomain,
+    scope: String(value.scope ?? 'banking'),
+    keywords: typeof value.keywords === 'string' ? value.keywords : '',
+    title: typeof value.title === 'string' ? value.title : 'Custom rule',
+  };
+}
+
 function parseRuleInference(reply: string): Partial<{ scope: string; cadence: string }> {
   const match = reply.match(/\{[\s\S]*\}/);
   if (!match) return {};
@@ -2829,7 +3100,6 @@ function parseRuleFeed(body: string): { version: number; specs: RuleSpec[] } {
   return { version, specs: record.specs.map((raw, index) => coerceRuleSpec(raw, index)) };
 }
 
-const RULE_FEED_DOMAINS = ['cash-flow', 'spending', 'credit', 'investments', 'connections'];
 const RULE_FEED_CLASSES = ['D', 'L', 'L+'];
 const RULE_FEED_TIERS = ['observer', 'advisor', 'guardian', 'navigator'];
 
@@ -2844,7 +3114,7 @@ function coerceRuleSpec(raw: unknown, index: number): RuleSpec {
   const strOrNull = (value: unknown) => (typeof value === 'string' ? value : null);
   return {
     kind,
-    domain: pick(r.domain, RULE_FEED_DOMAINS, 'cash-flow') as RuleSpec['domain'],
+    domain: pick(r.domain, RULE_DOMAINS, 'cash-flow') as RuleSpec['domain'],
     executionClass: pick(r.executionClass, RULE_FEED_CLASSES, 'D') as RuleSpec['executionClass'],
     actionTier: pick(r.actionTier, RULE_FEED_TIERS, 'observer') as RuleSpec['actionTier'],
     scope: str(r.scope, 'all'),
@@ -3068,14 +3338,14 @@ function insightIdentity(finding: Finding): string {
 const IM_DOMAIN_LABELS: Record<string, string> = {
   'cash-flow': 'Cash flow',
   spending: 'Spending',
-  credit: 'Credit',
+  'credit-report': 'Credit report',
   investments: 'Investments',
   connections: 'Connections',
 };
-const IM_DOMAIN_ORDER = ['cash-flow', 'spending', 'credit', 'investments', 'connections'];
+const IM_DOMAIN_ORDER = ['cash-flow', 'spending', 'credit-report', 'investments', 'connections'];
 
 // Group the delivered findings under their rule-taxonomy category so the message
-// reads by domain (Cash flow, Spending, Credit, Investments, Connections).
+// reads by domain (Cash flow, Spending, Credit report, Investments, Connections).
 function formatImInsights(findings: Finding[]): string {
   const icon = { high: '🔴', medium: '🟠', low: '🟡' } as const;
   const byDomain = new Map<string, Finding[]>();

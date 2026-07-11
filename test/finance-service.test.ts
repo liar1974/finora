@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FinanceService, enrichCreditExtractionWithLlm } from '../src/application/finance-service.js';
-import type { MerchantIdentifier, RecurringClassifier } from '../src/application/ports.js';
+import type { MerchantIdentifier, RecurringClassifier, RuleSqlAuthor } from '../src/application/ports.js';
 import { CsvStatementParser } from '../src/infrastructure/parsers/csv-parser.js';
 import { OfxStatementParser } from '../src/infrastructure/parsers/ofx-parser.js';
 import { SqliteFinanceRepository } from '../src/infrastructure/sqlite-repository.js';
@@ -51,7 +51,24 @@ const fakeMerchantIdentifier: MerchantIdentifier = async (candidates) =>
     return { merchant: candidate.merchant, canonicalName, canonicalSlug: canonicalName.toLowerCase(), confidence: 0.9 };
   });
 
-function application(classifier?: RecurringClassifier, identifier?: MerchantIdentifier) {
+// A valid deterministic rule query: it selects every required finding-draft
+// column and touches no tables/params, so it runs on any database and passes
+// validation. Stands in for whatever SQL the model would author.
+const VALID_RULE_SQL =
+  "SELECT 'row-1' AS key, 'Test finding' AS title, 'detail text' AS detail, 'value copy' AS value, 0.9 AS confidence, 'evidence' AS evidence_summary, '' AS evidence_records LIMIT 1";
+
+// A deterministic stand-in for the LLM NL→SQL rule author. Returns valid SQL by
+// default; a test can pass its own author to exercise the write/bad-column
+// rejection paths. Injecting it also marks a model as "available".
+const fakeRuleSqlAuthor: RuleSqlAuthor = async () => ({
+  sql: VALID_RULE_SQL,
+  domain: 'spending',
+  scope: 'banking',
+  keywords: 'test custom rule',
+  title: 'Test custom rule',
+});
+
+function application(classifier?: RecurringClassifier, identifier?: MerchantIdentifier, ruleSqlAuthor?: RuleSqlAuthor) {
   return new FinanceService(
     new SqliteFinanceRepository(':memory:'),
     [new OfxStatementParser(), new CsvStatementParser()],
@@ -59,6 +76,7 @@ function application(classifier?: RecurringClassifier, identifier?: MerchantIden
     undefined,
     classifier,
     identifier,
+    ruleSqlAuthor,
   );
 }
 
@@ -1346,5 +1364,72 @@ describe('enrichCreditExtractionWithLlm', () => {
     const json = JSON.stringify({ accounts: [], inquiries: [{ company: 'FACTUAL DATA', inquiryDate: '2026-01-21', type: 'hard' }] });
     const { aiReview } = await enrichCreditExtractionWithLlm(extracted, text, reply(json), meta);
     expect(aiReview).toBeNull();
+  });
+});
+
+// User-authored custom rules: the configured model turns a natural-language
+// description into a deterministic (D) SQL query, which the service validates on
+// the read-only connection before persisting as its own source='user' row. Only
+// custom rules can be edited or deleted; built-in and downloaded rules are fixed.
+describe('FinanceService custom rules', () => {
+  it('previews an authored rule without persisting it', async () => {
+    const service = application(undefined, undefined, fakeRuleSqlAuthor);
+    const before = service.listRules().length;
+    const preview = await service.previewCustomRule({ text: 'flag brokerage cash above 25%', cadence: 'weekly' });
+    expect(preview).toMatchObject({
+      kind: null,
+      executionClass: 'D',
+      domain: 'spending',
+      scope: 'banking',
+      cadence: 'weekly',
+      sql: VALID_RULE_SQL,
+    });
+    // Preview must never write a row.
+    expect(service.listRules().length).toBe(before);
+    service.close();
+  });
+
+  it('creates, evaluates, edits, and deletes a custom rule', async () => {
+    const service = application(undefined, undefined, fakeRuleSqlAuthor);
+    const created = await service.createCustomRule({ text: 'flag idle brokerage cash' });
+    expect(created).toMatchObject({ source: 'user', active: true });
+    expect(created.kind).toMatch(/^user:.*-[0-9a-f]{8}$/);
+    // The rule is persisted and its SQL is runnable by the engine.
+    expect(service.listRules().some((rule) => rule.kind === created.kind)).toBe(true);
+    expect(() => service.listFindings()).not.toThrow();
+
+    // Editing regenerates the definition from new natural language.
+    const edited = await service.updateCustomRuleContent({ kind: created.kind, text: 'a different description' });
+    expect(edited.kind).toBe(created.kind);
+    expect(edited.sourceText).toBe('a different description');
+
+    // Deleting a custom rule removes it.
+    expect(service.deleteRule(created.kind)).toEqual({ kind: created.kind, deleted: true });
+    expect(service.listRules().some((rule) => rule.kind === created.kind)).toBe(false);
+    service.close();
+  });
+
+  it('rejects SQL that is not read-only or is missing required columns', async () => {
+    const writeAuthor: RuleSqlAuthor = async () => ({ sql: 'DELETE FROM rules', domain: 'spending', scope: 'banking', keywords: '', title: 'x' });
+    const writes = application(undefined, undefined, writeAuthor);
+    await expect(writes.previewCustomRule({ text: 'try to delete everything' })).rejects.toMatchObject({ code: 'invalid_input' });
+    writes.close();
+
+    const thinAuthor: RuleSqlAuthor = async () => ({ sql: "SELECT 'k' AS key LIMIT 1", domain: 'spending', scope: 'banking', keywords: '', title: 'x' });
+    const thin = application(undefined, undefined, thinAuthor);
+    await expect(thin.createCustomRule({ text: 'incomplete draft' })).rejects.toMatchObject({ code: 'invalid_input' });
+    thin.close();
+  });
+
+  it('protects built-in rules from edit/delete and reports unknown kinds', async () => {
+    const service = application(undefined, undefined, fakeRuleSqlAuthor);
+    const builtin = service.listRules().find((rule) => rule.source !== 'user');
+    expect(builtin).toBeTruthy();
+
+    await expect(service.updateCustomRuleContent({ kind: builtin!.kind, text: 'edit a built-in' })).rejects.toMatchObject({ code: 'invalid_input' });
+    expect(() => service.deleteRule(builtin!.kind)).toThrow(/cannot be deleted/i);
+    await expect(service.updateCustomRuleContent({ kind: 'user:missing-00000000', text: 'x' })).rejects.toMatchObject({ code: 'not_found' });
+    expect(() => service.deleteRule('user:missing-00000000')).toThrow(/not found/i);
+    service.close();
   });
 });

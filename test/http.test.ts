@@ -2,6 +2,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FinanceService } from '../src/application/finance-service.js';
+import type { RuleSqlAuthor } from '../src/application/ports.js';
 import { startHttpServer } from '../src/http/server.js';
 import { CsvStatementParser } from '../src/infrastructure/parsers/csv-parser.js';
 import { OfxStatementParser } from '../src/infrastructure/parsers/ofx-parser.js';
@@ -12,20 +13,41 @@ import { daysAgo, missingModelEngine } from './helpers.js';
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => Promise.all(cleanups.splice(0).map((cleanup) => cleanup())));
 
-async function httpFixture(options: { desktopToken?: string; onDesktopShutdown?: () => void } = {}) {
+// A valid deterministic rule query selecting every required finding-draft column;
+// stands in for whatever SQL the model would author for a custom rule.
+const VALID_RULE_SQL =
+  "SELECT 'row-1' AS key, 'Test finding' AS title, 'detail' AS detail, 'value' AS value, 0.9 AS confidence, 'evidence' AS evidence_summary, '' AS evidence_records LIMIT 1";
+const fakeRuleSqlAuthor: RuleSqlAuthor = async () => ({
+  sql: VALID_RULE_SQL, domain: 'spending', scope: 'banking', keywords: 'test', title: 'Test custom rule',
+});
+
+async function httpFixture(options: {
+  desktopToken?: string;
+  onDesktopShutdown?: () => void;
+  ruleSqlAuthor?: RuleSqlAuthor;
+  // Runs before the server starts, so a test can preload rows a route reads back.
+  seed?: (repo: SqliteFinanceRepository) => void;
+} = {}) {
+  const { ruleSqlAuthor, seed, ...serverOptions } = options;
+  const repo = new SqliteFinanceRepository(':memory:');
+  seed?.(repo);
   const service = new FinanceService(
-    new SqliteFinanceRepository(':memory:'),
+    repo,
     [new OfxStatementParser(), new CsvStatementParser()],
     missingModelEngine(),
+    undefined,
+    undefined,
+    undefined,
+    ruleSqlAuthor,
   );
-  const server = startHttpServer(service, { host: '127.0.0.1', port: 0, ...options });
+  const server = startHttpServer(service, { host: '127.0.0.1', port: 0, ...serverOptions });
   await once(server, 'listening');
   const port = (server.address() as AddressInfo).port;
   cleanups.push(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     service.close();
   });
-  return { base: `http://127.0.0.1:${port}` };
+  return { base: `http://127.0.0.1:${port}`, repo, service };
 }
 
 async function createAccount(base: string, input: Record<string, unknown> = {}) {
@@ -224,7 +246,7 @@ Date: 05/01/2026
     expect(saved.status).toBe(201);
     expect(await saved.json()).toMatchObject({
       kind: 'credit-utilization',
-      domain: 'credit',
+      domain: 'credit-report',
       executionClass: 'D',
       actionTier: 'advisor',
       sourceText: 'Generate a daily rule that flags high credit utilization.',
@@ -463,5 +485,65 @@ describe('built-in model routes', () => {
     expect(response.status).toBe(200);
     const body = await response.json() as { models: Array<{ modelId: string }> };
     expect(body.models.map((model) => model.modelId)).toEqual(BUILTIN_MODELS.map((model) => model.id));
+  });
+});
+
+describe('brokerage value-series route', () => {
+  it('serves the carry-forward equity curve across brokerage accounts', async () => {
+    const { base } = await httpFixture({
+      seed: (repo) => {
+        const brokerage = repo.createAccount({ institution: 'Fidelity', name: 'Brokerage', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+        const bank = repo.createAccount({ institution: 'Chase', name: 'Checking', type: 'checking', currency: 'USD', domain: 'bank' });
+        repo.saveProviderHoldings([
+          { accountId: brokerage.id, asOfDate: '2026-01-01', symbol: 'AAPL', valueMinor: 1000, currency: 'USD', fingerprint: 'b:AAPL:2026-01-01' },
+          { accountId: brokerage.id, asOfDate: '2026-01-03', symbol: 'AAPL', valueMinor: 1200, currency: 'USD', fingerprint: 'b:AAPL:2026-01-03' },
+          { accountId: bank.id, asOfDate: '2026-01-02', symbol: 'XXX', valueMinor: 999999, currency: 'USD', fingerprint: 'bank:XXX:2026-01-02' },
+        ]);
+      },
+    });
+
+    const body = await (await fetch(`${base}/v1/brokerage/value-series`)).json() as { items: Array<{ date: string; valueMinor: number; currency: string }> };
+    expect(body.items).toEqual([
+      { date: '2026-01-01', valueMinor: 1000, currency: 'USD' },
+      { date: '2026-01-03', valueMinor: 1200, currency: 'USD' },
+    ]);
+  });
+});
+
+describe('custom rule routes', () => {
+  const post = (base: string, path: string, body: unknown) =>
+    fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  it('previews, creates, edits, and deletes a custom rule through the API', async () => {
+    const { base } = await httpFixture({ ruleSqlAuthor: fakeRuleSqlAuthor });
+
+    const preview = await post(base, '/v1/rules/custom/preview', { text: 'flag idle brokerage cash', cadence: 'weekly' });
+    expect(preview.status).toBe(200);
+    expect(await preview.json()).toMatchObject({ kind: null, executionClass: 'D', sql: VALID_RULE_SQL });
+
+    const created = await post(base, '/v1/rules/custom', { text: 'flag idle brokerage cash' });
+    expect(created.status).toBe(201);
+    const rule = await created.json() as { kind: string; source: string };
+    expect(rule).toMatchObject({ source: 'user' });
+    expect(rule.kind).toMatch(/^user:/);
+
+    const edited = await post(base, '/v1/rules/custom/edit', { kind: rule.kind, text: 'a new description' });
+    expect(edited.status).toBe(200);
+    expect(await edited.json()).toMatchObject({ kind: rule.kind, sourceText: 'a new description' });
+
+    const deleted = await post(base, '/v1/rules/delete', { kind: rule.kind });
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toEqual({ kind: rule.kind, deleted: true });
+  });
+
+  it('rejects editing/deleting a built-in rule and unknown kinds', async () => {
+    const { base, service } = await httpFixture({ ruleSqlAuthor: fakeRuleSqlAuthor });
+    const builtin = service.listRules().find((r) => r.source !== 'user')!;
+
+    expect((await post(base, '/v1/rules/custom/edit', { kind: builtin.kind, text: 'x' })).status).toBe(422);
+    expect((await post(base, '/v1/rules/delete', { kind: builtin.kind })).status).toBe(422);
+    expect((await post(base, '/v1/rules/delete', { kind: 'user:missing-00000000' })).status).toBe(404);
+    // Schema rejection: empty text fails validation (422) before any authoring runs.
+    expect((await post(base, '/v1/rules/custom', { text: '' })).status).toBe(422);
   });
 });

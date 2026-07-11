@@ -97,6 +97,9 @@ export const openApiDocument = {
     '/v1/brokerage/holdings': {
       get: { summary: 'List latest brokerage holdings', responses: { '200': { description: 'Holding collection' } } },
     },
+    '/v1/brokerage/value-series': {
+      get: { summary: 'Portfolio value over time (equity curve) across brokerage accounts', responses: { '200': { description: 'Value point collection' } } },
+    },
     '/v1/account-balances': {
       get: { summary: 'List account balances', responses: { '200': { description: 'Balance collection' } } },
     },
@@ -189,6 +192,21 @@ export const openApiDocument = {
     },
     '/v1/rules/schedule': {
       post: { summary: 'Update a rule\'s delivery schedule (by kind)', responses: { '200': { description: 'Updated rule' }, '404': { description: 'Rule not found' } } },
+    },
+    '/v1/rules/sync': {
+      post: { summary: 'Sync new built-in rules from the configured over-the-air feed', responses: { '200': { description: 'Sync result' } } },
+    },
+    '/v1/rules/custom/preview': {
+      post: { summary: 'Author + validate a custom rule\'s SQL from natural language without saving', responses: { '200': { description: 'Custom rule preview (incl. generated SQL)' }, '422': { description: 'Could not author or validate the rule' } } },
+    },
+    '/v1/rules/custom': {
+      post: { summary: 'Create a custom (user-authored) rule from natural language', responses: { '201': { description: 'Custom rule created' }, '422': { description: 'Could not author or validate the rule' } } },
+    },
+    '/v1/rules/custom/edit': {
+      post: { summary: 'Regenerate a custom rule\'s content from new natural language (custom rules only)', responses: { '200': { description: 'Updated rule' }, '404': { description: 'Rule not found' }, '422': { description: 'Built-in rules cannot be edited, or authoring failed' } } },
+    },
+    '/v1/rules/delete': {
+      post: { summary: 'Delete a custom rule by kind (built-in/downloaded rules are protected)', responses: { '200': { description: 'Deleted' }, '404': { description: 'Rule not found' }, '422': { description: 'Built-in rules cannot be deleted' } } },
     },
     '/v1/questions': {
       get: { summary: 'List pending questions ranked by unlockable dollar impact', responses: { '200': { description: 'Question collection' } } },

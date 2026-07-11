@@ -95,6 +95,25 @@ const ruleScheduleSchema = z.object({
   scheduledDay: z.number().int().min(0).max(31).nullable().optional(),
 }).strict();
 
+// Custom (user-authored) rules: content comes from natural-language text the model
+// turns into SQL. Preview/create take the text + optional schedule; edit is keyed
+// by the minted kind; delete is keyed by kind (a slug), not a UUID.
+const ruleCustomCreateSchema = z.object({
+  text: z.string().trim().min(1).max(2000),
+  cadence: z.string().trim().max(40).optional(),
+  scheduledHour: z.number().int().min(0).max(23).nullable().optional(),
+  scheduledDay: z.number().int().min(0).max(31).nullable().optional(),
+}).strict();
+
+const ruleCustomEditSchema = z.object({
+  kind: z.string().min(1),
+  text: z.string().trim().min(1).max(2000),
+}).strict();
+
+const ruleDeleteSchema = z.object({
+  kind: z.string().min(1),
+}).strict();
+
 const ruleRemoveSchema = z.object({
   id: z.string().uuid(),
 }).strict();
@@ -152,6 +171,11 @@ export function startHttpServer(service: FinanceService, options: ServerOptions)
       sendError(response, error, requestId);
     }
   });
+  // A chat turn backed by a local CPU model can spend up to 5 minutes prefilling a
+  // large prompt (see chat() timeoutMs). Node's default requestTimeout is 5 minutes,
+  // which would race that budget; give the HTTP layer headroom so the model timeout is
+  // always the one that governs. This server binds to localhost only.
+  server.requestTimeout = 6 * 60_000;
   server.listen(options.port, options.host, () => {
     console.log(`Finora is listening at http://${options.host}:${options.port}`);
   });
@@ -293,6 +317,9 @@ async function route(
   if (url.pathname === '/v1/brokerage/holdings' && method === 'GET') {
     return sendJson(response, 200, { items: service.listBrokerageHoldings(url.searchParams.get('accountId') ?? undefined) });
   }
+  if (url.pathname === '/v1/brokerage/value-series' && method === 'GET') {
+    return sendJson(response, 200, { items: service.brokerageValueSeries(url.searchParams.get('accountId') ?? undefined) });
+  }
   if (url.pathname === '/v1/account-balances' && method === 'GET') {
     return sendJson(response, 200, { items: service.listAccountBalances(url.searchParams.get('accountId') ?? undefined) });
   }
@@ -388,6 +415,22 @@ async function route(
   }
   if (url.pathname === '/v1/rules/sync' && method === 'POST') {
     return sendJson(response, 200, await service.syncRuleFeed());
+  }
+  if (url.pathname === '/v1/rules/custom/preview' && method === 'POST') {
+    const input = parseSchema(ruleCustomCreateSchema, await readJson(request));
+    return sendJson(response, 200, await service.previewCustomRule(input));
+  }
+  if (url.pathname === '/v1/rules/custom' && method === 'POST') {
+    const input = parseSchema(ruleCustomCreateSchema, await readJson(request));
+    return sendJson(response, 201, await service.createCustomRule(input));
+  }
+  if (url.pathname === '/v1/rules/custom/edit' && method === 'POST') {
+    const input = parseSchema(ruleCustomEditSchema, await readJson(request));
+    return sendJson(response, 200, await service.updateCustomRuleContent(input));
+  }
+  if (url.pathname === '/v1/rules/delete' && method === 'POST') {
+    const input = parseSchema(ruleDeleteSchema, await readJson(request));
+    return sendJson(response, 200, service.deleteRule(input.kind));
   }
   if (url.pathname === '/v1/questions' && method === 'GET') {
     return sendJson(response, 200, { items: service.listQuestions() });

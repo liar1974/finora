@@ -18,9 +18,10 @@ money at stake." The ranking function, not any single rule, is the product.
   plus a **SQL query** (deterministic) or a prompt (LLM). Built-in rules ship as a
   seed loaded into that table on startup; new rules are added or changed as rows —
   no code, no redeploy. The engine is a generic interpreter that runs whatever
-  rows the table holds, so built-in and downloaded rules are identical to it. A
-  shipped over-the-air feed adds new built-in rules to installed versions without a
-  release (see *Over-the-air rule updates*).
+  rows the table holds, so built-in, downloaded, and user-authored rules are all
+  identical to it. A shipped over-the-air feed adds new built-in rules to installed
+  versions without a release (see *Over-the-air rule updates*), and the user can
+  author their own rules from plain language (see *Custom rules*).
 - **One finding contract.** Every rule, regardless of how it is evaluated,
   emits the same `Finding` shape. Downstream ranking, delivery, and action never
   need to know which engine produced a finding.
@@ -47,9 +48,9 @@ BOTH the definition (code/feed-owned) and the user's on/off + schedule
   natural-language inference), `sql` (a `D` rule's deterministic query) OR
   `prompt` (an LLM spec), `facts` (the user facts the rule needs), `enabled`,
   `version`, and `source` (`builtin` | `downloaded` | `user`). Built-in rules are
-  seeded from code on startup; downloaded rules are upserted by the feed. The
-  `RuleSpec` type is the definition-only view used by the seed, the feed, and
-  natural-language inference.
+  seeded from code on startup; downloaded rules are upserted by the feed; `user`
+  rules are authored by the user (see *Custom rules*). The `RuleSpec` type is the
+  definition-only view used by the seed, the feed, and natural-language inference.
 - **User-owned** — `active` (the on/off switch), `channel`, `cadence`,
   `scheduledHour`, `scheduledDay`, `sourceText`.
 
@@ -58,7 +59,8 @@ The engine runs a rule when **`enabled AND active`**. Every rule ships enabled a
 individually. There is no separate "always-on" class at runtime — turning a rule
 off simply clears `active`. The startup seed and the feed upsert the definition
 columns only; they never touch the user's `active`, schedule, or channel, so
-re-seeding can't undo a toggle. (This single table replaced an earlier split of
+re-seeding can't undo a toggle. A `user` row's definition is written only by the
+custom-rule API (below), never by the seed or feed. (This single table replaced an earlier split of
 `rule_specs` definitions + a `rules` instances table; migration v12 folded them and
 v15 dropped the vestigial `always_on` / `user_rule` columns.)
 
@@ -282,12 +284,39 @@ Domains organize rules for the user; they do not drive engine logic.
 - **Cash flow** — income timing, bill runway, idle cash, recurring spend.
 - **Spending** — large charges, duplicates, subscriptions, fees, categorization
   cleanup.
-- **Credit** — utilization, card interest, late or fee signals, report review.
+- **Credit report** — utilization, card interest, late or fee signals, report review.
 - **Investments** — cash drag, concentration, portfolio movement, executed orders.
 - **Connections** — provider status, missing tokens, stale cursors, sync health.
 
 Additional domains (benefits, tax, medical, property) attach here as their
 reference tables and facts become available, without changing the engine.
+
+## Custom rules (user-authored)
+
+Because the engine runs whatever rows the table holds, the user can add their own
+rule from a plain-language description — no SQL knowledge required. The configured
+model turns the description into a deterministic (`D`) query, which then runs
+exactly like a built-in.
+
+- **Authoring.** `FinanceService.previewCustomRule()` / `createCustomRule()` pass
+  the description to a `RuleSqlAuthor` port (production calls the configured LLM
+  with the readable schema and the required finding-draft columns; tests inject a
+  deterministic stub). The model returns a `RuleSqlDraft` — the SQL plus its
+  classifying metadata (`domain`, `scope`, `keywords`, `title`). The model never
+  owns identity: the service mints the `kind` itself as `user:<slug>-<hex>`.
+- **Validation before persist.** The candidate SQL is dry-run on the **read-only**
+  connection with the engine's bound-param superset. A driver error (a write
+  attempt or malformed SQL) or a result row missing a required finding-draft column
+  (`key`, `title`, `detail`, `value`, `confidence`, `evidence_summary`,
+  `evidence_records`) rejects the rule before it is ever saved or scheduled.
+  `previewCustomRule` runs the same authoring + validation without persisting, so
+  the UI can show the generated query and inferred settings before the user commits.
+- **Provenance and permissions.** A persisted custom rule is a row with
+  `source = 'user'`, active by default, at the `observer` tier. `source` drives the
+  permission matrix: **only `user` rules can have their content edited
+  (`updateCustomRuleContent`, which regenerates the SQL from new text) or be deleted
+  (`deleteRule`)**. Built-in and downloaded rules have fixed definitions — they can
+  be toggled and rescheduled but not edited or deleted (disable them instead).
 
 ## Over-the-air rule updates
 
@@ -306,7 +335,9 @@ without a code release. `FinanceService.syncRuleFeed()` fetches a configured
   (`applied: 0`). There is no version gate: the feed's `version` is informational
   (surfaced in the UI), not a condition on applying it.
 
-The read-only query runner sandboxes downloaded SQL — it can never write. The feed
+The read-only query runner sandboxes downloaded and user-authored SQL alike — it
+runs on a read-only database connection, so a rule query can never write
+regardless of how the SQL is shaped (see *Custom rules*). The feed
 URL is editable and a **Check for updates** button triggers a sync
 (`POST /v1/rules/sync`) under **Settings → Rules & Facts**; background services
 run a silent, best-effort sync shortly after boot and once a day thereafter.
@@ -325,7 +356,7 @@ into the `rules` table on startup, enabled and active by default:
   payments, card-testing pattern, fees and interest, subscription price increases,
   recurring subscriptions, new recurring charges, discretionary category spikes,
   cross-card duplicate subscriptions, unfamiliar merchant charges.
-- **Credit** — credit utilization, card interest.
+- **Credit report** — credit utilization, card interest.
 - **Investments** — brokerage cash drag, portfolio concentration, single-name
   exposure, holding value swings, executed trades, dividends received, possible
   wash sales.

@@ -1,4 +1,4 @@
-# Finora(https://riffcash.com)
+# Finora
 
 **Your personal financial assistant. All data are on your own computer.**
 

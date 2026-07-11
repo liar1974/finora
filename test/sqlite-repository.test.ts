@@ -175,3 +175,129 @@ describe('dailyResetBoundary', () => {
     expect(new Date('2026-07-05T08:00:00').getTime() < boundary).toBe(false);
   });
 });
+
+describe('SqliteFinanceRepository brokerageValueSeries', () => {
+  it('sums holdings market value per date with as-of carry-forward and excludes non-brokerage accounts', () => {
+    const repo = new SqliteFinanceRepository(tempDbPath());
+    const a = repo.createAccount({ institution: 'Fidelity', name: 'Brokerage A', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+    const b = repo.createAccount({ institution: 'Schwab', name: 'Brokerage B', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+    const bank = repo.createAccount({ institution: 'Chase', name: 'Checking', type: 'checking', currency: 'USD', domain: 'bank' });
+
+    repo.saveProviderHoldings([
+      // A's 01-01 snapshot is two positions that must sum to one account total (1000).
+      { accountId: a.id, asOfDate: '2026-01-01', symbol: 'AAPL', valueMinor: 600, currency: 'USD', fingerprint: 'a:AAPL:2026-01-01' },
+      { accountId: a.id, asOfDate: '2026-01-01', symbol: 'MSFT', valueMinor: 400, currency: 'USD', fingerprint: 'a:MSFT:2026-01-01' },
+      // A re-syncs on 01-03 with a new full snapshot (1200).
+      { accountId: a.id, asOfDate: '2026-01-03', symbol: 'AAPL', valueMinor: 1200, currency: 'USD', fingerprint: 'a:AAPL:2026-01-03' },
+      { accountId: b.id, asOfDate: '2026-01-02', symbol: 'VOO', valueMinor: 500, currency: 'USD', fingerprint: 'b:VOO:2026-01-02' },
+      // A holding on a non-brokerage account must never leak into the equity curve.
+      { accountId: bank.id, asOfDate: '2026-01-02', symbol: 'XXX', valueMinor: 999999, currency: 'USD', fingerprint: 'bank:XXX:2026-01-02' },
+    ]);
+
+    const series = repo.brokerageValueSeries();
+
+    expect(series).toEqual([
+      // Only A has synced yet (600 + 400).
+      { date: '2026-01-01', valueMinor: 1000, currency: 'USD' },
+      // A carried forward from 01-01 (1000) + B's first snapshot (500). Bank excluded.
+      { date: '2026-01-02', valueMinor: 1500, currency: 'USD' },
+      // A's new snapshot (1200) + B carried forward from 01-02 (500).
+      { date: '2026-01-03', valueMinor: 1700, currency: 'USD' },
+    ]);
+  });
+
+  it('narrows to a single account when accountId is given', () => {
+    const repo = new SqliteFinanceRepository(tempDbPath());
+    const a = repo.createAccount({ institution: 'Fidelity', name: 'Brokerage A', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+    const b = repo.createAccount({ institution: 'Schwab', name: 'Brokerage B', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+    repo.saveProviderHoldings([
+      { accountId: a.id, asOfDate: '2026-01-01', symbol: 'AAPL', valueMinor: 1000, currency: 'USD', fingerprint: 'a:AAPL:2026-01-01' },
+      { accountId: b.id, asOfDate: '2026-01-01', symbol: 'VOO', valueMinor: 500, currency: 'USD', fingerprint: 'b:VOO:2026-01-01' },
+    ]);
+    expect(repo.brokerageValueSeries(a.id)).toEqual([
+      { date: '2026-01-01', valueMinor: 1000, currency: 'USD' },
+    ]);
+  });
+
+  it('returns an empty series when there are no brokerage holdings', () => {
+    const repo = new SqliteFinanceRepository(tempDbPath());
+    repo.createAccount({ institution: 'Chase', name: 'Checking', type: 'checking', currency: 'USD', domain: 'bank' });
+    expect(repo.brokerageValueSeries()).toEqual([]);
+  });
+
+  it('excludes cash pseudo-holdings (Plaid CUR:USD) from the equity curve', () => {
+    const repo = new SqliteFinanceRepository(tempDbPath());
+    const a = repo.createAccount({ institution: 'Robinhood', name: 'Individual', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+    repo.saveProviderHoldings([
+      { accountId: a.id, asOfDate: '2026-01-01', symbol: 'AAPL', securityType: 'equity', valueMinor: 1000, currency: 'USD', fingerprint: 'a:AAPL:2026-01-01' },
+      { accountId: a.id, asOfDate: '2026-01-01', symbol: 'CUR:USD', securityType: 'cash', valueMinor: 8302256, currency: 'USD', fingerprint: 'a:cash:2026-01-01' },
+    ]);
+    expect(repo.brokerageValueSeries()).toEqual([
+      { date: '2026-01-01', valueMinor: 1000, currency: 'USD' },
+    ]);
+  });
+});
+
+describe('SqliteFinanceRepository summarizeBrokerage cash handling', () => {
+  it('treats cash pseudo-holdings as cash and falls back to balance cash_minor', () => {
+    const repo = new SqliteFinanceRepository(tempDbPath());
+    // Plaid-style account: cash arrives as a CUR:USD holding, no balance cash_minor.
+    const plaid = repo.createAccount({ institution: 'Robinhood', name: 'Individual', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+    // SnapTrade-style account: cash_minor on the balance, no cash holding.
+    const snap = repo.createAccount({ institution: 'Alpaca', name: 'Margin', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+
+    repo.saveProviderHoldings([
+      { accountId: plaid.id, asOfDate: '2026-01-01', symbol: 'AAPL', securityType: 'equity', costBasisMinor: 800, valueMinor: 1000, currency: 'USD', fingerprint: 'p:AAPL' },
+      { accountId: plaid.id, asOfDate: '2026-01-01', symbol: 'CUR:USD', securityType: 'cash', valueMinor: 500, currency: 'USD', fingerprint: 'p:cash' },
+      { accountId: snap.id, asOfDate: '2026-01-01', symbol: 'VOO', securityType: 'etf', costBasisMinor: 300, valueMinor: 400, currency: 'USD', fingerprint: 's:VOO' },
+    ]);
+    repo.saveProviderBalances([
+      { accountId: snap.id, asOfDate: '2026-01-01', currentMinor: 600, cashMinor: 200, buyingPowerMinor: 250, currency: 'USD', fingerprint: 's:bal' },
+    ]);
+
+    const summary = repo.summarizeBrokerage()[0]!;
+    // Market value excludes the cash holding: 1000 (AAPL) + 400 (VOO).
+    expect(summary.marketValueMinor).toBe(1400);
+    // Cash = cash holding (500) + snap balance cash_minor (200).
+    expect(summary.cashMinor).toBe(700);
+    expect(summary.buyingPowerMinor).toBe(250);
+    // Holdings count excludes the cash pseudo-holding: AAPL + VOO.
+    expect(summary.holdings).toBe(2);
+  });
+
+  it('treats a crypto-exchange CUR:USD line as market value, not cash', () => {
+    const repo = new SqliteFinanceRepository(tempDbPath());
+    const stocks = repo.createAccount({ institution: 'Robinhood', name: 'Individual', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+    const crypto = repo.createAccount({ institution: 'Robinhood', name: 'Crypto', type: 'crypto exchange', currency: 'USD', domain: 'brokerage' });
+    repo.saveProviderHoldings([
+      { accountId: stocks.id, asOfDate: '2026-01-01', symbol: 'AAPL', securityType: 'equity', costBasisMinor: 800, valueMinor: 1000, currency: 'USD', fingerprint: 'st:AAPL' },
+      { accountId: stocks.id, asOfDate: '2026-01-01', symbol: 'CUR:USD', securityType: 'cash', valueMinor: 500, currency: 'USD', fingerprint: 'st:cash' },
+      // Crypto exchange: Plaid reports the whole balance as a CUR:USD cash line.
+      { accountId: crypto.id, asOfDate: '2026-01-01', symbol: 'CUR:USD', securityType: 'cash', valueMinor: 7000, currency: 'USD', fingerprint: 'cx:cash' },
+    ]);
+
+    const summary = repo.summarizeBrokerage()[0]!;
+    // Market value = AAPL (1000) + crypto CUR:USD (7000); the stock account's real
+    // cash (500) stays out.
+    expect(summary.marketValueMinor).toBe(8000);
+    // Cash = only the stock account's cash line, not the crypto balance.
+    expect(summary.cashMinor).toBe(500);
+    // Holdings counts AAPL + crypto line, not the stock cash line.
+    expect(summary.holdings).toBe(2);
+
+    // Equity curve includes the crypto value but not the stock cash.
+    const point = repo.brokerageValueSeries()[0]!;
+    expect(point).toEqual({ date: '2026-01-01', valueMinor: 8000, currency: 'USD' });
+  });
+
+  it('setBrokerageCashMinor patches cash onto an existing balance snapshot', () => {
+    const repo = new SqliteFinanceRepository(tempDbPath());
+    const a = repo.createAccount({ institution: 'Robinhood', name: 'Individual', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+    repo.saveProviderBalances([
+      { accountId: a.id, asOfDate: '2026-01-01', currentMinor: 1000, currency: 'USD', fingerprint: 'a:bal:2026-01-01' },
+    ]);
+    repo.setBrokerageCashMinor(a.id, '2026-01-01', 500);
+    const balance = repo.listAccountBalances(a.id).find((row) => row.asOfDate === '2026-01-01');
+    expect(balance?.cashMinor).toBe(500);
+  });
+});

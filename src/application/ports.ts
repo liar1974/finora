@@ -6,6 +6,7 @@ import type {
   AppSettingPreview,
   BrokerageHolding,
   BrokerageSummary,
+  BrokerageValuePoint,
   BrokerageTransaction,
   ChatSessionRecord,
   CreditReportRecord,
@@ -21,8 +22,10 @@ import type {
   QuestionRecord,
   RecurringCandidate,
   RecurringClassification,
+  RuleDomain,
   RuleRecord,
   RuleSpec,
+  RuleSqlDraft,
   Transaction,
   TransactionInput,
 } from '../domain/models.js';
@@ -36,6 +39,17 @@ export interface RuleAdoption {
   channel: string;
   scheduledHour: number | null;
   scheduledDay: number | null;
+}
+
+// The definition columns rewritten when a user edits a custom rule's content. The
+// natural-language sourceText is kept alongside the regenerated SQL so the next
+// edit can pre-fill it.
+export interface RuleContentEdit {
+  sql: string;
+  keywords: string;
+  domain: RuleDomain;
+  scope: string;
+  sourceText: string;
 }
 
 export interface AgentEventInput {
@@ -161,6 +175,7 @@ export interface FinanceRepository {
   runRuleQuery(sql: string, params: Record<string, unknown>): Record<string, unknown>[];
   listAccountBalances(accountId?: string): AccountBalance[];
   summarizeBrokerage(): BrokerageSummary[];
+  brokerageValueSeries(accountId?: string): BrokerageValuePoint[];
   listDashboards(): DashboardRecord[];
   listCreditReports(): CreditReportRecord[];
   saveCreditReport(input: Omit<CreditReportRecord, 'id' | 'createdAt'>): CreditReportRecord;
@@ -174,6 +189,15 @@ export interface FinanceRepository {
   adoptRule(kind: string, schedule: RuleAdoption): RuleRecord | null;
   toggleRule(kind: string, active: boolean): RuleRecord | null;
   updateRuleSchedule(kind: string, schedule: { cadence: string; scheduledHour: number | null; scheduledDay: number | null }): RuleRecord | null;
+  // Read one rule by kind (for source-based permission checks). Null if absent.
+  getRule(kind: string): RuleRecord | null;
+  // Insert a user-authored custom rule (source = 'user'), active by default.
+  createUserRule(spec: RuleSpec, schedule: RuleAdoption): RuleRecord;
+  // Rewrite a custom rule's definition (its LLM-authored SQL and classification).
+  // Guarded to source = 'user'; returns null when no such custom rule exists.
+  updateUserRuleContent(kind: string, content: RuleContentEdit): RuleRecord | null;
+  // Delete a custom rule. Guarded to source = 'user'; returns false otherwise.
+  deleteRule(kind: string): boolean;
   listRuleSpecs(): RuleSpec[];
   upsertRuleSpec(spec: RuleSpec): void;
   listRecurringCandidates(): RecurringCandidate[];
@@ -200,6 +224,7 @@ export interface FinanceRepository {
   saveProviderBrokerageTransactions(transactions: ProviderBrokerageTransactionInput[]): { inserted: number; skipped: number };
   saveProviderHoldings(holdings: ProviderHoldingInput[]): { inserted: number; skipped: number };
   saveProviderBalances(balances: ProviderBalanceInput[]): { inserted: number; skipped: number };
+  setBrokerageCashMinor(accountId: string, asOfDate: string, cashMinor: number): void;
   getUserProfileMarkdown(): string | null;
   saveUserProfileMarkdown(markdown: string): void;
   appendAgentEvent(input: AgentEventInput): void;
@@ -248,3 +273,9 @@ export type MerchantIdentityVerdict = Omit<MerchantIdentity, 'signature' | 'upda
 // the configured LLM (world knowledge of brands); tests inject a deterministic
 // stub, which also stands in for "a model is available".
 export type MerchantIdentifier = (candidates: MerchantCandidate[]) => Promise<MerchantIdentityVerdict[]>;
+
+// Turns a user's natural-language rule description into a deterministic SQL
+// definition. Production calls the configured LLM with the readable schema and the
+// required finding-draft output columns; tests inject a deterministic stub (which
+// also stands in for "a model is available"). The service validates and persists.
+export type RuleSqlAuthor = (input: { text: string }) => Promise<RuleSqlDraft>;

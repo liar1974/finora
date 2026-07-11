@@ -53,6 +53,26 @@ runner writes a consistent snapshot to `<db>.backup-v<fromVersion>` via
 `VACUUM INTO` and refuses to migrate if that backup cannot be written, so an
 upgrade can never mutate data it has not first backed up.
 
+## Local model and LLM providers
+
+Chat and AI-assisted enrichment (recurring classification, merchant identity,
+credit-report review, custom-rule authoring) route through one gateway that
+targets either a hosted provider (Anthropic, OpenAI, Google, or any
+OpenAI-compatible/Ollama endpoint) or the **built-in local model** — a
+`node-llama-cpp` engine running a GGUF model fully on the user's machine.
+
+The built-in engine sizes its KV cache to each prompt rather than allocating a
+fixed window. KV-cache RAM scales with the allocated context and is reserved at
+load time whether or not the prompt fills it, so the engine tokenizes the actual
+prompt, rounds up to a bucket, and grows the context on demand — never exceeding
+the model's trained window or `maxContextSize` (default 32768; a fixed 4096
+previously). `FINORA_BUILTIN_CONTEXT` overrides the ceiling (clamped to
+`[CONTEXT_MIN, CONTEXT_HARD_MAX]`, then bounded by the trained window). A chat
+turn prefilling a large ledger snapshot on CPU can take minutes, so the chat path
+uses a compact (un-indented) JSON context, a 5-minute model timeout, and disables
+reasoning-model `<think>` output; the HTTP `requestTimeout` is raised past that so
+the model timeout is always the one that governs.
+
 ## Extension points
 
 ### Statement format
@@ -232,7 +252,12 @@ lives in
 
 The rule creation UI should live with the page-level controls rather than
 inside the rules list. A new rule is saved only after the preview flow has
-resolved concrete delivery metadata.
+resolved concrete delivery metadata. The service and HTTP API also support
+user-authored **custom rules** from plain language — the model generates
+deterministic SQL, validated read-only before it is saved — via a
+preview-before-save flow (`previewCustomRule` → `createCustomRule`); only those
+user rules can be edited or deleted (built-in and downloaded rules are protected).
+The mechanics live in [`rules-design.md`](./rules-design.md).
 
 ## Dashboards
 
@@ -245,6 +270,26 @@ server delete and does not change the underlying artifact.
 Dashboard chart creation is prompt-first: the user describes the desired chart,
 previews it against local data, then saves it. Editing an existing chart reuses
 the same chart identifier instead of creating a duplicate.
+
+## Brokerage
+
+Brokerage holdings are stored as dated snapshots: a provider sync writes a full
+snapshot per account, and the latest snapshot date is that account's current
+positions. `summarizeBrokerage()` aggregates the latest snapshot per currency
+(market value, cash, buying power, holding count), and `brokerageValueSeries()`
+(`GET /v1/brokerage/value-series`) builds the equity curve — each account's
+holdings total carried forward to every later snapshot date, then summed per
+currency. The curve excludes cash and matches the Market-value tile.
+
+Providers report uninvested cash inconsistently: Plaid sends it as a pseudo-
+security holding (`security_type = 'cash'`, ticker `CUR:USD`), while SnapTrade
+sets `cash_minor` on the balance directly. A cash-type holding is diverted to the
+account's `cash_minor` (`setBrokerageCashMinor`) instead of being counted as a
+position, so market value and P&L are not inflated — **except on crypto
+exchanges**, which have no cash concept: there the `CUR:USD` line *is* the
+account's (crypto) market value and is kept as a holding. The cash figure prefers
+a cash-type holding when present, otherwise the balance's `cash_minor`, so an
+account is never double-counted through both paths.
 
 ## Credit reports
 

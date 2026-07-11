@@ -176,7 +176,8 @@ may be worth a second look.
 ### Brokerage — your investments
 
 Once connected, your holdings and balances appear here alongside your banking, so
-you see everything together. Until then, this is where you start a connection.
+you see everything together, including a **value-over-time** chart that builds up
+as the app syncs each day. Until then, this is where you start a connection.
 
 ![Brokerage](media/screenshots/brokerage.png)
 
@@ -184,7 +185,8 @@ you see everything together. Until then, this is where you start a connection.
 
 Add your Plaid keys and manage connected accounts under **Bank/Brokerage**,
 choose the language model under **Models**, decide how you'd like to be notified
-under **Delivery**, and create alert rules under **Rules & Facts**.
+under **Delivery**, and manage alert rules under **Rules & Facts** — where you can
+turn each built-in rule on or off and set when it runs.
 
 ![Settings](media/screenshots/settings.png)
 
