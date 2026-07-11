@@ -355,6 +355,37 @@ export class FinanceService {
     return { ok: true };
   }
 
+  // Provider-account ids the user has chosen to ignore: they are skipped on every
+  // sync (never re-imported) and purged locally. Stored as a JSON array in
+  // app_settings so it survives the account row being deleted.
+  private ignoredProviderAccounts(): Set<string> {
+    try {
+      const raw = this.repository.getAppSetting('ignored_provider_accounts');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  // Stop syncing a provider-managed account and purge its local data. Unlike
+  // removeAccount (which refuses provider accounts because a plain sync would
+  // recreate them), this records the provider account id on an ignore-list the
+  // sync consults, so the account stays gone. Targeted to one account; other
+  // accounts (and other users' imports) are unaffected.
+  ignoreProviderAccount(id: string) {
+    const account = this.repository.getAccount(id);
+    if (!account) throw new AppError('not_found', 'Account not found', { accountId: id });
+    if (!account.providerAccountId) {
+      throw new AppError('invalid_input', 'Only provider-managed accounts can be ignored', { accountId: id });
+    }
+    const ignored = this.ignoredProviderAccounts();
+    ignored.add(account.providerAccountId);
+    this.repository.saveAppSettings({ ignored_provider_accounts: JSON.stringify([...ignored]) });
+    this.repository.removeAccount(id);
+    return { ok: true, providerAccountId: account.providerAccountId };
+  }
+
   listTransactions(query: Partial<TransactionQuery> = {}) {
     if (query.from) assertIsoDate(query.from, 'from');
     if (query.to) assertIsoDate(query.to, 'to');
@@ -880,7 +911,9 @@ export class FinanceService {
     const asOfDate = new Date().toISOString().slice(0, 10);
     const institution = connection.institution || normalizeProviderInstitution('Plaid');
     const balances: ProviderBalanceInput[] = [];
+    const ignored = this.ignoredProviderAccounts();
     for (const plaidAccount of response.data.accounts) {
+      if (ignored.has(String(plaidAccount.account_id))) continue; // user-ignored account
       const currency = plaidAccount.balances?.iso_currency_code || 'USD';
       const domain = plaidAccountDomain(plaidAccount);
       this.ensureProviderAccount({
@@ -1046,7 +1079,9 @@ export class FinanceService {
     const out: ProviderSyncResult = emptyProviderSyncResult();
     const asOfDate = new Date().toISOString().slice(0, 10);
     const syncErrors: Array<{ accountId: string; accountName: string; stage: string; message: string }> = [];
+    const ignored = this.ignoredProviderAccounts();
     for (const snapAccount of (response.data || []) as Array<Record<string, any>>) {
+      if (ignored.has(String(snapAccount.id))) continue; // user-ignored account
       const account = this.ensureSnapTradeAccount(snapAccount);
       if (!account) continue;
       out.accounts += 1;

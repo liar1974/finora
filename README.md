@@ -23,7 +23,8 @@ your own numbers — every decision stays yours.
   online.
 - **Know what actually needs your attention.** Finora surfaces things like
   unusual spending, high credit-card usage, idle cash, and out-of-date accounts,
-  so you're not hunting for problems yourself.
+  so you're not hunting for problems yourself — and you can write your own alerts
+  in plain language, no formulas required.
 - **Get insights where you already are.** Have Finora send rule-triggered
   insights to your own **Telegram** chat or a **Slack** channel — great for a
   personal heads-up or a shared household or advisor channel. Your data still

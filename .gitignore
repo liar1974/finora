@@ -9,3 +9,6 @@ src-tauri/target/
 .DS_Store
 src-tauri/resources/desktop/*
 !src-tauri/resources/desktop/.gitkeep
+playwright-report/
+test-results/
+e2e/.artifacts/

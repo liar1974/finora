@@ -290,6 +290,33 @@ describe('SqliteFinanceRepository summarizeBrokerage cash handling', () => {
     expect(point).toEqual({ date: '2026-01-01', valueMinor: 8000, currency: 'USD' });
   });
 
+  it('drops stale holdings when a newer balance snapshot shows the account was emptied', () => {
+    const repo = new SqliteFinanceRepository(tempDbPath());
+    const held = repo.createAccount({ institution: 'Robinhood', name: 'Individual', type: 'brokerage', currency: 'USD', domain: 'brokerage' });
+    const emptied = repo.createAccount({ institution: 'Robinhood', name: 'Crypto', type: 'crypto exchange', currency: 'USD', domain: 'brokerage' });
+    repo.saveProviderHoldings([
+      { accountId: held.id, asOfDate: '2026-01-02', symbol: 'AAPL', securityType: 'equity', valueMinor: 1000, currency: 'USD', fingerprint: 'h:AAPL:02' },
+      // Emptied account: last holdings snapshot on 01-01, then a 01-02 sync with no holdings.
+      { accountId: emptied.id, asOfDate: '2026-01-01', symbol: 'CUR:USD', securityType: 'cash', valueMinor: 7000, currency: 'USD', fingerprint: 'e:cash:01' },
+    ]);
+    repo.saveProviderBalances([
+      { accountId: held.id, asOfDate: '2026-01-02', currentMinor: 1000, currency: 'USD', fingerprint: 'h:bal:02' },
+      { accountId: emptied.id, asOfDate: '2026-01-01', currentMinor: 7000, currency: 'USD', fingerprint: 'e:bal:01' },
+      { accountId: emptied.id, asOfDate: '2026-01-02', currentMinor: 0, currency: 'USD', fingerprint: 'e:bal:02' },
+    ]);
+
+    // Market value counts only the still-held account; the emptied one is dropped.
+    const summary = repo.summarizeBrokerage()[0]!;
+    expect(summary.marketValueMinor).toBe(1000);
+    expect(summary.holdings).toBe(1);
+
+    // The equity curve shows the emptied account historically, then drops to 0.
+    expect(repo.brokerageValueSeries(emptied.id)).toEqual([
+      { date: '2026-01-01', valueMinor: 7000, currency: 'USD' },
+      { date: '2026-01-02', valueMinor: 0, currency: 'USD' },
+    ]);
+  });
+
   it('setBrokerageCashMinor patches cash onto an existing balance snapshot', () => {
     const repo = new SqliteFinanceRepository(tempDbPath());
     const a = repo.createAccount({ institution: 'Robinhood', name: 'Individual', type: 'brokerage', currency: 'USD', domain: 'brokerage' });

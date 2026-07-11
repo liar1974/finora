@@ -151,6 +151,9 @@ const state = {
   bankTab: 'summary',
   brokerageTab: 'summary',
   accountId: null,
+  // Whether the user has explicitly picked an account card yet. Until they do,
+  // 'All accounts' is not shown as selected (the overview still renders).
+  accountTouched: false,
   from: isoDate(before),
   to: isoDate(today),
   accounts: [],
@@ -642,7 +645,15 @@ function buildVegaSpec(artifact, rows, x, series, format) {
     },
   };
   const xEncoding = (extra = {}) => ({
-    field: x, type: vegaType(x), title: chartLabel(x), axis: { labelAngle: -25 },
+    field: x, type: vegaType(x), title: chartLabel(x),
+    axis: {
+      labelAngle: -25,
+      labelOverlap: true,
+      // Optional coarser tick granularity (day/week/month/year) so temporal axes
+      // don't fall back to sub-day ("12 PM") ticks on short ranges.
+      ...(artifact.render?.xTickInterval ? { tickCount: { interval: artifact.render.xTickInterval, step: 1 } } : {}),
+      ...(artifact.render?.xLabelFormat ? { format: artifact.render.xLabelFormat, formatType: 'time' } : {}),
+    },
     ...extra,
   });
   const tooltip = [{ field: x, type: vegaType(x), title: chartLabel(x) }];
@@ -1538,6 +1549,7 @@ function renderSidebar() {
   for (const section of sections) {
     const row = el('button', `navrow${state.section === section.id ? ' active' : ''}`);
     row.type = 'button';
+    row.dataset.testid = `nav-${section.id}`;
     row.innerHTML = `<span class="lbl">${esc(section.label)}</span>`;
     row.addEventListener('click', () => setSection(section.id));
     nav.appendChild(row);
@@ -1627,10 +1639,13 @@ function accountCards(accounts = selectedAccounts(), label = 'accounts') {
   }, 0);
   const allCurrency = accounts[0]?.currency || 'USD';
   const allAmountClass = allTotal < 0 ? 'neg' : 'pos';
-  const all = el('div', `acctcard allacct${state.accountId ? '' : ' active'}`);
+  // 'All accounts' is highlighted only once the user has explicitly picked a card;
+  // on first load nothing is preselected, though the overview still renders.
+  const all = el('div', `acctcard allacct${!state.accountId && state.accountTouched ? ' active' : ''}`);
   all.innerHTML = `<div class="accticon allmark" title="All accounts" aria-label="All accounts" role="img">${accountIcon('all')}</div><div class="acctmeta"><div class="nm">All accounts</div><div class="sub">${accounts.length} account${accounts.length === 1 ? '' : 's'}</div></div><div class="acctamount ${allAmountClass}">${money(allTotal, allCurrency)}</div>`;
   all.addEventListener('click', () => {
     state.accountId = null;
+    state.accountTouched = true;
     if (state.section === 'brokerage') renderBrokerage();
     else renderBanks();
   });
@@ -1646,6 +1661,7 @@ function accountCards(accounts = selectedAccounts(), label = 'accounts') {
     card.innerHTML = `<div class="accticon ${esc(profile.cls)}" title="${esc(profile.label)}" aria-label="${esc(profile.label)}" role="img">${accountIcon(profile.icon)}</div><div class="acctmeta"><div class="nm">${esc(item.name)}</div><div class="sub">${esc(type)}${mask ? ` <span>${esc(mask)}</span>` : ''}</div></div><div class="acctamount ${amountClass}">${esc(amount.value)}</div>`;
     card.addEventListener('click', () => {
       state.accountId = state.accountId === item.id ? null : item.id;
+      state.accountTouched = true;
       if (state.section === 'brokerage') renderBrokerage();
       else {
         state.bankTab = 'transactions';
@@ -1780,6 +1796,7 @@ function renderDataTable(headers, rows, options = {}) {
   const filtered = key ? filterTableRows(key, rows) : rows;
   const visibleRows = key ? pageRows(key, filtered) : filtered;
   const wrap = el('div', 'table-wrap');
+  wrap.dataset.testid = 'data-table';
   const contextTitle = options.contextTitle || `${currentSectionLabel()} table: ${headers.map(textFromHtml).slice(0, 3).join(', ')}`;
   const contextIdValue = `table:${key || normalizeText(contextTitle).replace(/[^a-z0-9]+/g, '-') || headers.map(textFromHtml).join('-')}`;
   const contextAction = options.context === false ? null : chatContextButton('Chat', 'Add this table to chat context');
@@ -1817,6 +1834,7 @@ function renderSubnav(tabs = bankTabs, activeId = state.bankTab, onSelect = () =
   const subnav = el('div', 'subnav');
   for (const [id, label] of tabs) {
     const tab = el('div', `subtab${activeId === id ? ' active' : ''}`);
+    tab.dataset.testid = `subtab-${id}`;
     tab.textContent = label;
     tab.addEventListener('click', () => {
       onSelect(id);
@@ -2271,8 +2289,20 @@ function selectedBrokerageHoldings() {
     const current = latestDate.get(item.accountId);
     if (!current || item.asOfDate > current) latestDate.set(item.accountId, item.asOfDate);
   }
+  // An account whose latest balance snapshot is newer than its latest holdings
+  // snapshot was re-synced with no holdings (emptied), so its old holdings are
+  // stale — drop them so Market value / Cash / P&L don't show a closed account.
+  const latestBalanceDate = new Map();
+  for (const item of state.balances) {
+    const current = latestBalanceDate.get(item.accountId);
+    if (!current || item.asOfDate > current) latestBalanceDate.set(item.accountId, item.asOfDate);
+  }
   return scoped
     .filter((item) => item.asOfDate === latestDate.get(item.accountId))
+    .filter((item) => {
+      const balanceDate = latestBalanceDate.get(item.accountId);
+      return !balanceDate || balanceDate <= item.asOfDate;
+    })
     .sort((a, b) => Number(b.valueMinor || 0) - Number(a.valueMinor || 0));
 }
 
@@ -2488,6 +2518,13 @@ function brokerageValueChart() {
     sec.appendChild(empty('Not enough history yet — the value curve builds up as the app syncs each day.'));
     return sec;
   }
+  // Pick a tick granularity from the span so the axis reads in days for short
+  // history and coarsens to weeks/months/years as it grows — never sub-day.
+  const spanDays = (Date.parse(points[points.length - 1].date) - Date.parse(points[0].date)) / 86400000;
+  const [xTickInterval, xLabelFormat] = spanDays <= 31 ? ['day', '%b %d']
+    : spanDays <= 182 ? ['week', '%b %d']
+    : spanDays <= 730 ? ['month', '%b %Y']
+    : ['year', '%Y'];
   const host = el('div');
   sec.appendChild(host);
   renderArtifactChart(host, {
@@ -2495,7 +2532,7 @@ function brokerageValueChart() {
     artifact: {
       title: 'Value over time',
       description: `Holdings market value · ${currency}`,
-      render: { type: 'area', x: 'date', y: 'value' },
+      render: { type: 'area', x: 'date', y: 'value', xTickInterval, xLabelFormat },
       style: { numberFormat: 'currency' },
       data: points.map((point) => ({ date: point.date, value: point.valueMinor })),
     },
@@ -2801,7 +2838,7 @@ function renderCreditReportsTab(view) {
 
 function createCreditUploadForm(panel) {
   const form = el('form', 'formgrid creditform');
-  form.innerHTML = '<label class="file-drop compact">Drop PDF or choose file<small class="creditFileName">Experian, Equifax, TransUnion, or annual credit report PDF</small><input name="file" type="file" accept="application/pdf,.pdf"></label><span class="message creditMessage"></span><div class="uploadhistory creditUploadHistory"></div>';
+  form.innerHTML = '<label class="file-drop compact" data-testid="credit-dropzone">Drop PDF or choose file<small class="creditFileName">Experian, Equifax, TransUnion, or annual credit report PDF</small><input name="file" type="file" accept="application/pdf,.pdf" data-testid="credit-file-input"></label><span class="message creditMessage" data-testid="credit-message"></span><div class="uploadhistory creditUploadHistory"></div>';
 
   const fileInput = form.elements.file;
   const dropzone = form.querySelector('.file-drop');
@@ -3014,6 +3051,7 @@ function renderDashboards() {
       const saved = byId.get(item.chartId) || byId.get(item.id) || byId.get(item.chart_id);
       if (!saved) continue;
       const slot = el('div', 'dashslot sec');
+      slot.dataset.testid = 'chart-card';
       slot.style.margin = '0';
       const span = Number(item.w || item.width || 6);
       slot.style.gridColumn = `span ${Math.min(12, Math.max(3, span))}`;
@@ -3143,6 +3181,7 @@ function renderSettings() {
   const nav = el('div', 'subnav');
   for (const [id, label] of settingsTabs) {
     const tab = el('div', `subtab${state.settingsTab === id ? ' active' : ''}`);
+    tab.dataset.testid = `subtab-${id}`;
     tab.textContent = label;
     tab.addEventListener('click', () => {
       state.settingsTab = id;
@@ -3973,8 +4012,8 @@ function openRuleModal(existingRule = null) {
   form.innerHTML = `<label>Rule prompt<textarea name="text" required placeholder="Generate a weekly rule that flags brokerage cash above 25% and explains why it matters.">${esc(existingRule?.sourceText || '')}</textarea></label>
     <div class="row"><button class="ghost" type="button" id="previewRule">Preview</button><span class="message"></span></div>
     <div class="rulepreview" id="rulePreview"${existingRule ? '' : ' hidden'}>${existingRule ? rulePreviewMarkup(existingRule) : ''}</div>
-    <div class="deliverysettings" id="deliverySettings"${hasPreview ? '' : ' hidden'}><div class="nm">Delivery settings</div><div class="split"><label>Category<select name="domain">${ruleDomains.map(([key, label]) => `<option value="${key}"${existingRule?.domain === key ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select></label><label>Scope<select name="scope"><option value="">Generate</option><option${existingRule?.scope === 'banking' ? ' selected' : ''}>banking</option><option${existingRule?.scope === 'brokerage' ? ' selected' : ''}>brokerage</option><option${existingRule?.scope === 'credit' ? ' selected' : ''}>credit</option><option${existingRule?.scope === 'all' ? ' selected' : ''}>all</option></select></label><label>Cadence<select name="cadence"><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(existingRule?.cadence, existingRule?.scheduledDay)}</select></label></div><label class="rulehour">Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div>
-    <div class="row"><button class="primary" type="submit" id="saveRule"${hasPreview ? '' : ' hidden disabled'}>Save rule</button></div>`;
+    <div class="deliverysettings" id="deliverySettings"${hasPreview ? '' : ' hidden'}><div class="nm">Delivery settings</div><div class="cardsub">Category and scope are inferred from your description (shown above). Choose when the rule runs.</div><div class="split"><label>Cadence<select name="cadence"><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(existingRule?.cadence, existingRule?.scheduledDay)}</select></label><label class="rulehour">Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div></div>
+    <div class="row"><button class="primary" type="submit" id="saveRule"${hasPreview ? '' : ' hidden disabled'}>${existingRule ? 'Save changes' : 'Create rule'}</button></div>`;
   panel.appendChild(form);
   modal(panel);
   $('#closeModal').addEventListener('click', closeModal);
@@ -3989,13 +4028,15 @@ function openRuleModal(existingRule = null) {
     $('#rulePreview').innerHTML = '';
   });
   $('#previewRule').addEventListener('click', async () => {
-    const data = ruleFormData(form);
+    const data = customRuleFormData(form);
     const button = $('#previewRule');
     button.disabled = true;
-    form.querySelector('.message').textContent = 'Inferring settings...';
+    form.querySelector('.message').textContent = 'Generating the rule…';
     form.querySelector('.message').classList.remove('error');
     try {
-      const preview = await api('/v1/rules/preview', {
+      // Author + validate the SQL without persisting, so the user sees the
+      // generated query and inferred category/scope before committing.
+      const preview = await api('/v1/rules/custom/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
@@ -4017,21 +4058,39 @@ function openRuleModal(existingRule = null) {
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     if ($('#saveRule').disabled) return;
-    const data = ruleFormData(form);
+    const data = customRuleFormData(form);
     const submit = event.submitter;
     submit.disabled = true;
     try {
-      // Turning a rule on from natural language: /v1/rules matches a kind and
-      // activates it. Editing an existing rule's schedule goes through the
-      // schedule modal (openBuiltInRuleModal), not here.
-      await api('/v1/rules', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
+      if (existingRule) {
+        // Editing a custom rule: regenerate its SQL only when the description
+        // actually changed (re-authoring invokes the model and is non-deterministic,
+        // so a schedule-only edit must not silently rewrite the query), then apply
+        // the schedule. Both are keyed by kind — separate backend concerns.
+        if (data.text !== (existingRule.sourceText || '')) {
+          await api('/v1/rules/custom/edit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: existingRule.kind, text: data.text }),
+          });
+        }
+        await api('/v1/rules/schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kind: existingRule.kind, cadence: data.cadence, scheduledHour: data.scheduledHour, scheduledDay: data.scheduledDay }),
+        });
+      } else {
+        // Creating a custom rule: the model authors deterministic SQL from the
+        // description, validated read-only before it is saved (source = 'user').
+        await api('/v1/rules/custom', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+      }
       await loadData();
       closeModal();
-      toast('Rule turned on.');
+      toast(existingRule ? 'Rule updated.' : 'Rule created.');
       renderSettings();
     } catch (error) {
       form.querySelector('.message').textContent = error.message;
@@ -4042,32 +4101,44 @@ function openRuleModal(existingRule = null) {
   });
 }
 
-function ruleFormData(form) {
+// The payload the custom-rule endpoints accept: the natural-language text plus the
+// delivery schedule. Category and scope are authored by the model (not sent), so
+// they are deliberately omitted — the endpoints reject unknown fields.
+function customRuleFormData(form) {
   const data = Object.fromEntries(new FormData(form));
-  for (const key of ['scope', 'cadence']) if (!data[key]) delete data[key];
-  data.channel = 'auto';
+  const cadence = data.cadence || 'event';
   // Event/hourly rules are triggered, not scheduled, so they have no run hour.
-  const triggered = data.cadence === 'event' || data.cadence === 'hourly';
-  data.scheduledHour = triggered || data.scheduledHour === '' ? null : Number(data.scheduledHour);
-  data.scheduledDay = data.scheduledDay === '' || data.scheduledDay === undefined ? null : Number(data.scheduledDay);
-  return data;
+  const triggered = cadence === 'event' || cadence === 'hourly';
+  return {
+    text: data.text,
+    cadence,
+    scheduledHour: triggered || data.scheduledHour === '' ? null : Number(data.scheduledHour),
+    scheduledDay: data.scheduledDay === '' || data.scheduledDay === undefined ? null : Number(data.scheduledDay),
+  };
 }
 
 function applyRulePreview(form, preview) {
-  if (form.elements.domain && preview.domain) form.elements.domain.value = preview.domain;
-  form.elements.scope.value = preview.scope;
   form.elements.cadence.value = preview.cadence;
   form.elements.scheduledHour.value = preview.scheduledHour === null || preview.scheduledHour === undefined ? '' : String(preview.scheduledHour);
   syncRuleDayField(form, preview.scheduledDay);
 }
 
+// The generated-rule preview: the model-inferred category/scope, the schedule, the
+// authored SQL, and (on preview) the execution strategy. Shown for both a fresh
+// preview (a RuleSqlDraft-backed preview object) and an existing custom rule.
+function ruleDomainLabel(domain) {
+  const entry = ruleDomains.find(([key]) => key === domain);
+  return entry ? entry[1] : (domain || '—');
+}
+
 function rulePreviewMarkup(rule) {
-  const source = rule.inference?.source === 'llm' ? `LLM: ${rule.inference.model}` : 'Heuristic fallback';
   return `<div class="rulepreviewgrid">
-    <div><span>Scope</span><b>${esc(rule.scope)}</b></div>
+    <div><span>Category</span><b>${esc(ruleDomainLabel(rule.domain))}</b></div>
+    <div><span>Scope</span><b>${esc(rule.scope || '—')}</b></div>
     <div><span>Schedule</span><b>${esc(ruleScheduleLabel(rule))}</b></div>
   </div>
-  <div class="ruletags">${ruleTag('status', source)}</div>
+  <div class="ruletags">${ruleTag('status', 'Custom SQL')}</div>
+  ${rule.sql ? `<pre class="rulesql">${esc(rule.sql)}</pre>` : ''}
   ${rule.strategy ? `<div class="sub">${esc(rule.strategy)}</div>` : ''}`;
 }
 

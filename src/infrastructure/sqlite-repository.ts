@@ -811,6 +811,12 @@ export class SqliteFinanceRepository implements FinanceRepository {
           SELECT MAX(h2.as_of_date) FROM brokerage_holdings h2
           WHERE h2.account_id = h.account_id
         )
+        -- Drop stale holdings: if the account has a balance snapshot newer than its
+        -- latest holdings snapshot, it was re-synced with no holdings (emptied).
+        AND h.as_of_date >= COALESCE(
+          (SELECT MAX(b.as_of_date) FROM account_balances b WHERE b.account_id = h.account_id),
+          h.as_of_date
+        )
       ),
       cash_holdings AS (
         SELECT account_id, currency, SUM(value_minor) AS cash_minor
@@ -864,9 +870,12 @@ export class SqliteFinanceRepository implements FinanceRepository {
     // its next sync, so carrying the account total forward (rather than each
     // security) avoids both cross-account day gaps and sold positions lingering.
     const values: string[] = [];
-    let scope = '';
+    let scopeH = '';
+    let scopeB = '';
     if (accountId) {
-      scope = 'AND h.account_id = ?';
+      scopeH = 'AND h.account_id = ?';
+      values.push(accountId);
+      scopeB = 'AND b.account_id = ?';
       values.push(accountId);
     }
     const rows = this.database.prepare(`
@@ -877,8 +886,19 @@ export class SqliteFinanceRepository implements FinanceRepository {
         -- Exclude cash-equivalent lines from the equity curve, except on crypto
         -- exchanges where that line is the account's (crypto) market value.
         WHERE a.domain = 'brokerage'
-          AND (COALESCE(h.security_type, '') <> 'cash' OR LOWER(COALESCE(a.type, '')) LIKE '%crypto%') ${scope}
+          AND (COALESCE(h.security_type, '') <> 'cash' OR LOWER(COALESCE(a.type, '')) LIKE '%crypto%') ${scopeH}
         GROUP BY h.account_id, h.as_of_date, h.currency
+        UNION ALL
+        -- Emptied accounts: a balance snapshot newer than the latest holdings
+        -- snapshot means the account was re-synced with no holdings, so cap its
+        -- value at 0 from that date instead of carrying the stale total forward.
+        SELECT b.account_id, MAX(b.as_of_date) AS as_of_date, a.currency, 0 AS value_minor
+        FROM account_balances b
+        JOIN accounts a ON a.id = b.account_id
+        WHERE a.domain = 'brokerage' ${scopeB}
+        GROUP BY b.account_id, a.currency
+        HAVING (SELECT MAX(h.as_of_date) FROM brokerage_holdings h WHERE h.account_id = b.account_id) IS NOT NULL
+           AND MAX(b.as_of_date) > (SELECT MAX(h.as_of_date) FROM brokerage_holdings h WHERE h.account_id = b.account_id)
       ),
       acct AS (SELECT DISTINCT account_id, currency FROM account_values),
       dates AS (SELECT DISTINCT as_of_date FROM account_values),

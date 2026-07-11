@@ -24,7 +24,7 @@ function AppShell() {
         <aside id="sidebar" aria-label="Navigation" />
 
         <main>
-          <div id="view" />
+          <div id="view" data-testid="view" />
         </main>
 
         <section className="chat" aria-label="Assistant">
@@ -40,16 +40,16 @@ function AppShell() {
             <div className="contextbar" id="contextBar" />
             <div className="contextattachments" id="contextAttachments" />
             <div className="composebox">
-              <textarea id="input" rows="2" placeholder="Ask about the current ledger..." />
-              <button className="sendbtn" id="sendBtn" aria-label="Send">Send</button>
+              <textarea id="input" data-testid="chat-input" rows="2" placeholder="Ask about the current ledger..." />
+              <button className="sendbtn" id="sendBtn" data-testid="chat-send" aria-label="Send">Send</button>
             </div>
           </div>
         </section>
 
         <div className="scrim" id="scrim" />
       </div>
-      <div id="modalRoot" />
-      <div id="toast" role="status" aria-live="polite" />
+      <div id="modalRoot" data-testid="modal-root" />
+      <div id="toast" data-testid="toast" role="status" aria-live="polite" />
     </>
   );
 }

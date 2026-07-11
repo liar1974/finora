@@ -185,8 +185,15 @@ as the app syncs each day. Until then, this is where you start a connection.
 
 Add your Plaid keys and manage connected accounts under **Bank/Brokerage**,
 choose the language model under **Models**, decide how you'd like to be notified
-under **Delivery**, and manage alert rules under **Rules & Facts** — where you can
-turn each built-in rule on or off and set when it runs.
+under **Delivery**, and manage alert rules under **Rules & Facts**.
+
+Under **Rules & Facts** you can turn each built-in rule on or off and set when it
+runs, and — beyond those — write your own. Click **Create rule**, describe what
+you want to be alerted about in plain language (for example, "flag any brokerage
+cash sitting above 25% of the account"), and Finora's model turns it into a rule.
+**Preview** it first to see the generated query, then save. You can edit or delete
+the rules you create; built-in ones can only be paused. (Authoring a custom rule
+uses your configured model, so pick one under **Models** first.)
 
 ![Settings](media/screenshots/settings.png)
 

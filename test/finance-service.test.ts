@@ -98,6 +98,22 @@ describe('FinanceService', () => {
     expect(result.snaptrade).toBeUndefined();
   });
 
+  it('ignoreProviderAccount purges the account and records it on the ignore-list', () => {
+    const repository = new SqliteFinanceRepository(':memory:');
+    const service = new FinanceService(repository, [new OfxStatementParser(), new CsvStatementParser()], localModel());
+    const account = repository.createAccount({
+      institution: 'Robinhood', name: 'Crypto', type: 'crypto exchange', currency: 'USD',
+      domain: 'brokerage', source: 'plaid', providerAccountId: 'PLAID_CRYPTO_1',
+    });
+
+    const result = service.ignoreProviderAccount(account.id);
+
+    expect(result.providerAccountId).toBe('PLAID_CRYPTO_1');
+    expect(repository.getAccount(account.id)).toBeNull();
+    const ignored = JSON.parse(repository.getAppSetting('ignored_provider_accounts') ?? '[]');
+    expect(ignored).toContain('PLAID_CRYPTO_1');
+  });
+
   it('delivers each active insight to Telegram once until it resolves', async () => {
     const repository = new SqliteFinanceRepository(':memory:');
     repository.saveAppSettings({

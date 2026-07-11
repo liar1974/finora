@@ -431,6 +431,7 @@ tbody tr.clickable:hover td { background: var(--card2); }
 .rulepreviewgrid div { min-width: 0; display: grid; gap: 2px; }
 .rulepreviewgrid span { color: var(--mut); font-size: 11px; font-weight: 800; }
 .rulepreviewgrid b { min-width: 0; font-size: 13px; font-weight: 800; text-transform: capitalize; overflow-wrap: anywhere; }
+.rulesql { margin: 0; max-height: 220px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); padding: 8px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fg); }
 .checkrow { display: inline-flex; flex-direction: row; align-items: center; gap: 8px; color: var(--fg); font-size: 13px; font-weight: 700; }
 .checkrow input { width: auto; }
 .formgrid textarea { min-height: 110px; resize: vertical; }
