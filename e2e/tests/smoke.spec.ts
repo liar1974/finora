@@ -14,5 +14,7 @@ test.describe('smoke', () => {
     }
     // Feed is the default landing section.
     await expect(app.nav('feed')).toHaveClass(/active/);
+    // The credit section is labelled "Credit Report" in the sidebar.
+    await expect(app.nav('credit')).toContainText('Credit Report');
   });
 });

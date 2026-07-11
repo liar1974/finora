@@ -156,6 +156,8 @@ const state = {
   accountTouched: false,
   from: isoDate(before),
   to: isoDate(today),
+  // Selected banking period preset; keep in sync with from/to (default 90 days).
+  period: '90d',
   accounts: [],
   summary: [],
   transactions: [],
@@ -193,7 +195,7 @@ const sections = [
   { id: 'feed', label: 'Insights' },
   { id: 'banks', label: 'Banking' },
   { id: 'brokerage', label: 'Brokerage' },
-  { id: 'credit', label: 'Credit' },
+  { id: 'credit', label: 'Credit Report' },
   { id: 'dashboards', label: 'Dashboards' },
   { id: 'settings', label: 'Settings' },
 ];
@@ -1153,6 +1155,10 @@ function isSpendingTransaction(txn) {
 function selectedSummary() {
   const byCurrency = new Map();
   for (const txn of selectedTransactions()) {
+    // Internal transfers move money between the user's own accounts — they are
+    // neither income nor spending. Excluding them keeps these cards consistent
+    // with the category chart (bankSpendingByCategory / isSpendingTransaction).
+    if (isTransferCategory(txn.category)) continue;
     const current = byCurrency.get(txn.currency) || {
       currency: txn.currency,
       incomeMinor: 0,
@@ -1472,6 +1478,21 @@ async function fetchAllBrokerageTransactions() {
   return items;
 }
 
+// Banking transactions are paged (server caps limit at 200). Load every page so
+// the Summary "Transactions" count and "Spending" total are computed over full
+// history; the selected date range is then applied client-side in
+// selectedTransactions(). Mirrors fetchAllBrokerageTransactions() above.
+async function fetchAllTransactions() {
+  const items = [];
+  let cursor = null;
+  do {
+    const page = await api(`/v1/transactions?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+    items.push(...(page.items || []));
+    cursor = page.nextCursor || null;
+  } while (cursor);
+  return items;
+}
+
 async function loadData() {
   const [
     accounts,
@@ -1494,7 +1515,7 @@ async function loadData() {
   ] = await Promise.all([
     api('/v1/accounts'),
     api('/v1/summary'),
-    api('/v1/transactions?limit=100'),
+    fetchAllTransactions(),
     api('/v1/provider-connections'),
     api('/v1/brokerage/summary'),
     fetchAllBrokerageTransactions(),
@@ -1512,9 +1533,9 @@ async function loadData() {
   ]);
   state.accounts = accounts.items;
   state.summary = summary.items;
-  state.transactions = txns.items;
+  state.transactions = txns;
   state.recurring = null; // recomputed server-side on next Recurring tab view
-  state.nextCursor = txns.nextCursor;
+  state.nextCursor = null; // full history is loaded up-front; no incremental paging
   state.connections = connections.items;
   state.brokerageSummary = brokerageSummary.items;
   state.brokerageTransactions = brokerageTxns;
@@ -1582,6 +1603,55 @@ function dateRangeControl() {
   return wrap;
 }
 
+// Period presets for the banking views. Selecting one just narrows the
+// client-side date filter (selectedTransactions) over the full history that
+// loadData() already fetched — no refetch needed, so we re-render synchronously.
+const PERIOD_PRESETS = [
+  { id: 'month', label: 'This month' },
+  { id: '30d', label: '30 days' },
+  { id: '90d', label: '90 days' },
+  { id: 'year', label: 'This year' },
+  { id: 'all', label: 'All time' },
+];
+
+function periodRange(id) {
+  const now = new Date();
+  const to = isoDate(now);
+  switch (id) {
+    case 'month':
+      return { from: isoDate(new Date(now.getFullYear(), now.getMonth(), 1)), to };
+    case '30d':
+      return { from: isoDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30)), to };
+    case '90d':
+      return { from: isoDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 90)), to };
+    case 'year':
+      return { from: isoDate(new Date(now.getFullYear(), 0, 1)), to };
+    case 'all':
+      return { from: '', to: '' }; // empty bounds disable the filter in selectedTransactions
+    default:
+      return { from: state.from, to: state.to };
+  }
+}
+
+function periodControl() {
+  const wrap = el('div', 'period');
+  for (const preset of PERIOD_PRESETS) {
+    const button = el('button', `periodbtn${state.period === preset.id ? ' active' : ''}`);
+    button.type = 'button';
+    button.textContent = preset.label;
+    button.addEventListener('click', () => {
+      if (state.period === preset.id) return;
+      state.period = preset.id;
+      const range = periodRange(preset.id);
+      state.from = range.from;
+      state.to = range.to;
+      render();
+    });
+    wrap.appendChild(button);
+  }
+  return wrap;
+}
+
 function topbar(title, eyebrow = 'Local finance workspace', options = {}) {
   const bar = el('div', 'topbar');
   if (!options.hideTitle) {
@@ -1591,6 +1661,7 @@ function topbar(title, eyebrow = 'Local finance workspace', options = {}) {
   }
   const controls = el('div', 'topbarcontrols');
   if (!options.hideDateRange) controls.appendChild(dateRangeControl());
+  if (options.period) controls.appendChild(periodControl());
   if (options.action) controls.appendChild(options.action);
   if (controls.children.length) bar.appendChild(controls);
   return bar;
@@ -1848,7 +1919,7 @@ function renderBanks() {
   state.section = 'banks';
   renderSidebar();
   const view = $('#view');
-  view.replaceChildren(topbar('Banking', 'Imported from Plaid', { hideDateRange: true, action: manageAccountsButton('banks') }));
+  view.replaceChildren(topbar('Banking', 'Imported from Plaid', { hideDateRange: true, period: true, action: manageAccountsButton('banks') }));
   const accounts = bankAccounts();
   if (!accounts.length) {
     view.appendChild(accountCta('No bank accounts yet', 'Connect a bank through Plaid Link. Bank statement import is not supported in this build.', 'Add bank account', () => openProviderConnection()));

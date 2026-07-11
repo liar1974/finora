@@ -24,4 +24,20 @@ test.describe('credit', () => {
     // The app is still alive and interactive after the failure.
     await expect(app.nav('credit')).toHaveClass(/active/);
   });
+
+  test('reports sub-tab shows an empty state when nothing is uploaded', async ({ app }) => {
+    await app.goto('credit');
+    await app.subtab('reports').click();
+    await expect(app.subtab('reports')).toHaveClass(/active/);
+    await expect(app.view).toContainText('No uploaded credit report PDFs yet');
+  });
+
+  test('manage-reports modal opens and closes', async ({ app }) => {
+    await app.goto('credit');
+    await app.page.locator('#manageCreditReports').click();
+    await expect(app.modal.getByTestId('credit-file-input')).toBeAttached();
+
+    await app.modal.locator('#closeModal').click();
+    await expect(app.modal.getByTestId('credit-file-input')).toHaveCount(0);
+  });
 });

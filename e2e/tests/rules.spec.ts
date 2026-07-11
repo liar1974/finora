@@ -19,4 +19,26 @@ test.describe('rules', () => {
     await enabled.first().click();
     await expect(enabled).toHaveCount(before - 1);
   });
+
+  test('checking for rule updates without a feed URL is handled gracefully', async ({ app }) => {
+    await app.goto('settings');
+    await app.subtab('insights').click();
+
+    await app.page.locator('#syncRules').click();
+    // Server returns skipped:no-feed-url (no network call); the UI toasts a hint.
+    await expect(app.toast).toContainText(/feed url/i);
+  });
+
+  test('create-rule modal opens and closes', async ({ app }) => {
+    await app.goto('settings');
+    await app.subtab('insights').click();
+
+    await app.page.locator('#newRuleTopbar').click();
+    const modal = app.modal;
+    await expect(modal.locator('textarea[name="text"]')).toBeVisible();
+    await expect(modal.locator('#previewRule')).toBeVisible();
+
+    await modal.locator('#closeModal').click();
+    await expect(modal.locator('textarea[name="text"]')).toHaveCount(0);
+  });
 });

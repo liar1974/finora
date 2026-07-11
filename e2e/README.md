@@ -22,17 +22,38 @@ with a temp DB (`FINORA_DATABASE_PATH`), an empty models dir, and
 `CHAT_GATEWAY/AUTO_SYNC/ALERTS_ENABLED=off`. Locally an already-running server on
 that port is reused; in CI a fresh one is always started.
 
+## Projects & servers
+
+Two hermetic servers run in parallel (both `tsx src/cli.ts serve`, temp DB, empty
+models dir, gateways off). The web bundle is built once by `pnpm test:e2e` before
+Playwright starts, so the two servers share `dist/http/web` without racing on it.
+
+- **`chromium`** (server `:3999`) — the main suite. Depends on the **`setup`**
+  project (`seed.setup.ts`), which seeds a known bank account + transactions via
+  the public API and writes `e2e/.artifacts/seed.json`. Read-mostly specs.
+- **`onboarding`** (server `:3997`) — `onboarding.spec.ts` only, on its own empty
+  DB. The onboarding journey *writes global settings* (Plaid keys, delivery
+  channels, model provider), so it's isolated here to avoid racing the main
+  suite's Telegram/channel assertions. Runs `serial`; each test is idempotent
+  (re-selects its channel/provider) so a reused server stays green across runs.
+
 ## Layout
 
-- `playwright.config.ts` (repo root) — projects, the hermetic `webServer`.
-- `e2e/seed.setup.ts` — a `setup` project (the `chromium` project depends on it)
-  that seeds a known bank account + transactions through the public HTTP API and
-  writes `e2e/.artifacts/seed.json`. Guaranteed to run after the server is up.
+- `playwright.config.ts` (repo root) — the two projects/servers above.
 - `e2e/fixtures.ts` — extends the base test with an `app` page-object and the
   `seed` data. Import `test`/`expect` from here, not from `@playwright/test`.
+  (Onboarding specs use `app` only, never `seed`.)
 - `e2e/pages/app.ts` — page-object over the SPA (navigation, sub-tabs, modal,
   toast). `app.goto(section)` auto-loads the app on a fresh page.
 - `e2e/tests/*.spec.ts` — the specs.
+
+## Shared state & assertions
+
+The main server's DB is shared across parallel specs, so specs assert on
+seeded/immutable state or their own isolated keys — avoid writing global settings
+there (do that in the `onboarding` project). Forms that call `renderSettings()`
+after saving wipe their inline `.message`, so assert the **toast** (a stable
+success signal whose text persists) rather than the in-form message.
 
 ## Selector convention
 
