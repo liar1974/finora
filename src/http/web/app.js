@@ -294,6 +294,30 @@ const isDesktopApp = typeof window !== 'undefined' && !!window.__TAURI_INTERNALS
 let updateState = { status: 'idle', version: null, currentVersion: null, progress: 0, error: null };
 let pendingUpdate = null;
 
+// The running app version shown in the sidebar footer. There is no reliable version
+// in the repo source (package.json etc. hold a 0.1.0 placeholder that CI stamps with
+// the release tag at build time), so we read it at runtime from the build artifact:
+// the desktop app asks Tauri (getVersion() returns the version baked into the bundle),
+// and web mode asks the backend, whose /v1/health reports its package.json version.
+let appVersion = null;
+
+async function resolveAppVersion() {
+  try {
+    if (isDesktopApp) {
+      const { getVersion } = await import('@tauri-apps/api/app');
+      appVersion = await getVersion();
+    } else {
+      const health = await api('/v1/health');
+      appVersion = health?.version ?? null;
+    }
+  } catch (error) {
+    // A missing version is not worth surfacing — just omit the footer.
+    console.warn('Version lookup failed:', error);
+    appVersion = null;
+  }
+  renderSidebar();
+}
+
 async function checkForUpdate() {
   if (!isDesktopApp) return;
   try {
@@ -594,7 +618,7 @@ function renderArtifactTable(host, rows) {
     return;
   }
   const keys = Object.keys(rows[0]).slice(0, 6);
-  host.appendChild(transactionLikeTable(keys.map(chartLabel), rows.slice(0, 20).map((row) => keys.map((key) => esc(formatChartValue(row[key], null, key))))));
+  host.appendChild(transactionLikeTable(keys.map(chartLabel), rows.map((row) => keys.map((key) => esc(formatChartValue(row[key], null, key))))));
 }
 
 function vegaRows(rows, series, format) {
@@ -1274,11 +1298,6 @@ function attachmentTypeLabel(type) {
   return { chart: 'Chart', item: 'Item' }[type] || 'Table';
 }
 
-function stableItemId(prefix, values) {
-  const slug = normalizeText(values.join(' ')).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
-  return `${prefix}:${slug || 'row'}`;
-}
-
 function addContextAttachment(attachment) {
   const next = {
     ...attachment,
@@ -1296,20 +1315,6 @@ function addContextAttachment(attachment) {
   $('#input').focus();
   toast(`${attachmentTypeLabel(next.type)} ${exists ? 'removed from' : 'added to'} chat context.`);
   if (!$('#modalRoot')?.children.length) render();
-}
-
-// Attach a single record (one table row or one credit-report item) to chat context.
-// columns/values are parallel arrays of plain text; the attachment carries a one-row table.
-function addItemContext(id, title, columns, values, section) {
-  addContextAttachment({
-    id,
-    type: 'item',
-    title,
-    section,
-    columns,
-    rows: [Object.fromEntries(columns.map((column, index) => [column, values[index] ?? '']))],
-    totalRows: 1,
-  });
 }
 
 function addTableContext(id, title, headers, rows, totalRows = rows.length) {
@@ -1579,6 +1584,12 @@ function renderSidebar() {
 
   const banner = renderUpdateBanner();
   if (banner) side.appendChild(banner);
+
+  if (appVersion) {
+    const footer = el('div', 'sidebarversion');
+    footer.textContent = `v${appVersion}`;
+    side.appendChild(footer);
+  }
 }
 
 function dateRangeControl() {
@@ -1862,14 +1873,22 @@ function pageRows(key, rows) {
 }
 
 function renderDataTable(headers, rows, options = {}) {
-  const key = options.pageKey;
-  const renderFn = options.render || render;
+  const contextTitle = options.contextTitle || `${currentSectionLabel()} table: ${headers.map(textFromHtml).slice(0, 3).join(', ')}`;
+  const contextIdValue = `table:${options.pageKey || normalizeText(contextTitle).replace(/[^a-z0-9]+/g, '-') || headers.map(textFromHtml).join('-')}`;
+  // Any table longer than a page gets search + page-size + a pager, even without an
+  // explicit pageKey: derive a stable key from the context id so page/search state
+  // survives re-renders. Pass options.paginate === false to force a flat table.
+  const key = options.pageKey
+    || (options.paginate !== false && rows.length > defaultPageSize ? contextIdValue : null);
   const filtered = key ? filterTableRows(key, rows) : rows;
   const visibleRows = key ? pageRows(key, filtered) : filtered;
   const wrap = el('div', 'table-wrap');
   wrap.dataset.testid = 'data-table';
-  const contextTitle = options.contextTitle || `${currentSectionLabel()} table: ${headers.map(textFromHtml).slice(0, 3).join(', ')}`;
-  const contextIdValue = `table:${key || normalizeText(contextTitle).replace(/[^a-z0-9]+/g, '-') || headers.map(textFromHtml).join('-')}`;
+  // Explicit-pageKey tables re-render through their section (options.render, else the
+  // global render). Tables that auto-paginated without a caller key re-render in place,
+  // so paging/search work inside modals and anywhere without a section render fn.
+  const renderFn = options.render
+    || (options.pageKey ? render : () => wrap.replaceWith(renderDataTable(headers, rows, options)));
   const contextAction = options.context === false ? null : chatContextButton('Chat', 'Add this table to chat context');
   if (contextAction) {
     setContextButtonState(contextAction, contextIdValue);
@@ -2740,96 +2759,51 @@ function accountBalanceSummary(account) {
   return parts.join(' · ') || account.accountType || 'Account details unavailable';
 }
 
-function renderMiniReportList(rows, emptyText, limit = 5) {
-  const block = el('div', 'reportdetailblock');
-  if (!rows.length) {
-    const emptyRow = el('div', 'reportminirow emptymini');
-    emptyRow.textContent = emptyText;
-    block.appendChild(emptyRow);
-    return block;
-  }
-  for (const row of rows.slice(0, limit)) {
-    const item = el('div', `reportminirow ${row.level || ''}`);
-    const text = el('div', 'reportminitext');
-    text.innerHTML = `<div class="nm">${esc(row.title)}</div><div class="sub">${esc(row.detail)}</div>`;
-    item.appendChild(text);
-    if (row.context) {
-      const { title, columns, values } = row.context;
-      const id = stableItemId('item', [title, ...values]);
-      const button = chatContextButton('', 'Add this item to chat context');
-      setContextButtonState(button, id);
-      button.addEventListener('click', () => addItemContext(id, title, columns, values, 'credit'));
-      item.appendChild(button);
-    }
-    block.appendChild(item);
-  }
-  if (rows.length > limit) {
-    const more = el('div', 'reportminirow moremini');
-    more.textContent = `+${rows.length - limit} more`;
-    block.appendChild(more);
-  }
-  return block;
-}
-
-// Attach a whole credit list (open accounts / inquiries) to chat context as a table,
-// mirroring the whole-table button Banking/Brokerage tables get from renderDataTable.
-function creditListContextButton(id, title, columns, valueRows) {
-  const button = chatContextButton('Chat', 'Add this list to chat context');
-  setContextButtonState(button, id);
-  button.addEventListener('click', () => addTableContext(id, title, columns, valueRows, valueRows.length));
-  return button;
-}
-
 function renderCreditOpenAccounts(view) {
   const accounts = state.credit.accounts || [];
-  const columns = ['Creditor', 'Summary', 'Flag'];
-  const openAccounts = accounts
+  const rows = accounts
     .filter((account) => account.isOpen)
     .map((account) => {
       const title = `${account.creditor}${account.accountMask ? ` ${account.accountMask}` : ''}`;
-      const detail = accountBalanceSummary(account);
       const flagged = Number(account.pastDueMinor || 0) > 0 || account.isNegative;
-      return {
-        title,
-        detail,
-        level: flagged ? 'medium' : '',
-        context: { title, columns, values: [title, detail, flagged ? 'Needs review' : 'OK'] },
-      };
+      return [
+        esc(title),
+        esc(accountBalanceSummary(account)),
+        flagged ? '<span class="status warn">Needs review</span>' : '<span class="status ok">OK</span>',
+      ];
     });
   const section = el('div', 'sec creditdetails');
   section.innerHTML = '<div class="sechdr"><h3>Open accounts</h3><span class="pill">Latest report</span></div>';
-  if (openAccounts.length) {
-    section.querySelector('.sechdr').appendChild(
-      creditListContextButton('table:credit-open-accounts', 'Credit open accounts', columns, openAccounts.map((row) => row.context.values)),
-    );
-  }
-  section.appendChild(renderMiniReportList(openAccounts, 'No open accounts parsed.', 8));
+  section.appendChild(renderDataTable(['Creditor', 'Summary', 'Flag'], rows, {
+    pageKey: 'credit-open-accounts',
+    render: renderCredit,
+    itemLabel: 'account',
+    contextTitle: 'Credit open accounts',
+    emptyText: 'No open accounts parsed.',
+  }));
   view.appendChild(section);
 }
 
 function renderCreditInquiries(view) {
   const inquiries = state.credit.inquiries || [];
-  const columns = ['Company', 'Type', 'Date'];
+  // Newest inquiries first regardless of type (blank dates sort last).
   const rows = inquiries
-    .map((inquiry) => {
-      const title = inquiry.company || 'Unknown company';
-      const type = inquiry.type === 'hard' ? 'Hard' : 'Soft';
-      const date = inquiry.inquiryDate ? formatReportDate(inquiry.inquiryDate) : '';
-      return {
-        title,
-        detail: `${type} inquiry${date ? ` · ${date}` : ''}`,
-        level: inquiry.type === 'hard' ? 'medium' : '',
-        context: { title, columns, values: [title, type, date] },
-      };
-    });
+    .slice()
+    .sort((a, b) => (b.inquiryDate || '').localeCompare(a.inquiryDate || ''))
+    .map((inquiry) => [
+      esc(inquiry.company || 'Unknown company'),
+      inquiry.type === 'hard' ? '<span class="status warn">Hard</span>' : '<span class="status neutral">Soft</span>',
+      esc(inquiry.inquiryDate ? formatReportDate(inquiry.inquiryDate) : '—'),
+    ]);
   const section = el('div', 'sec creditdetails');
   section.innerHTML = '<div class="sechdr"><h3>Inquiries</h3><span class="pill">Hard + soft</span></div>';
-  if (rows.length) {
-    section.querySelector('.sechdr').appendChild(
-      creditListContextButton('table:credit-inquiries', 'Credit inquiries', columns, rows.map((row) => row.context.values)),
-    );
-  }
-  section.appendChild(renderMiniReportList(rows, 'No inquiries parsed.', rows.length));
+  section.appendChild(renderDataTable(['Company', 'Type', 'Date'], rows, {
+    pageKey: 'credit-inquiries',
+    render: renderCredit,
+    itemLabel: 'inquiry',
+    contextTitle: 'Credit inquiries',
+    emptyText: 'No inquiries parsed.',
+  }));
   view.appendChild(section);
 }
 
@@ -3345,11 +3319,20 @@ function renderApiModelSettings(view, effective) {
     `<label>Provider<select name="LLM_PROVIDER">${providerOptions}</select></label>`,
     settingRow('LLM_API_KEY', 'API key', 'password'),
     settingRow('LLM_BASE_URL', 'Base URL'),
-    settingRow('LLM_MODEL', 'Extraction model'),
-    settingRow('LLM_CHAT_MODEL', 'Chat model'),
+    settingRow('LLM_MODEL', 'Model'),
   ];
-  const subtitle = `Web chat and Telegram use the same configured model. Current route: ${esc(effective.label || 'not configured')} / ${esc(effective.chatModel || 'no chat model')}.`;
+  const subtitle = `One model handles chat, Telegram, and data extraction. Current: ${esc(effective.label || 'not configured')} / ${esc(effective.model || 'no model')}.`;
   const formSection = settingsForm('Language model', subtitle, rows);
+  // A single "Model" field, no extraction-vs-chat split. Mirror it into the legacy
+  // LLM_CHAT_MODEL key on save so the two never diverge (empty stays empty, which the
+  // backend skips — leaving the current model untouched).
+  const modelInput = formSection.querySelector('input[name="LLM_MODEL"]');
+  const chatMirror = document.createElement('input');
+  chatMirror.type = 'hidden';
+  chatMirror.name = 'LLM_CHAT_MODEL';
+  chatMirror.value = modelInput.value;
+  modelInput.insertAdjacentElement('afterend', chatMirror);
+  modelInput.addEventListener('input', () => { chatMirror.value = modelInput.value; });
   const actions = formSection.querySelector('.row');
   const test = el('button', 'ghost');
   test.type = 'button';
@@ -4083,7 +4066,8 @@ function openRuleModal(existingRule = null) {
   form.innerHTML = `<label>Rule prompt<textarea name="text" required placeholder="Generate a weekly rule that flags brokerage cash above 25% and explains why it matters.">${esc(existingRule?.sourceText || '')}</textarea></label>
     <div class="row"><button class="ghost" type="button" id="previewRule">Preview</button><span class="message"></span></div>
     <div class="rulepreview" id="rulePreview"${existingRule ? '' : ' hidden'}>${existingRule ? rulePreviewMarkup(existingRule) : ''}</div>
-    <div class="deliverysettings" id="deliverySettings"${hasPreview ? '' : ' hidden'}><div class="nm">Delivery settings</div><div class="cardsub">Category and scope are inferred from your description (shown above). Choose when the rule runs.</div><div class="split"><label>Cadence<select name="cadence"><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(existingRule?.cadence, existingRule?.scheduledDay)}</select></label><label class="rulehour">Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div></div>
+    <label class="rulecategory" id="ruleCategory"${hasPreview ? '' : ' hidden'}>Category<select name="scope">${ruleCategoryOptions(existingRule?.scope)}</select></label>
+    <div class="deliverysettings" id="deliverySettings"${hasPreview ? '' : ' hidden'}><div class="split"><label>Cadence<select name="cadence"><option${existingRule?.cadence === 'event' ? ' selected' : ''}>event</option><option${existingRule?.cadence === 'hourly' ? ' selected' : ''}>hourly</option><option${existingRule?.cadence === 'daily' ? ' selected' : ''}>daily</option><option${existingRule?.cadence === 'weekly' ? ' selected' : ''}>weekly</option><option${existingRule?.cadence === 'monthly' ? ' selected' : ''}>monthly</option></select></label><label class="ruleday" hidden>Day<select name="scheduledDay">${ruleDayOptions(existingRule?.cadence, existingRule?.scheduledDay)}</select></label><label class="rulehour">Run hour<select name="scheduledHour">${ruleHourOptions(existingRule?.scheduledHour)}</select></label></div></div>
     <div class="row"><button class="primary" type="submit" id="saveRule"${hasPreview ? '' : ' hidden disabled'}>${existingRule ? 'Save changes' : 'Create rule'}</button></div>`;
   panel.appendChild(form);
   modal(panel);
@@ -4092,6 +4076,7 @@ function openRuleModal(existingRule = null) {
   form.elements.cadence.addEventListener('change', () => syncRuleDayField(form, existingRule?.scheduledDay));
   form.elements.text.addEventListener('input', () => {
     if (existingRule) return;
+    $('#ruleCategory').hidden = true;
     $('#deliverySettings').hidden = true;
     $('#saveRule').hidden = true;
     $('#saveRule').disabled = true;
@@ -4100,13 +4085,16 @@ function openRuleModal(existingRule = null) {
   });
   $('#previewRule').addEventListener('click', async () => {
     const data = customRuleFormData(form);
+    // First preview: let the model infer the category. Once the Category field is
+    // visible the user's choice is an explicit override, so keep sending it.
+    if ($('#ruleCategory').hidden) delete data.scope;
     const button = $('#previewRule');
     button.disabled = true;
     form.querySelector('.message').textContent = 'Generating the rule…';
     form.querySelector('.message').classList.remove('error');
     try {
       // Author + validate the SQL without persisting, so the user sees the
-      // generated query and inferred category/scope before committing.
+      // inferred category and can adjust it before committing.
       const preview = await api('/v1/rules/custom/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4115,6 +4103,7 @@ function openRuleModal(existingRule = null) {
       applyRulePreview(form, preview);
       $('#rulePreview').hidden = false;
       $('#rulePreview').innerHTML = rulePreviewMarkup(preview);
+      $('#ruleCategory').hidden = false;
       $('#deliverySettings').hidden = false;
       $('#saveRule').hidden = false;
       $('#saveRule').disabled = false;
@@ -4134,15 +4123,16 @@ function openRuleModal(existingRule = null) {
     submit.disabled = true;
     try {
       if (existingRule) {
-        // Editing a custom rule: regenerate its SQL only when the description
-        // actually changed (re-authoring invokes the model and is non-deterministic,
-        // so a schedule-only edit must not silently rewrite the query), then apply
-        // the schedule. Both are keyed by kind — separate backend concerns.
-        if (data.text !== (existingRule.sourceText || '')) {
+        // Editing a custom rule: send the content edit when the description or the
+        // category changed. The backend re-authors the SQL (model, non-deterministic)
+        // only when the text changed; a category-only edit just updates classification
+        // and leaves the query intact. The schedule is a separate concern, keyed by
+        // kind, applied below.
+        if (data.text !== (existingRule.sourceText || '') || data.scope !== (existingRule.scope || '')) {
           await api('/v1/rules/custom/edit', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ kind: existingRule.kind, text: data.text }),
+            body: JSON.stringify({ kind: existingRule.kind, text: data.text, scope: data.scope }),
           });
         }
         await api('/v1/rules/schedule', {
@@ -4172,9 +4162,10 @@ function openRuleModal(existingRule = null) {
   });
 }
 
-// The payload the custom-rule endpoints accept: the natural-language text plus the
-// delivery schedule. Category and scope are authored by the model (not sent), so
-// they are deliberately omitted — the endpoints reject unknown fields.
+// The payload the custom-rule endpoints accept: the natural-language text, the
+// user-chosen category (scope), and the schedule. The SQL and internal domain are
+// authored/derived server-side. scope is sent as an override; on the first preview
+// (before the category field is shown) the caller drops it so the model infers it.
 function customRuleFormData(form) {
   const data = Object.fromEntries(new FormData(form));
   const cadence = data.cadence || 'event';
@@ -4182,6 +4173,7 @@ function customRuleFormData(form) {
   const triggered = cadence === 'event' || cadence === 'hourly';
   return {
     text: data.text,
+    scope: data.scope,
     cadence,
     scheduledHour: triggered || data.scheduledHour === '' ? null : Number(data.scheduledHour),
     scheduledDay: data.scheduledDay === '' || data.scheduledDay === undefined ? null : Number(data.scheduledDay),
@@ -4189,27 +4181,33 @@ function customRuleFormData(form) {
 }
 
 function applyRulePreview(form, preview) {
+  if (preview.scope) form.elements.scope.value = preview.scope;
   form.elements.cadence.value = preview.cadence;
   form.elements.scheduledHour.value = preview.scheduledHour === null || preview.scheduledHour === undefined ? '' : String(preview.scheduledHour);
   syncRuleDayField(form, preview.scheduledDay);
 }
 
-// The generated-rule preview: the model-inferred category/scope, the schedule, the
-// authored SQL, and (on preview) the execution strategy. Shown for both a fresh
-// preview (a RuleSqlDraft-backed preview object) and an existing custom rule.
-function ruleDomainLabel(domain) {
-  const entry = ruleDomains.find(([key]) => key === domain);
-  return entry ? entry[1] : (domain || '—');
+// A custom rule's single user-facing "Category": the app's product areas, which is
+// the rule's scope. The domain is derived server-side, so there is no second picker.
+const ruleCategories = [
+  ['banking', 'Banking'],
+  ['brokerage', 'Brokerage'],
+  ['credit', 'Credit report'],
+  ['all', 'All'],
+];
+
+function ruleCategoryOptions(selected) {
+  const current = ruleCategories.some(([value]) => value === selected) ? selected : 'banking';
+  return ruleCategories
+    .map(([value, label]) => `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`)
+    .join('');
 }
 
+// The generated-rule preview: a short confirmation that the rule was authored and
+// validated. The raw SQL is deliberately hidden; category and schedule are shown as
+// editable fields below. Used for a fresh preview and for an existing custom rule.
 function rulePreviewMarkup(rule) {
-  return `<div class="rulepreviewgrid">
-    <div><span>Category</span><b>${esc(ruleDomainLabel(rule.domain))}</b></div>
-    <div><span>Scope</span><b>${esc(rule.scope || '—')}</b></div>
-    <div><span>Schedule</span><b>${esc(ruleScheduleLabel(rule))}</b></div>
-  </div>
-  <div class="ruletags">${ruleTag('status', 'Custom SQL')}</div>
-  ${rule.sql ? `<pre class="rulesql">${esc(rule.sql)}</pre>` : ''}
+  return `<div class="rulepreviewhead"><div class="nm">${esc(rule.title || 'Custom rule')}</div>${ruleTag('status', 'Ready')}</div>
   ${rule.strategy ? `<div class="sub">${esc(rule.strategy)}</div>` : ''}`;
 }
 
@@ -4640,3 +4638,4 @@ loadData().then(render).catch((error) => {
   $('#view').replaceChildren(empty(error.message));
 });
 checkForUpdate();
+resolveAppVersion();

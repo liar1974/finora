@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +8,29 @@ import { z } from 'zod';
 import type { FinanceService } from '../application/finance-service.js';
 import { AppError } from '../application/errors.js';
 import { openApiDocument } from './openapi.js';
+
+// The app version reported over /v1/health, resolved once at import. The repo keeps
+// a placeholder in package.json (0.1.0); CI's scripts/set-version.mjs stamps the
+// release tag into it before building, so shipped builds report their real version.
+// The web UI reads this so its sidebar can show the running version in browser mode
+// (the desktop app instead uses Tauri's getVersion(), which is baked into the bundle).
+const APP_VERSION = resolveAppVersion();
+function resolveAppVersion(): string {
+  const candidates = [
+    resolve(process.cwd(), 'package.json'),
+    fileURLToPath(new URL('../../package.json', import.meta.url)),
+    fileURLToPath(new URL('../../../package.json', import.meta.url)),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const pkg = JSON.parse(readFileSync(candidate, 'utf8')) as { version?: unknown };
+      if (typeof pkg.version === 'string' && pkg.version) return pkg.version;
+    } catch {
+      // Try the next location.
+    }
+  }
+  return '0.0.0';
+}
 
 const accountSchema = z.object({
   institution: z.string().trim().min(1).max(120),
@@ -100,6 +124,7 @@ const ruleScheduleSchema = z.object({
 // by the minted kind; delete is keyed by kind (a slug), not a UUID.
 const ruleCustomCreateSchema = z.object({
   text: z.string().trim().min(1).max(2000),
+  scope: z.string().trim().max(40).optional(),
   cadence: z.string().trim().max(40).optional(),
   scheduledHour: z.number().int().min(0).max(23).nullable().optional(),
   scheduledDay: z.number().int().min(0).max(31).nullable().optional(),
@@ -108,6 +133,7 @@ const ruleCustomCreateSchema = z.object({
 const ruleCustomEditSchema = z.object({
   kind: z.string().min(1),
   text: z.string().trim().min(1).max(2000),
+  scope: z.string().trim().max(40).optional(),
 }).strict();
 
 const ruleDeleteSchema = z.object({
@@ -196,7 +222,7 @@ async function route(
   }
   if (method === 'GET' && url.pathname === '/openapi.json') return sendJson(response, 200, openApiDocument);
   if (method === 'GET' && url.pathname === '/v1/health') {
-    return sendJson(response, 200, { status: 'ok', version: '0.1.0' });
+    return sendJson(response, 200, { status: 'ok', version: APP_VERSION });
   }
   if (
     url.pathname.startsWith('/v1/') &&

@@ -1082,6 +1082,17 @@ export class SqliteFinanceRepository implements FinanceRepository {
     return result.changes > 0 ? this.getRule(kind) : null;
   }
 
+  // Update only a custom rule's classification (domain + scope), leaving its
+  // validated SQL intact. Used for a category-only edit that must not re-author the
+  // query. Guarded to source = 'user'.
+  updateUserRuleClassification(kind: string, content: { domain: string; scope: string }): RuleRecord | null {
+    const result = this.database.prepare(`
+      UPDATE rules SET domain = ?, scope = ?, updated_at = ?
+      WHERE kind = ? AND source = 'user'
+    `).run(content.domain, content.scope, new Date().toISOString(), kind);
+    return result.changes > 0 ? this.getRule(kind) : null;
+  }
+
   // Delete a custom rule. Guarded to source = 'user' so built-in/downloaded rules
   // are never removed. Returns whether a row was deleted.
   deleteRule(kind: string): boolean {

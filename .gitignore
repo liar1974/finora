@@ -12,3 +12,6 @@ src-tauri/resources/desktop/*
 playwright-report/
 test-results/
 e2e/.artifacts/
+
+# Local promo/marketing asset generation (screenshots, GIFs, avatars) — not shipped
+promo/

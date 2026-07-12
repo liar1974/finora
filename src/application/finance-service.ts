@@ -497,16 +497,24 @@ export class FinanceService {
     }
     const nextProviderId = clean.LLM_PROVIDER?.toLowerCase();
     const currentProviderId = (this.repository.getAppSetting('LLM_PROVIDER') || 'builtin').toLowerCase();
+    // Switching away from the built-in model: its in-process weights + KV cache
+    // otherwise linger in RAM until the process exits (nothing else unloads on a
+    // provider switch). Free them here; a later switch back reloads on demand.
+    const leavingBuiltin = Boolean(nextProviderId && nextProviderId !== currentProviderId && currentProviderId === 'builtin');
     if (nextProviderId && nextProviderId !== currentProviderId) {
       const provider = LLM_PROVIDERS.find((candidate) => candidate.id === nextProviderId);
       if (provider) {
         if (!('LLM_BASE_URL' in clean)) clean.LLM_BASE_URL = provider.baseUrl || '';
+        // One model per provider — extraction and chat are not distinguished. Seed
+        // both the model and the (legacy) chat-model key to the same default so they
+        // never diverge; the Settings UI likewise writes a single Model field to both.
         if (!('LLM_MODEL' in clean)) clean.LLM_MODEL = provider.defaultModel;
-        if (!('LLM_CHAT_MODEL' in clean)) clean.LLM_CHAT_MODEL = provider.defaultChatModel;
+        if (!('LLM_CHAT_MODEL' in clean)) clean.LLM_CHAT_MODEL = provider.defaultModel;
         if (!('LLM_API_KEY' in clean)) clean.LLM_API_KEY = '';
       }
     }
     this.repository.saveAppSettings(clean);
+    if (leavingBuiltin) void this.localModel.unload();
     if (this.backgroundServicesStarted && telegramChatEnabled()) this.telegramGateway.start();
     return { ok: true, saved: Object.keys(clean).length };
   }
@@ -1456,15 +1464,18 @@ export class FinanceService {
 
   // Author + validate a custom rule's SQL without persisting, so the UI can show
   // the generated query and inferred settings before the user commits.
-  async previewCustomRule(input: { text: string; cadence?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
+  async previewCustomRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
     const draft = await this.authorCustomRule(text);
     const cadence = normalizeChoice(input.cadence ?? 'event', RULE_CADENCES, 'event');
+    // The user may override the model-inferred category; domain follows scope.
+    const scope = input.scope ? normalizeChoice(input.scope, RULE_SCOPES, draft.scope) : draft.scope;
+    const domain = SCOPE_TO_DOMAIN[scope] ?? draft.domain;
     return {
       text,
       kind: null,
-      domain: draft.domain,
-      scope: draft.scope,
+      domain,
+      scope,
       executionClass: 'D' as const,
       cadence,
       scheduledHour: input.scheduledHour ?? suggestedRuleHour(cadence),
@@ -1477,17 +1488,20 @@ export class FinanceService {
 
   // Author + validate + persist a new custom rule (source = 'user'), active by
   // default. The kind is minted here — the model never owns identity.
-  async createCustomRule(input: { text: string; cadence?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
+  async createCustomRule(input: { text: string; scope?: string | undefined; cadence?: string | undefined; scheduledHour?: number | null | undefined; scheduledDay?: number | null | undefined }) {
     const text = requireText(input.text, 'text');
     const draft = await this.authorCustomRule(text);
     const cadence = normalizeChoice(input.cadence ?? 'event', RULE_CADENCES, 'event');
+    // The user may override the model-inferred category; domain follows scope.
+    const scope = input.scope ? normalizeChoice(input.scope, RULE_SCOPES, draft.scope) : draft.scope;
+    const domain = SCOPE_TO_DOMAIN[scope] ?? draft.domain;
     const kind = this.mintUserRuleKind(text);
     const spec: RuleSpec = {
       kind,
-      domain: draft.domain,
+      domain,
       executionClass: 'D',
       actionTier: 'observer',
-      scope: draft.scope,
+      scope,
       cadence,
       keywords: draft.keywords,
       sql: draft.sql,
@@ -1508,7 +1522,7 @@ export class FinanceService {
 
   // Rewrite a custom rule's content by regenerating its SQL from new natural
   // language. Only user rules may be edited; built-in/downloaded content is fixed.
-  async updateCustomRuleContent(input: { kind: string; text: string }) {
+  async updateCustomRuleContent(input: { kind: string; text: string; scope?: string | undefined }) {
     const kind = requireText(input.kind, 'kind');
     const text = requireText(input.text, 'text');
     const existing = this.repository.getRule(kind);
@@ -1516,12 +1530,22 @@ export class FinanceService {
     if (existing.source !== 'user') {
       throw new AppError('invalid_input', 'Only custom rules can be edited; built-in rules have fixed content.', { kind, source: existing.source });
     }
+    const scope = input.scope ? normalizeChoice(input.scope, RULE_SCOPES, existing.scope) : existing.scope;
+    const domain = (SCOPE_TO_DOMAIN[scope] ?? existing.domain) as RuleDomain;
+    // Re-authoring runs the model (non-deterministic and slow), so only do it when
+    // the description actually changed. A category-only edit just updates the two
+    // classification columns and leaves the validated SQL untouched.
+    if ((existing.sourceText ?? '') === text) {
+      const rule = this.repository.updateUserRuleClassification(kind, { domain, scope });
+      if (!rule) throw new AppError('not_found', 'Rule not found', { kind });
+      return rule;
+    }
     const draft = await this.authorCustomRule(text);
     const rule = this.repository.updateUserRuleContent(kind, {
       sql: draft.sql,
       keywords: draft.keywords,
-      domain: draft.domain,
-      scope: draft.scope,
+      domain,
+      scope,
       sourceText: text,
     });
     if (!rule) throw new AppError('not_found', 'Rule not found', { kind });
@@ -1545,15 +1569,48 @@ export class FinanceService {
   // Run the injected author, then validate the generated SQL against the live DB on
   // the read-only connection before it is ever persisted or scheduled.
   private async authorCustomRule(text: string): Promise<RuleSqlDraft> {
-    const draft = await this.ruleSqlAuthor({ text });
-    this.validateRuleSql(draft.sql);
-    return {
-      sql: draft.sql,
-      title: draft.title || 'Custom rule',
-      keywords: draft.keywords || text.toLowerCase().slice(0, 120),
-      domain: normalizeChoice(draft.domain, RULE_DOMAINS, 'spending') as RuleDomain,
-      scope: normalizeChoice(draft.scope, RULE_SCOPES, 'banking'),
-    };
+    // The author is non-deterministic, and even a mid-size model intermittently emits
+    // unparseable JSON or SQL that fails validation (unknown column, bad alias/CTE
+    // scoping, syntax). Retry a few times — and when a candidate parses but fails
+    // validation, feed the exact SQLite error + the failed SQL back so the next
+    // attempt can *fix that specific mistake* rather than guess afresh (self-repair).
+    // A missing model won't fix itself — bail on it.
+    const maxAttempts = 5;
+    let lastError: unknown;
+    let repair: { sql: string; error: string } | undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let draft: RuleSqlDraft;
+      try {
+        draft = await this.ruleSqlAuthor({ text, repair });
+      } catch (error) {
+        lastError = error;
+        if (error instanceof AppError && error.details?.reason === 'needs_download') throw error;
+        continue; // authoring/parse failed — no SQL to repair from, try again
+      }
+      try {
+        this.validateRuleSql(draft.sql);
+        return {
+          sql: draft.sql,
+          title: draft.title || 'Custom rule',
+          keywords: draft.keywords || text.toLowerCase().slice(0, 120),
+          domain: normalizeChoice(draft.domain, RULE_DOMAINS, 'spending') as RuleDomain,
+          scope: normalizeChoice(draft.scope, RULE_SCOPES, 'banking'),
+        };
+      } catch (error) {
+        lastError = error;
+        // Hand the model its own broken query and the reason it failed.
+        repair = { sql: draft.sql, error: error instanceof Error ? error.message : 'query failed' };
+      }
+    }
+    // All attempts failed. Surface the underlying error, plus a hint about the most
+    // likely remedy: small local models often can't author complex rules reliably.
+    if (lastError instanceof AppError) {
+      const hint = this.llmConfig().local
+        ? ' A small local model can struggle to author complex rules — try a more capable model (Settings → Models) or simplify the description.'
+        : ' Try simplifying or rephrasing the rule.';
+      throw new AppError(lastError.code, `${lastError.message}${hint}`, lastError.details);
+    }
+    throw lastError;
   }
 
   // Execute the candidate SQL once on the read-only connection with the engine's
@@ -1576,16 +1633,84 @@ export class FinanceService {
     }
   }
 
+  // The schema block for the author prompt, read from the live DB so it never drifts
+  // from the real tables. Cached per process (the schema is stable within a run).
+  private ruleSchemaSummaryCache: string | null = null;
+  private ruleSchemaSummary(): string {
+    if (this.ruleSchemaSummaryCache !== null) return this.ruleSchemaSummaryCache;
+    const lines: string[] = [];
+    for (const name of RULE_SCHEMA_TABLES) {
+      try {
+        // name is a trusted constant (not user input), so inlining it is injection-safe.
+        // pragma_table_info works for both tables and views, giving real column names.
+        const cols = this.repository.runRuleQuery(`SELECT name FROM pragma_table_info('${name}')`, {});
+        const columns = cols.map((row) => String(row.name)).filter(Boolean);
+        if (columns.length) lines.push(`- ${name}(${columns.join(', ')})`);
+      } catch {
+        // Table/view absent in this DB — skip it rather than fail authoring.
+      }
+    }
+    this.ruleSchemaSummaryCache = lines.join('\n');
+    return this.ruleSchemaSummaryCache;
+  }
+
+  // Assemble the full author system prompt: static header + live schema + static footer.
+  private ruleAuthorSystemPrompt(): string {
+    return `${RULE_SQL_AUTHOR_HEADER}\n\nReadable tables/columns (query only these):\n${this.ruleSchemaSummary()}\n\n${RULE_SQL_AUTHOR_FOOTER}`;
+  }
+
+  // Output-token budget for rule authoring, scaled to model capability. A small model
+  // handed a large budget mostly fills it with repetition (→ truncation/garbage); a
+  // capable one needs room to finish a long query. We size by the best "size" signal
+  // each provider gives us: built-in models expose weight bytes; Ollama tags usually
+  // encode the parameter count (":9b"); hosted models are all large. A SQL rule never
+  // needs more than the 8k cap.
+  private ruleAuthorMaxTokens(llm: ReturnType<typeof this.llmConfig>): number {
+    const CAP = 8_192;
+    if (llm.provider === 'builtin') {
+      // ~7B+ local weights get more room than a ~4B; both stay modest (CPU + small ctx).
+      return getBuiltinModel(llm.model).approxSizeBytes >= 5_000_000_000 ? 4_096 : 2_048;
+    }
+    if (llm.provider === 'ollama') {
+      // Read the parameter-size hint from the tag (e.g. "qwen3.5:9b" -> 9), if present.
+      const params = Number(/:(\d+(?:\.\d+)?)\s*b\b/i.exec(llm.model)?.[1]);
+      if (!Number.isFinite(params)) return 6_144; // unknown size — moderate
+      return params >= 7 ? CAP : 4_096;           // 7B+ (e.g. qwen3.5:9b) validated at 8k
+    }
+    return CAP; // hosted frontier models
+  }
+
   // Production NL→SQL author (default RuleSqlAuthor). Asks the configured model for
   // a deterministic query over the local schema, returning strict JSON.
-  private async authorRuleSqlWithModel({ text }: { text: string }): Promise<RuleSqlDraft> {
+  private async authorRuleSqlWithModel({ text, repair }: { text: string; repair?: { sql: string; error: string } | undefined }): Promise<RuleSqlDraft> {
     const llm = this.llmConfig();
+    const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [{ role: 'user', content: text }];
+    if (repair) {
+      // Self-repair turn: show the model its own failed query and the exact SQLite
+      // error so it fixes that specific problem (e.g. an alias/CTE that didn't select
+      // the referenced column) instead of regenerating from scratch.
+      messages.push({ role: 'assistant', content: JSON.stringify({ sql: repair.sql }) });
+      messages.push({
+        role: 'user',
+        content: `That query failed validation with SQLite error: ${repair.error}\n`
+          + 'Return corrected JSON. Only reference columns that exist in the schema above, and make sure every table alias you use is defined and selects the columns you read from it.',
+      });
+    }
     try {
       const reply = await this.llmReply(llm, {
-        system: RULE_SQL_AUTHOR_SYSTEM,
-        messages: [{ role: 'user', content: text }],
+        system: this.ruleAuthorSystemPrompt(),
+        messages,
         timeoutMs: 120_000,
-        maxTokens: 1_200,
+        // Budget scaled to model capability (see ruleAuthorMaxTokens). Too small a
+        // budget truncates schema-heavy SQL mid-statement ("incomplete input"); too
+        // large lets a weak model ramble. For Ollama this also grows num_ctx (sized
+        // from maxTokens), still under the 32768 cap.
+        maxTokens: this.ruleAuthorMaxTokens(llm),
+        // This call wants strict JSON, not reasoning. A reasoning model (Qwen3.5)
+        // otherwise spends the token budget inside <think> and returns empty or
+        // truncated output, so authoring fails intermittently. Match the chat/test
+        // paths and skip thinking (also faster on a CPU-bound local model).
+        disableThinking: true,
       });
       const parsed = parseRuleSqlDraft(reply);
       if (!parsed) throw new Error('the model did not return a SQL rule');
@@ -2837,6 +2962,17 @@ const RULE_SCOPES = ['banking', 'brokerage', 'credit', 'all'];
 const RULE_CADENCES = ['event', 'hourly', 'daily', 'weekly', 'monthly'];
 const RULE_DOMAINS = ['cash-flow', 'spending', 'credit-report', 'investments', 'connections'];
 
+// Custom rules expose a single user-facing "Category" — the app's product areas
+// (banking / brokerage / credit / all), which is the rule's scope. The internal
+// domain (used for the settings-list grouping) is derived from that choice so the
+// two classification columns never disagree; there is no separate domain picker.
+const SCOPE_TO_DOMAIN: Record<string, RuleDomain> = {
+  banking: 'cash-flow',
+  brokerage: 'investments',
+  credit: 'credit-report',
+  all: 'cash-flow',
+};
+
 // The columns every rule's SQL must SELECT to produce a finding draft (see
 // rowToDraft in rules-engine). Optional columns (dollar_impact_minor, currency,
 // urgency, effort, severity, action_label, account_id) are not required.
@@ -2854,53 +2990,87 @@ const RULE_SQL_VALIDATION_PARAMS: Record<string, unknown> = {
   checking_apr: 0.0001,
 };
 
-// System prompt for the default NL→SQL author. Describes the read-only schema, the
-// shared UDFs/params, and the finding-draft output contract, and demands raw SQL
-// as strict JSON. The query runs on a read-only connection, so it can only read.
-const RULE_SQL_AUTHOR_SYSTEM = [
+// The rule-relevant tables/views exposed to the NL→SQL author. The column lists are
+// read from the live DB (single source of truth) rather than hand-maintained here, so
+// they never drift from the real schema. Internal tables (settings, migrations, chat,
+// dashboards, …) are deliberately omitted so the model isn't tempted to query them.
+const RULE_SCHEMA_TABLES = [
+  'accounts',
+  'transactions',
+  'account_balances',
+  'brokerage_holdings',
+  'brokerage_transactions',
+  'facts',
+  'recurring_series',
+  'recurring_classifications',
+  'merchant_identities',
+  'credit_reports',
+];
+
+// Static top of the author system prompt: the task, the strict-JSON contract, and the
+// finding-draft output columns. The schema block is injected between header and footer
+// at runtime (see ruleAuthorSystemPrompt).
+const RULE_SQL_AUTHOR_HEADER = [
   'You author a single deterministic SQLite query for a Finora rule from the user\'s description.',
-  'Return ONLY compact JSON: {"sql": string, "domain": string, "scope": string, "keywords": string, "title": string}. No prose, no markdown fences.',
+  'Return ONLY compact JSON: {"sql": string, "category": string, "keywords": string, "title": string}. No prose, no markdown fences.',
   '',
   'The sql MUST be a single read-only SELECT or WITH statement (it runs on a read-only connection; writes fail). No semicolons, no PRAGMA, no attached databases.',
   'It MUST select these columns (a "finding draft"): key (stable unique id per row, TEXT), title, detail, value, confidence (0..1 REAL), evidence_summary, evidence_records (comma-joined record ids, may be \'\').',
   'It MAY also select: dollar_impact_minor (signed integer minor units), currency, urgency (>=1), effort (>=1), severity (\'high\'|\'medium\'|\'low\'), action_label, account_id, created_at.',
   'Amounts are integer minor units (cents); outflows are negative amount_minor. Annualize recurring impact to a 12-month horizon.',
-  '',
-  'Readable tables/columns:',
-  '- accounts(id, institution, name, type, currency, domain, source)',
-  '- transactions(id, account_id, date, description, amount_minor, currency, category, pending)',
-  '- account_balances(id, account_id, as_of_date, current_minor, available_minor, limit_minor, cash_minor, currency) — use the latest per account via ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC)',
-  '- brokerage_holdings(id, account_id, as_of_date, symbol, name, security_type, quantity, value_minor, currency)',
-  '- brokerage_transactions(id, account_id, date, description, amount_minor, currency, symbol, investment_type)',
-  '- facts(key, value, source, confidence)',
-  '- recurring_series view(account_id, merchant, direction, currency, count, latest_minor, typical_minor, label, first_date, last_date, periods_per_year, record_ids) joined to recurring_classifications(merchant, direction, is_recurring, kind, canonical_name, confidence)',
-  '- merchant_identities(merchant, canonical_name, canonical_slug)',
-  '',
+].join('\n');
+
+// Static bottom: UDFs/params, a few dialect one-liners that patch specific local-model
+// blind spots (self-repair alone did not fix these), the keep-it-minimal steer, and the
+// category values. Kept intentionally short.
+const RULE_SQL_AUTHOR_FOOTER = [
   'UDFs/aggregates: money(minor[, currency]) -> display string, normalize_merchant(description), fee_like(description) -> 1/0, median(x).',
-  'Bound params you may reference: :now_iso, :now_ms, :prior_30d_iso, :hysa_apr, :checking_apr, :rule_created_at. Use julianday(:now_iso) - julianday(date) for day math.',
+  'Bound params you may reference: :now_iso, :now_ms, :prior_30d_iso, :hysa_apr, :checking_apr, :rule_created_at. Use julianday(:now_iso) - julianday(date) for day math. account_balances holds one row per snapshot — take the latest per account with ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY as_of_date DESC, id DESC).',
   '',
-  'domain must be one of: cash-flow, spending, credit-report, investments, connections. scope one of: banking, brokerage, credit, all. keywords is a short lowercase regex-ish phrase for matching. Always add a LIMIT.',
+  'SQLite syntax (avoid these common mistakes):',
+  '- Alias EVERY output column with `expr AS name`. SQLite has NO `:=` operator — never write `name := expr`.',
+  '- Qualify EVERY column with its table alias (t.currency, a.name); an unqualified column present in two joined tables fails with "ambiguous column name".',
+  '- Compare dates as ISO text (date >= :prior_30d_iso) or via julianday(); never compare a date string to a bare number.',
+  '',
+  'Keep it MINIMAL: write the simplest query that satisfies the request. Do NOT invent scoring, impact ratios, urgency tiers, or optional columns the user did not ask for. For a "new X" / "any X" rule, just SELECT the matching rows with a stable key — the engine only surfaces rows it has not seen before, so you never compute "new" yourself.',
+  '',
+  'category must be one of: banking, brokerage, credit, all. keywords is a short lowercase regex-ish phrase for matching. Always add a LIMIT.',
 ].join('\n');
 
 // Parse the author's JSON reply into a RuleSqlDraft. Returns null when the reply
 // has no JSON object or lacks a usable sql string.
-function parseRuleSqlDraft(reply: string): RuleSqlDraft | null {
-  const match = reply.match(/\{[\s\S]*\}/);
-  if (!match) return null;
-  let value: Record<string, unknown>;
-  try {
-    const parsed = JSON.parse(match[0]);
-    if (!parsed || typeof parsed !== 'object') return null;
-    value = parsed as Record<string, unknown>;
-  } catch {
-    return null;
+// Pull the JSON object out of a model reply, tolerating the wrappers small local
+// models add around it: <think> reasoning blocks, ```json fences, and stray prose
+// before/after the object. Returns null when no JSON object can be parsed.
+function extractJsonObject(reply: string): Record<string, unknown> | null {
+  const cleaned = reply
+    .replace(/<think>[\s\S]*?<\/think>/gi, '') // closed reasoning block
+    .replace(/<think>[\s\S]*$/i, '')            // unclosed block (budget ran out mid-think)
+    .replace(/```(?:json)?\s*([\s\S]*?)```/gi, '$1'); // code fences, keep inner text
+  for (const text of [cleaned, reply]) {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) continue;
+    try {
+      const parsed = JSON.parse(match[0]);
+      if (parsed && typeof parsed === 'object') return parsed as Record<string, unknown>;
+    } catch {
+      // Try the next candidate (e.g. the raw reply if cleaning mangled it).
+    }
   }
+  return null;
+}
+
+function parseRuleSqlDraft(reply: string): RuleSqlDraft | null {
+  const value = extractJsonObject(reply);
+  if (!value) return null;
   const sql = typeof value.sql === 'string' ? value.sql.trim() : '';
   if (!sql) return null;
   return {
     sql,
-    domain: String(value.domain ?? 'spending') as RuleDomain,
-    scope: String(value.scope ?? 'banking'),
+    // The author now returns a single `category` (the app's product areas). `domain`
+    // is derived from it downstream (SCOPE_TO_DOMAIN), so any placeholder is fine here.
+    domain: 'spending' as RuleDomain,
+    scope: String(value.category ?? value.scope ?? 'banking'),
     keywords: typeof value.keywords === 'string' ? value.keywords : '',
     title: typeof value.title === 'string' ? value.title : 'Custom rule',
   };

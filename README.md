@@ -1,17 +1,30 @@
+<div align="center">
+
 # Finora
 
-**Your personal financial assistant. All data are on your own computer.**
+**Your money, understood — entirely on your own computer.**
+
+The open-source, local-first personal finance assistant. Your bank, brokerage,<br/>
+and credit report in one clear picture — and nothing ever leaves your machine.
+
+[![Latest release](https://img.shields.io/github/v/release/liar1974/finora?sort=semver&label=release)](https://github.com/liar1974/finora/releases/latest)
+[![Stars](https://img.shields.io/github/stars/liar1974/finora?style=flat)](https://github.com/liar1974/finora/stargazers)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+
+[Download](#download) · [Onboarding](docs/onboarding.md) · [X](https://x.com/geniuskoi) · [Privacy](#your-privacy) · [Contributing](CONTRIBUTING.md) · [License](LICENSE)
+
+</div>
+
+## What is Finora?
 
 Finora is a personal financial assistant that brings your bank accounts,
 investments, and credit reports together into one clear picture — then helps you
-make sense of it. It runs on your own laptop and
-keeps everything in a single file on your machine.
+make sense of it. It runs on your own laptop and keeps everything in a single
+file on your machine.
 
 Finora never moves your money, never stores your bank passwords anywhere online,
 and never gives financial advice. It helps you *see*, *understand*, and act on
 your own numbers — every decision stays yours.
-
-![Finora banking overview](docs/media/screenshots/banking.png)
 
 ## What Finora does for you
 
@@ -127,7 +140,8 @@ Found a bug or have a question? Please
 ---
 
 *Want to build Finora from source or run it yourself? See
-[CONTRIBUTING.md](CONTRIBUTING.md). Finora is **source-available**, not open
-source: the code is public to read and to run for your own personal,
-non-commercial use, but modifying, redistributing, or using it commercially is
-not permitted. See the [LICENSE](LICENSE) for the exact terms.*
+[CONTRIBUTING.md](CONTRIBUTING.md). Finora is **open source under the
+[GNU AGPL-3.0](LICENSE)**: you are free to use, study, modify, and redistribute
+it, provided that any distributed or network-hosted derivative is also released
+under the AGPL-3.0 with complete source. See the [LICENSE](LICENSE) for the exact
+terms.*

@@ -41,4 +41,47 @@ test.describe('rules', () => {
     await modal.locator('#closeModal').click();
     await expect(modal.locator('textarea[name="text"]')).toHaveCount(0);
   });
+
+  test('previewing a custom rule shows an editable Category, hides the SQL, and posts the override', async ({ app }) => {
+    // Stub the model-backed author so the flow runs without a local model. The
+    // preview infers scope 'brokerage'; the created rule must carry whatever the
+    // user leaves in the Category select (we change it to 'credit').
+    await app.page.route('**/v1/rules/custom/preview', (route) =>
+      route.fulfill({
+        json: {
+          text: 'flag idle cash', kind: null, domain: 'investments', scope: 'brokerage',
+          executionClass: 'D', cadence: 'weekly', scheduledHour: 9, scheduledDay: 1,
+          sql: 'SELECT secret_column FROM rules LIMIT 1', title: 'Idle cash', strategy: 'Deterministic query and local copy.',
+        },
+      }));
+    let postedScope = null;
+    await app.page.route('**/v1/rules/custom', (route) => {
+      postedScope = JSON.parse(route.request().postData() || '{}').scope;
+      return route.fulfill({ json: { kind: 'user:idle-cash-abcd1234', source: 'user', active: true } });
+    });
+
+    await app.goto('settings');
+    await app.subtab('insights').click();
+    await app.page.locator('#newRuleTopbar').click();
+    const modal = app.modal;
+
+    await modal.locator('textarea[name="text"]').fill('flag idle cash');
+    await modal.locator('#previewRule').click();
+
+    // Category is editable and pre-filled with the inferred scope; the schedule
+    // card is just the cadence dropdown (no heading/hint); the raw SQL is never shown.
+    const category = modal.locator('select[name="scope"]');
+    await expect(category).toBeVisible();
+    await expect(category).toHaveValue('brokerage');
+    await expect(modal.locator('#deliverySettings select[name="cadence"]')).toBeVisible();
+    await expect(modal.locator('#deliverySettings .nm, #deliverySettings .cardsub')).toHaveCount(0);
+    await expect(modal.locator('.rulesql, pre')).toHaveCount(0);
+    await expect(modal).not.toContainText('secret_column');
+
+    // Override the inferred category, then create — the POST carries the override.
+    await category.selectOption('credit');
+    await modal.locator('#saveRule').click();
+    await expect(app.toast).toContainText(/Rule created/i);
+    expect(postedScope).toBe('credit');
+  });
 });

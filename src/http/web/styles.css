@@ -76,6 +76,9 @@ main { overflow: auto; padding: 28px 32px; min-width: 0; }
 .updatebanner.is-error { border-color: var(--red); }
 .updatetitle { font-weight: 700; font-size: 13px; color: var(--fg); }
 .updatesub { font-size: 11.5px; color: var(--mut); word-break: break-word; }
+/* margin-top:auto pins the version to the sidebar bottom when no update banner is
+   present; when a banner is (it also uses margin-top:auto) this simply sits below it. */
+.sidebarversion { margin-top: auto; padding: 8px 8px 2px; color: var(--mut); font-size: 11px; font-variant-numeric: tabular-nums; }
 .updatebtn { width: 100%; padding: 8px 10px; border: 0; border-radius: 8px; background: var(--brand); color: #fff; font-size: 12.5px; font-weight: 600; cursor: pointer; }
 .updatebtn:hover { background: var(--brandd); }
 .updateprogress { width: 100%; height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
@@ -432,11 +435,11 @@ tbody tr.clickable:hover td { background: var(--card2); }
 .deliverysettings { display: grid; gap: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 10px 12px; }
 .deliverysettings[hidden] { display: none; }
 .rulepreview { display: grid; gap: 9px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 10px 12px; }
-.rulepreviewgrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-.rulepreviewgrid div { min-width: 0; display: grid; gap: 2px; }
-.rulepreviewgrid span { color: var(--mut); font-size: 11px; font-weight: 800; }
-.rulepreviewgrid b { min-width: 0; font-size: 13px; font-weight: 800; text-transform: capitalize; overflow-wrap: anywhere; }
-.rulesql { margin: 0; max-height: 220px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); padding: 8px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fg); }
+.rulepreview[hidden] { display: none; }
+.rulepreviewhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rulepreviewhead .nm { min-width: 0; font-size: 13px; font-weight: 800; overflow-wrap: anywhere; }
+.rulecategory { display: grid; gap: 6px; }
+.rulecategory[hidden] { display: none; }
 .checkrow { display: inline-flex; flex-direction: row; align-items: center; gap: 8px; color: var(--fg); font-size: 13px; font-weight: 700; }
 .checkrow input { width: auto; }
 .formgrid textarea { min-height: 110px; resize: vertical; }
@@ -510,14 +513,6 @@ tbody tr.clickable:hover td { background: var(--card2); }
 .creditmetric { min-width: 0; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); padding: 12px; }
 .creditmetric .lab { color: var(--mut); font-size: 10.5px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
 .creditmetric .value { margin-top: 5px; color: var(--fg); font-size: 19px; line-height: 1.2; font-weight: 850; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.reportdetailblock { min-width: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--card); overflow: hidden; }
-.reportminirow { min-width: 0; padding: 10px 12px; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.reportminitext { min-width: 0; }
-.reportminirow:first-of-type { border-top: 0; }
-.reportminirow.medium { background: rgba(180,83,9,.055); }
-.reportminirow.high { background: rgba(220,38,38,.055); }
-.reportminirow.emptymini, .reportminirow.moremini { color: var(--mut); font-size: 12.5px; }
-.reportminirow.moremini { font-weight: 750; }
 .creditinsights { display: grid; gap: 10px; }
 .insightrow { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; border: 1px solid var(--line); border-left-width: 3px; border-radius: 10px; background: var(--panel); padding: 12px; }
 .insightrow.high { border-left-color: var(--red); }
@@ -565,7 +560,7 @@ tbody tr.clickable:hover td { background: var(--card2); }
   .settingsform { grid-template-columns: 1fr; }
   .chartbuilder { grid-template-columns: 1fr; }
   .chartpreview { min-height: 240px; }
-  .channelgrid, .channelpicker, .channelsetup, .notificationlayout, .requirementgrid, .principlegrid, .rulepreviewgrid { grid-template-columns: 1fr; }
+  .channelgrid, .channelpicker, .channelsetup, .notificationlayout, .requirementgrid, .principlegrid { grid-template-columns: 1fr; }
   .creditreporthead, .creditmetricgrid, .insightrow, .reportrow { grid-template-columns: 1fr; }
   .reportfacts { justify-content: flex-start; }
   .callout { flex-direction: column; }

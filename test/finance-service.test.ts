@@ -81,6 +81,29 @@ function application(classifier?: RecurringClassifier, identifier?: MerchantIden
 }
 
 describe('FinanceService', () => {
+  it('unloads the built-in model only when switching provider away from builtin', async () => {
+    const engine = localModel();
+    const unload = vi.spyOn(engine, 'unload').mockResolvedValue();
+    const service = new FinanceService(
+      new SqliteFinanceRepository(':memory:'),
+      [new OfxStatementParser(), new CsvStatementParser()],
+      engine,
+      undefined,
+    );
+    // A non-provider settings save must not touch the loaded model.
+    service.saveAppSettings({ HYSA_APR: '4.5' });
+    expect(unload).not.toHaveBeenCalled();
+
+    // builtin -> ollama frees the resident weights/KV cache.
+    service.saveAppSettings({ LLM_PROVIDER: 'ollama' });
+    expect(unload).toHaveBeenCalledTimes(1);
+
+    // ollama -> openai (neither is builtin) must not unload again.
+    service.saveAppSettings({ LLM_PROVIDER: 'openai' });
+    expect(unload).toHaveBeenCalledTimes(1);
+    service.close();
+  });
+
   it('does not auto-sync SnapTrade even when its credentials are configured', async () => {
     // SnapTrade auto-sync is intentionally parked behind SNAPTRADE_SYNC_ENABLED=false
     // (it duplicated transactions for accounts also reachable another way, inflating
@@ -1395,13 +1418,31 @@ describe('FinanceService custom rules', () => {
     expect(preview).toMatchObject({
       kind: null,
       executionClass: 'D',
-      domain: 'spending',
+      // domain is derived from scope so the two classification columns never
+      // disagree: scope 'banking' -> domain 'cash-flow'.
+      domain: 'cash-flow',
       scope: 'banking',
       cadence: 'weekly',
       sql: VALID_RULE_SQL,
     });
     // Preview must never write a row.
     expect(service.listRules().length).toBe(before);
+    service.close();
+  });
+
+  it('honors a user category override and derives the domain from it', async () => {
+    const service = application(undefined, undefined, fakeRuleSqlAuthor);
+    // The fake author infers scope 'banking'; overriding to 'brokerage' must win and
+    // pull the domain to 'investments'.
+    const preview = await service.previewCustomRule({ text: 'flag idle cash', scope: 'brokerage' });
+    expect(preview).toMatchObject({ scope: 'brokerage', domain: 'investments' });
+
+    const created = await service.createCustomRule({ text: 'flag idle cash', scope: 'credit' });
+    expect(created).toMatchObject({ scope: 'credit', domain: 'credit-report' });
+
+    // A category-only edit (same text) updates classification without re-authoring.
+    const edited = await service.updateCustomRuleContent({ kind: created.kind, text: created.sourceText ?? 'flag idle cash', scope: 'all' });
+    expect(edited).toMatchObject({ scope: 'all', domain: 'cash-flow' });
     service.close();
   });
 
@@ -1435,6 +1476,56 @@ describe('FinanceService custom rules', () => {
     const thin = application(undefined, undefined, thinAuthor);
     await expect(thin.createCustomRule({ text: 'incomplete draft' })).rejects.toMatchObject({ code: 'invalid_input' });
     thin.close();
+  });
+
+  it('retries a flaky author before surfacing a rule, and gives up after the cap', async () => {
+    // The author fails twice (a small model emitting unparseable/invalid output),
+    // then returns valid SQL — the retry should recover and persist the rule.
+    let calls = 0;
+    const flaky: RuleSqlAuthor = async () => {
+      calls += 1;
+      if (calls < 3) throw new Error('the model did not return a SQL rule');
+      return { sql: VALID_RULE_SQL, domain: 'spending', scope: 'banking', keywords: 'k', title: 'Recovered rule' };
+    };
+    const recovered = application(undefined, undefined, flaky);
+    const created = await recovered.createCustomRule({ text: 'flag something' });
+    expect(created).toMatchObject({ source: 'user' });
+    expect(calls).toBe(3); // failed twice, third attempt succeeded
+    recovered.close();
+
+    // A persistently bad author is retried up to the cap (5), then the error surfaces.
+    let badCalls = 0;
+    const bad: RuleSqlAuthor = async () => {
+      badCalls += 1;
+      return { sql: 'DELETE FROM rules', domain: 'spending', scope: 'banking', keywords: '', title: 'x' };
+    };
+    const persistent = application(undefined, undefined, bad);
+    await expect(persistent.createCustomRule({ text: 'nope' })).rejects.toMatchObject({ code: 'invalid_input' });
+    expect(badCalls).toBe(5);
+    persistent.close();
+  });
+
+  it('feeds a validation error back to the author so it can self-repair', async () => {
+    // First call (no repair) returns SQL referencing a column that doesn't exist;
+    // the retry must arrive WITH the repair context (failed sql + SQLite error), at
+    // which point the author returns a valid query.
+    const seen: Array<{ sql: string; error: string } | undefined> = [];
+    const repairing: RuleSqlAuthor = async ({ repair }) => {
+      seen.push(repair);
+      if (!repair) {
+        return { sql: "SELECT a.nope AS key FROM accounts a LIMIT 1", domain: 'spending', scope: 'banking', keywords: 'k', title: 'x' };
+      }
+      return { sql: VALID_RULE_SQL, domain: 'spending', scope: 'banking', keywords: 'k', title: 'Repaired' };
+    };
+    const service = application(undefined, undefined, repairing);
+    const created = await service.createCustomRule({ text: 'flag something' });
+    expect(created).toMatchObject({ source: 'user' });
+    // Two attempts: first without repair, second with the failed sql + error.
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toBeUndefined();
+    expect(seen[1]?.sql).toContain('a.nope');
+    expect(seen[1]?.error).toMatch(/no such column/i);
+    service.close();
   });
 
   it('protects built-in rules from edit/delete and reports unknown kinds', async () => {

@@ -4,6 +4,24 @@ This guide is for developers who want to run Finora from source, work on the
 code, or cut a release. If you just want to *use* the app, see the
 [README](README.md) and the [onboarding guide](docs/onboarding.md) instead.
 
+## License and contributor agreement
+
+Finora is open source under the [GNU AGPL-3.0](LICENSE). By contributing, you
+agree that your contributions are licensed under the AGPL-3.0, and — because
+maintaining the project sustainably may involve dual-licensing — you also agree
+to the [Contributor License Agreement (CLA)](CLA.md).
+
+**In short:** you keep ownership of your work; you grant the maintainers a broad
+license (including the right to relicense) so Finora can be offered under the
+AGPL-3.0 and, if needed, separate commercial terms. You accept the CLA by signing
+off your commits:
+
+```bash
+git commit -s   # adds a "Signed-off-by: Name <email>" line
+```
+
+See [CLA.md](CLA.md) for the full terms.
+
 ## Architecture and API
 
 - [Architecture](docs/architecture.md) — local-first boundaries, provider rules,

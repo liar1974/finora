@@ -196,6 +196,9 @@ export interface FinanceRepository {
   // Rewrite a custom rule's definition (its LLM-authored SQL and classification).
   // Guarded to source = 'user'; returns null when no such custom rule exists.
   updateUserRuleContent(kind: string, content: RuleContentEdit): RuleRecord | null;
+  // Update only a custom rule's classification (domain + scope), leaving its SQL
+  // intact — for a category-only edit. Guarded to source = 'user'; null otherwise.
+  updateUserRuleClassification(kind: string, content: { domain: string; scope: string }): RuleRecord | null;
   // Delete a custom rule. Guarded to source = 'user'; returns false otherwise.
   deleteRule(kind: string): boolean;
   listRuleSpecs(): RuleSpec[];
@@ -278,4 +281,7 @@ export type MerchantIdentifier = (candidates: MerchantCandidate[]) => Promise<Me
 // definition. Production calls the configured LLM with the readable schema and the
 // required finding-draft output columns; tests inject a deterministic stub (which
 // also stands in for "a model is available"). The service validates and persists.
-export type RuleSqlAuthor = (input: { text: string }) => Promise<RuleSqlDraft>;
+// `repair`, when present, carries a prior failed attempt (its SQL + the exact
+// validation error) so the author can correct that specific mistake instead of
+// re-generating blindly.
+export type RuleSqlAuthor = (input: { text: string; repair?: { sql: string; error: string } | undefined }) => Promise<RuleSqlDraft>;
