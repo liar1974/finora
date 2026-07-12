@@ -191,6 +191,13 @@ export class LocalModelEngine {
   private readonly modelsDir: string;
   private engineAvailable: boolean | null = null;
   private engineError: string | undefined;
+  // The engine probe (native getLlama()) is loaded at most once and shared by
+  // every caller. Without this, statusAll() fanned out one probe per built-in
+  // model — five concurrent native loads on the first /v1/llm, which on a slow
+  // binary-fallback platform (e.g. CI's incompatible prebuilt) both leaked
+  // beforeExit listeners and stalled the status call long enough to block the
+  // web client's post-save data reload.
+  private enginePromise: Promise<boolean> | null = null;
   // Only one download runs at a time; these track that single active download and
   // which model it belongs to. Presence of any other model is read from disk.
   private downloadState: DownloadState = 'absent';
@@ -220,12 +227,21 @@ export class LocalModelEngine {
     else if (active && this.downloadState === 'error') state = 'error';
     else state = 'absent';
 
+    // Status is polled and, on the web client, sits on the critical path of the
+    // app-wide data reload (loadData → /v1/llm). Never block it on the native
+    // engine load: start the (memoized) probe in the background and report the
+    // last known result, treating "still probing" as optimistically available.
+    // The Settings model tab polls status, so a later poll reflects the truth;
+    // the download action (startDownload) hard-checks before committing anyway.
+    if (this.engineAvailable === null) void this.probeEngine();
+    const engineAvailable = this.engineAvailable ?? true;
+
     return {
       modelId: model.id,
       label: model.label,
       approxSizeBytes: model.approxSizeBytes,
-      engineAvailable: await this.checkEngine(),
-      ...(this.engineError ? { engineError: this.engineError } : {}),
+      engineAvailable,
+      ...(engineAvailable ? {} : this.engineError ? { engineError: this.engineError } : {}),
       present,
       ...(filePath ? { filePath } : {}),
       download: {
@@ -520,17 +536,31 @@ export class LocalModelEngine {
     await loaded.model.dispose().catch(() => {});
   }
 
+  // Authoritative engine check: awaits the memoized probe. Callers that must be
+  // certain before acting (e.g. startDownload) use this; status() reads the
+  // cached flag without blocking.
   private async checkEngine(): Promise<boolean> {
     if (this.engineAvailable !== null) return this.engineAvailable;
-    try {
-      const { getLlama } = await import('node-llama-cpp');
-      await getLlama();
-      this.engineAvailable = true;
-    } catch (error) {
-      this.engineAvailable = false;
-      this.engineError = error instanceof Error ? error.message : String(error);
-    }
-    return this.engineAvailable;
+    return this.probeEngine();
+  }
+
+  // Load the native engine exactly once. Concurrent callers share this promise,
+  // so getLlama() runs a single time even when statusAll() queries every model
+  // at once.
+  private probeEngine(): Promise<boolean> {
+    if (this.enginePromise) return this.enginePromise;
+    this.enginePromise = (async () => {
+      try {
+        const { getLlama } = await import('node-llama-cpp');
+        await getLlama();
+        this.engineAvailable = true;
+      } catch (error) {
+        this.engineAvailable = false;
+        this.engineError = error instanceof Error ? error.message : String(error);
+      }
+      return this.engineAvailable as boolean;
+    })();
+    return this.enginePromise;
   }
 
   // Cheap presence check: whether downloaded weights exist, without loading the
