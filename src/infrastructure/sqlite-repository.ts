@@ -55,7 +55,7 @@ const RULES_ENGINE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS rules (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
-    domain TEXT NOT NULL DEFAULT 'cash-flow',
+    domain TEXT NOT NULL DEFAULT 'banking',
     source_text TEXT NOT NULL,
     execution_class TEXT NOT NULL DEFAULT 'D' CHECK (execution_class IN ('D', 'L', 'L+')),
     action_tier TEXT NOT NULL DEFAULT 'observer' CHECK (action_tier IN ('observer', 'advisor', 'guardian', 'navigator')),
@@ -108,7 +108,7 @@ const RULES_ENGINE_SCHEMA = `
 const RULE_SPECS_SCHEMA = `
   CREATE TABLE IF NOT EXISTS rule_specs (
     kind TEXT PRIMARY KEY,
-    domain TEXT NOT NULL DEFAULT 'cash-flow',
+    domain TEXT NOT NULL DEFAULT 'banking',
     execution_class TEXT NOT NULL DEFAULT 'D',
     action_tier TEXT NOT NULL DEFAULT 'observer',
     scope TEXT NOT NULL DEFAULT 'banking',
@@ -133,7 +133,7 @@ const RULE_SPECS_SCHEMA = `
 const MERGED_RULES_SCHEMA = `
   CREATE TABLE IF NOT EXISTS rules (
     kind TEXT PRIMARY KEY,
-    domain TEXT NOT NULL DEFAULT 'cash-flow',
+    domain TEXT NOT NULL DEFAULT 'banking',
     execution_class TEXT NOT NULL DEFAULT 'D' CHECK (execution_class IN ('D', 'L', 'L+')),
     action_tier TEXT NOT NULL DEFAULT 'observer' CHECK (action_tier IN ('observer', 'advisor', 'guardian', 'navigator')),
     scope TEXT NOT NULL DEFAULT 'banking',
@@ -1723,6 +1723,17 @@ export class SqliteFinanceRepository implements FinanceRepository {
       // Drop the now-vestigial columns: the engine runs on `active` alone, so
       // always_on and user_rule no longer carry meaning.
       { version: 15, up: () => this.dropVestigialRuleColumns() },
+      // Collapse the rule-domain taxonomy: cash-flow + spending merge into
+      // `banking`, and investments is renamed `brokerage`. Backfills stored rows
+      // so their grouping matches the new taxonomy (docs/rules-design.md).
+      {
+        version: 16,
+        up: () =>
+          this.database.exec(
+            "UPDATE rules SET domain = 'banking' WHERE domain IN ('cash-flow', 'spending');" +
+              "UPDATE rules SET domain = 'brokerage' WHERE domain = 'investments';",
+          ),
+      },
     ];
 
     // Before mutating an existing user's data, snapshot it. This only runs when

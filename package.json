@@ -29,6 +29,7 @@
     "test:e2e": "pnpm build:web && playwright test",
     "test:e2e:ui": "pnpm build:web && playwright test --ui",
     "e2e:install": "playwright install --with-deps chromium",
+    "promo:demo": "pnpm build:web && node promo/demo/record-demo.mjs",
     "check": "pnpm typecheck && pnpm test && pnpm build"
   },
   "dependencies": {

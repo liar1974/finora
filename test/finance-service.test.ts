@@ -62,7 +62,7 @@ const VALID_RULE_SQL =
 // rejection paths. Injecting it also marks a model as "available".
 const fakeRuleSqlAuthor: RuleSqlAuthor = async () => ({
   sql: VALID_RULE_SQL,
-  domain: 'spending',
+  domain: 'banking',
   scope: 'banking',
   keywords: 'test custom rule',
   title: 'Test custom rule',
@@ -552,7 +552,7 @@ describe('FinanceService', () => {
       version: 1,
       specs: [{
         kind: 'commute-cost',
-        domain: 'spending',
+        domain: 'banking',
         executionClass: 'D',
         actionTier: 'advisor',
         scope: 'banking',
@@ -575,7 +575,7 @@ describe('FinanceService', () => {
 
     // A newer feed version inserts rules this install doesn't have yet, as `downloaded`.
     expect(await service.syncRuleFeed()).toMatchObject({ applied: 1, skipped: false, version: 1 });
-    expect(repository.listRuleSpecs().find((s) => s.kind === 'commute-cost')).toMatchObject({ source: 'downloaded', domain: 'spending' });
+    expect(repository.listRuleSpecs().find((s) => s.kind === 'commute-cost')).toMatchObject({ source: 'downloaded', domain: 'banking' });
 
     // The downloaded rule declares a fact, so it flows straight into the needs-input surface.
     const needs = service.factNeeds();
@@ -1419,8 +1419,8 @@ describe('FinanceService custom rules', () => {
       kind: null,
       executionClass: 'D',
       // domain is derived from scope so the two classification columns never
-      // disagree: scope 'banking' -> domain 'cash-flow'.
-      domain: 'cash-flow',
+      // disagree: scope 'banking' -> domain 'banking'.
+      domain: 'banking',
       scope: 'banking',
       cadence: 'weekly',
       sql: VALID_RULE_SQL,
@@ -1433,16 +1433,16 @@ describe('FinanceService custom rules', () => {
   it('honors a user category override and derives the domain from it', async () => {
     const service = application(undefined, undefined, fakeRuleSqlAuthor);
     // The fake author infers scope 'banking'; overriding to 'brokerage' must win and
-    // pull the domain to 'investments'.
+    // pull the domain to 'brokerage'.
     const preview = await service.previewCustomRule({ text: 'flag idle cash', scope: 'brokerage' });
-    expect(preview).toMatchObject({ scope: 'brokerage', domain: 'investments' });
+    expect(preview).toMatchObject({ scope: 'brokerage', domain: 'brokerage' });
 
     const created = await service.createCustomRule({ text: 'flag idle cash', scope: 'credit' });
     expect(created).toMatchObject({ scope: 'credit', domain: 'credit-report' });
 
     // A category-only edit (same text) updates classification without re-authoring.
     const edited = await service.updateCustomRuleContent({ kind: created.kind, text: created.sourceText ?? 'flag idle cash', scope: 'all' });
-    expect(edited).toMatchObject({ scope: 'all', domain: 'cash-flow' });
+    expect(edited).toMatchObject({ scope: 'all', domain: 'banking' });
     service.close();
   });
 
@@ -1467,12 +1467,12 @@ describe('FinanceService custom rules', () => {
   });
 
   it('rejects SQL that is not read-only or is missing required columns', async () => {
-    const writeAuthor: RuleSqlAuthor = async () => ({ sql: 'DELETE FROM rules', domain: 'spending', scope: 'banking', keywords: '', title: 'x' });
+    const writeAuthor: RuleSqlAuthor = async () => ({ sql: 'DELETE FROM rules', domain: 'banking', scope: 'banking', keywords: '', title: 'x' });
     const writes = application(undefined, undefined, writeAuthor);
     await expect(writes.previewCustomRule({ text: 'try to delete everything' })).rejects.toMatchObject({ code: 'invalid_input' });
     writes.close();
 
-    const thinAuthor: RuleSqlAuthor = async () => ({ sql: "SELECT 'k' AS key LIMIT 1", domain: 'spending', scope: 'banking', keywords: '', title: 'x' });
+    const thinAuthor: RuleSqlAuthor = async () => ({ sql: "SELECT 'k' AS key LIMIT 1", domain: 'banking', scope: 'banking', keywords: '', title: 'x' });
     const thin = application(undefined, undefined, thinAuthor);
     await expect(thin.createCustomRule({ text: 'incomplete draft' })).rejects.toMatchObject({ code: 'invalid_input' });
     thin.close();
@@ -1485,7 +1485,7 @@ describe('FinanceService custom rules', () => {
     const flaky: RuleSqlAuthor = async () => {
       calls += 1;
       if (calls < 3) throw new Error('the model did not return a SQL rule');
-      return { sql: VALID_RULE_SQL, domain: 'spending', scope: 'banking', keywords: 'k', title: 'Recovered rule' };
+      return { sql: VALID_RULE_SQL, domain: 'banking', scope: 'banking', keywords: 'k', title: 'Recovered rule' };
     };
     const recovered = application(undefined, undefined, flaky);
     const created = await recovered.createCustomRule({ text: 'flag something' });
@@ -1497,7 +1497,7 @@ describe('FinanceService custom rules', () => {
     let badCalls = 0;
     const bad: RuleSqlAuthor = async () => {
       badCalls += 1;
-      return { sql: 'DELETE FROM rules', domain: 'spending', scope: 'banking', keywords: '', title: 'x' };
+      return { sql: 'DELETE FROM rules', domain: 'banking', scope: 'banking', keywords: '', title: 'x' };
     };
     const persistent = application(undefined, undefined, bad);
     await expect(persistent.createCustomRule({ text: 'nope' })).rejects.toMatchObject({ code: 'invalid_input' });
@@ -1513,9 +1513,9 @@ describe('FinanceService custom rules', () => {
     const repairing: RuleSqlAuthor = async ({ repair }) => {
       seen.push(repair);
       if (!repair) {
-        return { sql: "SELECT a.nope AS key FROM accounts a LIMIT 1", domain: 'spending', scope: 'banking', keywords: 'k', title: 'x' };
+        return { sql: "SELECT a.nope AS key FROM accounts a LIMIT 1", domain: 'banking', scope: 'banking', keywords: 'k', title: 'x' };
       }
-      return { sql: VALID_RULE_SQL, domain: 'spending', scope: 'banking', keywords: 'k', title: 'Repaired' };
+      return { sql: VALID_RULE_SQL, domain: 'banking', scope: 'banking', keywords: 'k', title: 'Repaired' };
     };
     const service = application(undefined, undefined, repairing);
     const created = await service.createCustomRule({ text: 'flag something' });

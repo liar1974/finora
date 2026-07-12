@@ -281,11 +281,10 @@ but not yet wired to act, and financial connections stay read-only.
 
 Domains organize rules for the user; they do not drive engine logic.
 
-- **Cash flow** — income timing, bill runway, idle cash, recurring spend.
-- **Spending** — large charges, duplicates, subscriptions, fees, categorization
-  cleanup.
+- **Banking** — income timing, bill runway, idle cash, recurring spend, large
+  charges, duplicates, subscriptions, fees, categorization cleanup.
 - **Credit report** — utilization, card interest, late or fee signals, report review.
-- **Investments** — cash drag, concentration, portfolio movement, executed orders.
+- **Brokerage** — cash drag, concentration, portfolio movement, executed orders.
 - **Connections** — provider status, missing tokens, stale cursors, sync health.
 
 Additional domains (benefits, tax, medical, property) attach here as their
@@ -349,15 +348,14 @@ All current rules are `D` (deterministic) SQL over the connected-account stream
 plus shipped reference data — no user input except where noted. They are seeded
 into the `rules` table on startup, enabled and active by default:
 
-- **Cash flow** — idle cash, low / negative balance, cash runway, cash-flow
+- **Banking** — idle cash, low / negative balance, cash runway, cash-flow
   negative, upcoming bills / overdraft, net-worth movement, employer 401(k) match
-  (fact-gated).
-- **Spending** — large transactions, duplicate charges, cross-account duplicate
+  (fact-gated), large transactions, duplicate charges, cross-account duplicate
   payments, card-testing pattern, fees and interest, subscription price increases,
   recurring subscriptions, new recurring charges, discretionary category spikes,
   cross-card duplicate subscriptions, unfamiliar merchant charges.
 - **Credit report** — credit utilization, card interest.
-- **Investments** — brokerage cash drag, portfolio concentration, single-name
+- **Brokerage** — brokerage cash drag, portfolio concentration, single-name
   exposure, holding value swings, executed trades, dividends received, possible
   wash sales.
 - **Connections** — connection health, stale account data.

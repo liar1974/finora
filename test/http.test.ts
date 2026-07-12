@@ -18,7 +18,7 @@ afterEach(async () => Promise.all(cleanups.splice(0).map((cleanup) => cleanup())
 const VALID_RULE_SQL =
   "SELECT 'row-1' AS key, 'Test finding' AS title, 'detail' AS detail, 'value' AS value, 0.9 AS confidence, 'evidence' AS evidence_summary, '' AS evidence_records LIMIT 1";
 const fakeRuleSqlAuthor: RuleSqlAuthor = async () => ({
-  sql: VALID_RULE_SQL, domain: 'spending', scope: 'banking', keywords: 'test', title: 'Test custom rule',
+  sql: VALID_RULE_SQL, domain: 'banking', scope: 'banking', keywords: 'test', title: 'Test custom rule',
 });
 
 async function httpFixture(options: {
@@ -224,7 +224,7 @@ Date: 05/01/2026
     expect(previewBody).toMatchObject({
       text: 'Generate a weekly rule for large brokerage cash drag before a digest.',
       kind: 'idle-brokerage-cash',
-      domain: 'investments',
+      domain: 'brokerage',
       scope: 'brokerage',
       cadence: 'weekly',
       scheduledHour: 9,
@@ -267,8 +267,8 @@ Date: 05/01/2026
     });
     expect(saved.status).toBe(201);
     // Kind is inferred from the text; the rule's domain follows its shared
-    // definition (large-transaction is a spending rule) rather than a per-user override.
-    expect(await saved.json()).toMatchObject({ kind: 'large-transaction', domain: 'spending' });
+    // definition (large-transaction is a banking rule) rather than a per-user override.
+    expect(await saved.json()).toMatchObject({ kind: 'large-transaction', domain: 'banking' });
   });
 
   it('lists active findings ranked with dollar impact and confidence', async () => {

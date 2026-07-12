@@ -49,7 +49,7 @@ test.describe('rules', () => {
     await app.page.route('**/v1/rules/custom/preview', (route) =>
       route.fulfill({
         json: {
-          text: 'flag idle cash', kind: null, domain: 'investments', scope: 'brokerage',
+          text: 'flag idle cash', kind: null, domain: 'brokerage', scope: 'brokerage',
           executionClass: 'D', cadence: 'weekly', scheduledHour: 9, scheduledDay: 1,
           sql: 'SELECT secret_column FROM rules LIMIT 1', title: 'Idle cash', strategy: 'Deterministic query and local copy.',
         },

@@ -1593,7 +1593,7 @@ export class FinanceService {
           sql: draft.sql,
           title: draft.title || 'Custom rule',
           keywords: draft.keywords || text.toLowerCase().slice(0, 120),
-          domain: normalizeChoice(draft.domain, RULE_DOMAINS, 'spending') as RuleDomain,
+          domain: normalizeChoice(draft.domain, RULE_DOMAINS, 'banking') as RuleDomain,
           scope: normalizeChoice(draft.scope, RULE_SCOPES, 'banking'),
         };
       } catch (error) {
@@ -2960,17 +2960,17 @@ export class FinanceService {
 // rules validate against the same taxonomy.
 const RULE_SCOPES = ['banking', 'brokerage', 'credit', 'all'];
 const RULE_CADENCES = ['event', 'hourly', 'daily', 'weekly', 'monthly'];
-const RULE_DOMAINS = ['cash-flow', 'spending', 'credit-report', 'investments', 'connections'];
+const RULE_DOMAINS = ['banking', 'brokerage', 'credit-report', 'connections'];
 
 // Custom rules expose a single user-facing "Category" — the app's product areas
 // (banking / brokerage / credit / all), which is the rule's scope. The internal
 // domain (used for the settings-list grouping) is derived from that choice so the
 // two classification columns never disagree; there is no separate domain picker.
 const SCOPE_TO_DOMAIN: Record<string, RuleDomain> = {
-  banking: 'cash-flow',
-  brokerage: 'investments',
+  banking: 'banking',
+  brokerage: 'brokerage',
   credit: 'credit-report',
-  all: 'cash-flow',
+  all: 'banking',
 };
 
 // The columns every rule's SQL must SELECT to produce a finding draft (see
@@ -3069,7 +3069,7 @@ function parseRuleSqlDraft(reply: string): RuleSqlDraft | null {
     sql,
     // The author now returns a single `category` (the app's product areas). `domain`
     // is derived from it downstream (SCOPE_TO_DOMAIN), so any placeholder is fine here.
-    domain: 'spending' as RuleDomain,
+    domain: 'banking' as RuleDomain,
     scope: String(value.category ?? value.scope ?? 'banking'),
     keywords: typeof value.keywords === 'string' ? value.keywords : '',
     title: typeof value.title === 'string' ? value.title : 'Custom rule',
@@ -3319,7 +3319,7 @@ function coerceRuleSpec(raw: unknown, index: number): RuleSpec {
   const strOrNull = (value: unknown) => (typeof value === 'string' ? value : null);
   return {
     kind,
-    domain: pick(r.domain, RULE_DOMAINS, 'cash-flow') as RuleSpec['domain'],
+    domain: pick(r.domain, RULE_DOMAINS, 'banking') as RuleSpec['domain'],
     executionClass: pick(r.executionClass, RULE_FEED_CLASSES, 'D') as RuleSpec['executionClass'],
     actionTier: pick(r.actionTier, RULE_FEED_TIERS, 'observer') as RuleSpec['actionTier'],
     scope: str(r.scope, 'all'),
@@ -3541,21 +3541,20 @@ function insightIdentity(finding: Finding): string {
 }
 
 const IM_DOMAIN_LABELS: Record<string, string> = {
-  'cash-flow': 'Cash flow',
-  spending: 'Spending',
+  banking: 'Banking',
+  brokerage: 'Brokerage',
   'credit-report': 'Credit report',
-  investments: 'Investments',
   connections: 'Connections',
 };
-const IM_DOMAIN_ORDER = ['cash-flow', 'spending', 'credit-report', 'investments', 'connections'];
+const IM_DOMAIN_ORDER = ['banking', 'brokerage', 'credit-report', 'connections'];
 
 // Group the delivered findings under their rule-taxonomy category so the message
-// reads by domain (Cash flow, Spending, Credit report, Investments, Connections).
+// reads by domain (Banking, Brokerage, Credit report, Connections).
 function formatImInsights(findings: Finding[]): string {
   const icon = { high: '🔴', medium: '🟠', low: '🟡' } as const;
   const byDomain = new Map<string, Finding[]>();
   for (const finding of findings) {
-    const domain = finding.domain || 'cash-flow';
+    const domain = finding.domain || 'banking';
     const bucket = byDomain.get(domain);
     if (bucket) bucket.push(finding);
     else byDomain.set(domain, [finding]);

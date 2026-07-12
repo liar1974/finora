@@ -251,10 +251,9 @@ function prettyKind(kind) {
 // The rules taxonomy from docs/rules-design.md, in display order. Used to group
 // both built-in and saved rules in the settings UI.
 const ruleDomains = [
-  ['cash-flow', 'Cash flow', 'Income timing, bill runway, idle cash, low balance.'],
-  ['spending', 'Spending', 'Large charges, duplicates, subscriptions, fees.'],
+  ['banking', 'Banking', 'Income timing, bill runway, idle cash, large charges, subscriptions, fees.'],
+  ['brokerage', 'Brokerage', 'Cash drag, concentration, allocation, executed orders.'],
   ['credit-report', 'Credit report', 'Credit-report health: utilization, card interest.'],
-  ['investments', 'Investments', 'Cash drag, concentration, allocation, executed orders.'],
   ['connections', 'Connections', 'Provider status, tokens, cursors, sync freshness.'],
 ];
 const notificationChannels = {
@@ -3797,10 +3796,10 @@ function renderSettingsInsights(view) {
     };
   });
   // Group by the rules taxonomy so every rule sits under one domain heading.
-  const domainOf = (rule) => rule.domain || rule.category || 'cash-flow';
+  const domainOf = (rule) => rule.domain || rule.category || 'banking';
   const grouped = new Map(ruleDomains.map(([key]) => [key, []]));
   for (const rule of rules) {
-    const key = grouped.has(domainOf(rule)) ? domainOf(rule) : 'cash-flow';
+    const key = grouped.has(domainOf(rule)) ? domainOf(rule) : 'banking';
     grouped.get(key).push(rule);
   }
   for (const [key, label, blurb] of ruleDomains) {

@@ -168,7 +168,7 @@ export interface EngineResult {
 
 const idleCash: Evaluator = {
   kind: 'idle-cash',
-  domain: 'cash-flow',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'banking',
@@ -208,7 +208,7 @@ const idleCash: Evaluator = {
 
 const idleBrokerageCash: Evaluator = {
   kind: 'idle-brokerage-cash',
-  domain: 'investments',
+  domain: 'brokerage',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'brokerage',
@@ -239,7 +239,7 @@ const idleBrokerageCash: Evaluator = {
 
 const largeTransaction: Evaluator = {
   kind: 'large-transaction',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'banking',
@@ -267,7 +267,7 @@ const largeTransaction: Evaluator = {
 
 const duplicateCharge: Evaluator = {
   kind: 'duplicate-charge',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'banking',
@@ -304,7 +304,7 @@ const duplicateCharge: Evaluator = {
 
 const portfolioConcentration: Evaluator = {
   kind: 'portfolio-concentration',
-  domain: 'investments',
+  domain: 'brokerage',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'brokerage',
@@ -432,7 +432,7 @@ const connectionConsentExpiring: Evaluator = {
 // so it is asked rather than integrated. Missing facts become ranked questions.
 const employerMatch: Evaluator = {
   kind: 'employer-match',
-  domain: 'cash-flow',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'all',
@@ -481,7 +481,7 @@ const employerMatch: Evaluator = {
 // it carries no dollar value but an explicit severity so it always surfaces.
 const lowBalance: Evaluator = {
   kind: 'low-balance',
-  domain: 'cash-flow',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'banking',
@@ -517,7 +517,7 @@ const lowBalance: Evaluator = {
 // the last 90 days, annualized. Stream-only via description matching.
 const feesAndInterest: Evaluator = {
   kind: 'fees-and-interest',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'banking',
@@ -551,7 +551,7 @@ const feesAndInterest: Evaluator = {
 // the silent price hike. Impact is the annualized increase.
 const subscriptionPriceIncrease: Evaluator = {
   kind: 'subscription-price-increase',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'banking',
@@ -583,7 +583,7 @@ const subscriptionPriceIncrease: Evaluator = {
 // forgotten memberships are visible. Opt-in (not always-on) to stay quiet.
 const recurringSubscriptions: Evaluator = {
   kind: 'recurring-subscriptions',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'banking',
@@ -617,7 +617,7 @@ const recurringSubscriptions: Evaluator = {
 // its prior 3-month average — lifestyle inflation. Uses Plaid categories.
 const spendingCategorySpike: Evaluator = {
   kind: 'spending-category-spike',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'banking',
@@ -666,7 +666,7 @@ const spendingCategorySpike: Evaluator = {
 // or a regular cadence (3+), never by merchant repetition alone.
 const newRecurringCharge: Evaluator = {
   kind: 'new-recurring-charge',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'banking',
@@ -700,7 +700,7 @@ const newRecurringCharge: Evaluator = {
 // only when runway is short. Risk-based, explicit severity, no dollar value.
 const cashRunway: Evaluator = {
   kind: 'cash-runway',
-  domain: 'cash-flow',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'banking',
@@ -775,7 +775,7 @@ const staleData: Evaluator = {
 // Spending: the same subscription billed on more than one account — paying twice.
 const crossCardSubscription: Evaluator = {
   kind: 'cross-card-subscription',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'banking',
@@ -819,7 +819,7 @@ const crossCardSubscription: Evaluator = {
 // Spending: a large charge at a merchant with no prior history in the window.
 const unfamiliarMerchantCharge: Evaluator = {
   kind: 'unfamiliar-merchant-charge',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'banking',
@@ -888,7 +888,7 @@ const cardInterest: Evaluator = {
 // Cash flow: over the last 30 days spending outran income, drawing down savings.
 const cashFlowNegative: Evaluator = {
   kind: 'cash-flow-negative',
-  domain: 'cash-flow',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'banking',
@@ -920,7 +920,7 @@ const cashFlowNegative: Evaluator = {
 // the cash on hand — a forward-looking overdraft risk.
 const upcomingBills: Evaluator = {
   kind: 'upcoming-bills',
-  domain: 'cash-flow',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'banking',
@@ -978,7 +978,7 @@ const upcomingBills: Evaluator = {
 // Cash flow: net worth fell materially month over month (drops only).
 const netWorthMovement: Evaluator = {
   kind: 'net-worth-movement',
-  domain: 'cash-flow',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'all',
@@ -1020,7 +1020,7 @@ const netWorthMovement: Evaluator = {
 // Investments: recent executed buy/sell orders.
 const executedTrades: Evaluator = {
   kind: 'executed-trades',
-  domain: 'investments',
+  domain: 'brokerage',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'brokerage',
@@ -1049,7 +1049,7 @@ const executedTrades: Evaluator = {
 // Investments: dividends and interest received (tax-relevant income).
 const dividendsReceived: Evaluator = {
   kind: 'dividends-received',
-  domain: 'investments',
+  domain: 'brokerage',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'brokerage',
@@ -1082,7 +1082,7 @@ const dividendsReceived: Evaluator = {
 // Investments: one position is an outsized share of total net worth.
 const singleNameExposure: Evaluator = {
   kind: 'single-name-exposure',
-  domain: 'investments',
+  domain: 'brokerage',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'all',
@@ -1123,7 +1123,7 @@ const singleNameExposure: Evaluator = {
 // Investments: a holding's value swung sharply since the prior snapshot.
 const holdingSwing: Evaluator = {
   kind: 'holding-swing',
-  domain: 'investments',
+  domain: 'brokerage',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'brokerage',
@@ -1171,7 +1171,7 @@ const holdingSwing: Evaluator = {
 // sale worth a manual review at tax time (no cost basis, so review only).
 const washSaleRisk: Evaluator = {
   kind: 'wash-sale-risk',
-  domain: 'investments',
+  domain: 'brokerage',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'brokerage',
@@ -1205,7 +1205,7 @@ const washSaleRisk: Evaluator = {
 // billing descriptions; falls back to the normalized merchant when unidentified.
 const crossAccountDuplicate: Evaluator = {
   kind: 'cross-account-duplicate',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'advisor',
   scope: 'banking',
@@ -1255,7 +1255,7 @@ const crossAccountDuplicate: Evaluator = {
 // quiet; the sharper "is this merchant sketchy" judgment is a future L+ upgrade.
 const cardTesting: Evaluator = {
   kind: 'card-testing',
-  domain: 'spending',
+  domain: 'banking',
   executionClass: 'D',
   defaultTier: 'observer',
   scope: 'banking',
@@ -1483,7 +1483,7 @@ export function inferRule(specs: RuleSpec[], text: string, scope?: string, caden
   const chosenCadence = (cadence && CADENCES.includes(cadence) ? cadence : inferCadence(lower));
   return {
     kind: match?.kind ?? 'large-transaction',
-    domain: match?.domain ?? 'spending',
+    domain: match?.domain ?? 'banking',
     executionClass: match?.executionClass ?? 'D',
     actionTier: match?.actionTier ?? 'observer',
     scope: SCOPES.includes(chosenScope) ? chosenScope : 'banking',

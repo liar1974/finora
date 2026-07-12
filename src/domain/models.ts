@@ -206,7 +206,7 @@ export type RuleExecutionClass = 'D' | 'L' | 'L+';
 // tier is additionally capped by finding confidence at run time.
 export type RuleActionTier = 'observer' | 'advisor' | 'guardian' | 'navigator';
 
-export type RuleDomain = 'cash-flow' | 'spending' | 'credit-report' | 'investments' | 'connections';
+export type RuleDomain = 'banking' | 'brokerage' | 'credit-report' | 'connections';
 
 // One rule = one row in the single `rules` table (see docs/rules-design.md). The
 // row carries BOTH the definition (code/feed-owned: sql, keywords, facts…, kept
