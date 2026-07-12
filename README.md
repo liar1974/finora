@@ -11,7 +11,7 @@ and credit report in one clear picture — and nothing ever leaves your machine.
 [![Stars](https://img.shields.io/github/stars/liar1974/finora?style=flat)](https://github.com/liar1974/finora/stargazers)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-[Download](#download) · [Onboarding](docs/onboarding.md) · [X](https://x.com/geniuskoi) · [Privacy](#your-privacy) · [Contributing](CONTRIBUTING.md) · [License](LICENSE)
+[Download](#download) · [Onboarding](docs/onboarding.md) · [X](https://x.com/geniuskoi) · [Slack](https://join.slack.com/t/finoraco/shared_invite/zt-43n4streu-AUx78tUPrpZqvUPHzeUgag) · [Privacy](#your-privacy) · [Contributing](CONTRIBUTING.md) · [License](LICENSE)
 
 </div>
 
